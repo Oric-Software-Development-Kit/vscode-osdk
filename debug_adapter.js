@@ -1,0 +1,1205 @@
+'use strict';
+
+// ================================================================
+// Oricutron DAP Debug Adapter
+//
+// Pure JavaScript — no npm dependencies.
+// Communicates with VS Code via DAP (stdin/stdout, Content-Length).
+// Communicates with Oricutron via GDB RSP (TCP).
+// ================================================================
+
+const net = require('net');
+const fs = require('fs');
+
+// ----------------------------------------------------------------
+// DAP protocol I/O  (Content-Length framing over stdin/stdout)
+// ----------------------------------------------------------------
+
+let dapBuf = Buffer.alloc(0);
+let dapSeq = 1;
+
+process.stdin.resume();
+process.stdin.on('data', chunk => {
+    dapBuf = Buffer.concat([dapBuf, chunk]);
+    parseDap();
+});
+process.stdin.on('end', () => process.exit(0));
+
+function parseDap() {
+    while (true) {
+        const idx = dapBuf.indexOf('\r\n\r\n');
+        if (idx < 0) return;
+        const header = dapBuf.slice(0, idx).toString('utf8');
+        const m = header.match(/Content-Length:\s*(\d+)/i);
+        if (!m) { dapBuf = dapBuf.slice(idx + 4); continue; }
+        const len = parseInt(m[1], 10);
+        const start = idx + 4;
+        if (dapBuf.length < start + len) return;
+        const body = dapBuf.slice(start, start + len).toString('utf8');
+        dapBuf = dapBuf.slice(start + len);
+        try { handleDap(JSON.parse(body)); }
+        catch (e) { log('DAP parse error: ' + e.message); }
+    }
+}
+
+function sendDap(msg) {
+    msg.seq = dapSeq++;
+    const json = JSON.stringify(msg);
+    const out = 'Content-Length: ' + Buffer.byteLength(json, 'utf8') + '\r\n\r\n' + json;
+    process.stdout.write(out);
+}
+
+function respond(req, body, ok, message) {
+    sendDap({
+        type: 'response',
+        request_seq: req.seq,
+        command: req.command,
+        success: ok !== false,
+        message: message,
+        body: body || {}
+    });
+}
+
+function evt(name, body) {
+    sendDap({ type: 'event', event: name, body: body || {} });
+}
+
+function log(msg) {
+    evt('output', { category: 'console', output: msg + '\n' });
+}
+
+// ----------------------------------------------------------------
+// GDB RSP client  (TCP, $packet#checksum framing)
+// ----------------------------------------------------------------
+
+let sock = null;
+let rxBuf = '';
+let pendingResolve = null;
+let pendingCmdType = null;   // first char of pending GDB command (to distinguish responses)
+let gdbQueue = [];           // queued commands: [{cmd, resolve}]
+let disconnecting = false;
+
+function gdbConnect(host, port) {
+    return new Promise((resolve, reject) => {
+        const s = net.createConnection({ host: host, port: port }, () => {
+            sock = s;
+            resolve();
+        });
+        s.setEncoding('latin1');
+        s.on('data', onGdbData);
+        s.on('error', err => {
+            if (!sock) { reject(err); return; }
+            log('GDB connection error: ' + err.message);
+        });
+        s.on('close', () => {
+            const wasSock = sock;
+            sock = null;
+            if (pendingResolve) {
+                const r = pendingResolve;
+                pendingResolve = null;
+                pendingCmdType = null;
+                r(null);
+            }
+            for (const entry of gdbQueue) entry.resolve(null);
+            gdbQueue = [];
+            if (wasSock && !disconnecting) {
+                evt('terminated');
+            }
+        });
+    });
+}
+
+function onGdbData(data) {
+    rxBuf += data;
+    while (rxBuf.length > 0) {
+        // Skip ACK / NAK
+        if (rxBuf[0] === '+' || rxBuf[0] === '-') {
+            rxBuf = rxBuf.substring(1);
+            continue;
+        }
+        // Expect '$'
+        if (rxBuf[0] !== '$') {
+            rxBuf = rxBuf.substring(1);
+            continue;
+        }
+        // Find '#'
+        const hash = rxBuf.indexOf('#', 1);
+        if (hash < 0 || hash + 2 >= rxBuf.length) return; // incomplete
+        const payload = rxBuf.substring(1, hash);
+        rxBuf = rxBuf.substring(hash + 3);
+        // ACK
+        if (sock) sock.write('+');
+
+        // Route the packet: if we're waiting for a command response,
+        // deliver it — UNLESS it's an unsolicited stop notification
+        // (T05/S05) while we're waiting for a non-'?' response.
+        if (pendingResolve) {
+            const isStop = (payload[0] === 'T' || payload[0] === 'S');
+            if (isStop && pendingCmdType !== '?') {
+                // Unsolicited stop while waiting for a command response
+                onStopReply(payload);
+            } else {
+                const r = pendingResolve;
+                pendingResolve = null;
+                pendingCmdType = null;
+                r(payload);
+                gdbSendNext();
+            }
+        } else if (payload[0] === 'T' || payload[0] === 'S') {
+            // Asynchronous stop notification (e.g. breakpoint hit during 'c')
+            onStopReply(payload);
+        }
+    }
+}
+
+function gdbWrite(cmd) {
+    if (!sock) return;
+    let cs = 0;
+    for (let i = 0; i < cmd.length; i++) cs = (cs + cmd.charCodeAt(i)) & 0xff;
+    sock.write('$' + cmd + '#' + cs.toString(16).padStart(2, '0'));
+}
+
+/** Send the next queued GDB command (if any). */
+function gdbSendNext() {
+    if (gdbQueue.length === 0) return;
+    const { cmd, resolve } = gdbQueue.shift();
+    pendingResolve = resolve;
+    pendingCmdType = cmd[0];
+    gdbWrite(cmd);
+}
+
+/** Send a GDB command and wait for the response packet.
+ *  Commands are serialized: if a command is already in flight,
+ *  this one queues behind it. */
+function gdbCmd(cmd) {
+    return new Promise(resolve => {
+        if (!sock) { resolve(null); return; }
+        if (pendingResolve) {
+            // Another command is in flight — queue this one
+            gdbQueue.push({ cmd, resolve });
+        } else {
+            // Send immediately
+            pendingResolve = resolve;
+            pendingCmdType = cmd[0];
+            gdbWrite(cmd);
+        }
+    });
+}
+
+// ----------------------------------------------------------------
+// Adapter state
+// ----------------------------------------------------------------
+
+let symbols    = new Map();   // name  -> address (number)
+let addrSym    = new Map();   // address -> name
+let regs       = null;        // { a, x, y, sp, pc, f }
+let running    = false;
+let config     = {};
+let bpId       = 1;
+let bps        = new Map();   // id -> { id, addr, name } (function breakpoints)
+let ibps       = new Map();   // id -> { id, addr }       (instruction breakpoints)
+let zpSymbols  = [];          // [{addr, name, size}] sorted by address
+let configDone = false;
+let pendingStop = null;       // deferred stopped event body
+let gotoTargetMap = new Map(); // targetId -> address (for goto/setNextStatement)
+
+// ----------------------------------------------------------------
+// Symbol file loader  (format: "HHHH symbol_name" per line)
+// ----------------------------------------------------------------
+
+function loadSymbols(file) {
+    symbols.clear();
+    addrSym.clear();
+    zpSymbols = [];
+    try {
+        const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
+        for (const line of lines) {
+            const m = line.match(/^([0-9a-fA-F]{4})\s+(\S+)/);
+            if (m) {
+                const a = parseInt(m[1], 16);
+                const n = m[2];
+                symbols.set(n, a);
+                if (!addrSym.has(a)) addrSym.set(a, n);
+            }
+        }
+        // Build sorted zero-page symbol list with inferred sizes
+        const zpAddrs = [];
+        for (const [a, n] of addrSym) {
+            if (a <= 0xFF) zpAddrs.push({ addr: a, name: n });
+        }
+        zpAddrs.sort((a, b) => a.addr - b.addr);
+        for (let i = 0; i < zpAddrs.length; i++) {
+            const next = i + 1 < zpAddrs.length ? zpAddrs[i + 1].addr : zpAddrs[i].addr + 2;
+            const size = Math.min(next - zpAddrs[i].addr, 2); // 1 or 2 bytes
+            zpSymbols.push({ addr: zpAddrs[i].addr, name: zpAddrs[i].name, size: size });
+        }
+        log('Loaded ' + symbols.size + ' symbols from ' + file + ' (' + zpSymbols.length + ' zero-page)');
+    } catch (e) {
+        log('Could not load symbols: ' + e.message);
+    }
+}
+
+// ----------------------------------------------------------------
+// Register helpers
+// ----------------------------------------------------------------
+
+// Parse 'g' response: AA XX YY SP PClo PChi FF  (14 hex chars)
+function parseRegsG(hex) {
+    if (!hex || hex.length < 14) return null;
+    return {
+        a:  parseInt(hex.substring(0,  2), 16),
+        x:  parseInt(hex.substring(2,  4), 16),
+        y:  parseInt(hex.substring(4,  6), 16),
+        sp: parseInt(hex.substring(6,  8), 16),
+        pc: (parseInt(hex.substring(10, 12), 16) << 8) |
+             parseInt(hex.substring(8,  10), 16),
+        f:  parseInt(hex.substring(12, 14), 16)
+    };
+}
+
+// Parse stop-reply register annotations:
+//   T0500:aa;01:xx;02:yy;03:ss;04:pppp;05:ff;
+function parseStopRegs(payload) {
+    const r = {};
+    const parts = payload.substring(3).split(';');
+    for (const p of parts) {
+        const c = p.indexOf(':');
+        if (c < 0) continue;
+        const reg = parseInt(p.substring(0, c), 16);
+        const val = p.substring(c + 1);
+        switch (reg) {
+            case 0: r.a  = parseInt(val, 16); break;
+            case 1: r.x  = parseInt(val, 16); break;
+            case 2: r.y  = parseInt(val, 16); break;
+            case 3: r.sp = parseInt(val, 16); break;
+            case 4:
+                r.pc = (parseInt(val.substring(2, 4), 16) << 8) |
+                        parseInt(val.substring(0, 2), 16);
+                break;
+            case 5: r.f = parseInt(val, 16); break;
+        }
+    }
+    return r;
+}
+
+// ----------------------------------------------------------------
+// Asynchronous stop-reply handler
+// ----------------------------------------------------------------
+
+function onStopReply(payload) {
+    running = false;
+    regs = parseStopRegs(payload);
+    const sig = parseInt(payload.substring(1, 3), 16);
+
+    // Determine stop reason
+    let reason = sig === 5 ? 'step' : 'pause';
+    let hitIds;
+    if (sig === 5 && regs && regs.pc !== undefined) {
+        for (const [id, bp] of bps) {
+            if (bp.addr === regs.pc) { reason = 'breakpoint'; hitIds = [id]; break; }
+        }
+        if (!hitIds) {
+            for (const [id, bp] of ibps) {
+                if (bp.addr === regs.pc) { reason = 'breakpoint'; hitIds = [id]; break; }
+            }
+        }
+    }
+
+    const body = { reason: reason, threadId: 1, allThreadsStopped: true };
+    if (hitIds) body.hitBreakpointIds = hitIds;
+
+    if (configDone) {
+        evt('stopped', body);
+    } else {
+        pendingStop = body;
+    }
+}
+
+// ----------------------------------------------------------------
+// 6502 disassembler
+// ----------------------------------------------------------------
+
+// Compact opcode table: 'MNEm' = 3-char mnemonic + 1-char mode, or 0 = illegal
+// Modes: I=implied A=accumulator #=immediate z=zp x=zp,X y=zp,Y
+//        a=absolute X=abs,X Y=abs,Y n=indirect (=izx )=izy r=relative
+const OPS = [
+'BRKI','ORA(', 0,0, 0,    'ORAz','ASLz', 0, 'PHPI','ORA#','ASLA', 0, 0,    'ORAa','ASLa', 0,
+'BPLr','ORA)', 0,0, 0,    'ORAx','ASLx', 0, 'CLCI','ORAY', 0,     0, 0,    'ORAX','ASLX', 0,
+'JSRa','AND(', 0,0,'BITz','ANDz','ROLz', 0, 'PLPI','AND#','ROLA', 0,'BITa','ANDa','ROLa', 0,
+'BMIr','AND)', 0,0, 0,    'ANDx','ROLx', 0, 'SECI','ANDY', 0,     0, 0,    'ANDX','ROLX', 0,
+'RTII','EOR(', 0,0, 0,    'EORz','LSRz', 0, 'PHAI','EOR#','LSRA', 0,'JMPa','EORa','LSRa', 0,
+'BVCr','EOR)', 0,0, 0,    'EORx','LSRx', 0, 'CLII','EORY', 0,     0, 0,    'EORX','LSRX', 0,
+'RTSI','ADC(', 0,0, 0,    'ADCz','RORz', 0, 'PLAI','ADC#','RORA', 0,'JMPn','ADCa','RORa', 0,
+'BVSr','ADC)', 0,0, 0,    'ADCx','RORx', 0, 'SEII','ADCY', 0,     0, 0,    'ADCX','RORX', 0,
+ 0,    'STA(', 0,0,'STYz','STAz','STXz', 0, 'DEYI', 0,    'TXAI', 0,'STYa','STAa','STXa', 0,
+'BCCr','STA)', 0,0,'STYx','STAx','STXy', 0, 'TYAI','STAY','TXSI', 0, 0,    'STAX', 0,     0,
+'LDY#','LDA(','LDX#',0,'LDYz','LDAz','LDXz',0,'TAYI','LDA#','TAXI',0,'LDYa','LDAa','LDXa',0,
+'BCSr','LDA)', 0,0,'LDYx','LDAx','LDXy', 0, 'CLVI','LDAY','TSXI', 0,'LDYX','LDAX','LDXY', 0,
+'CPY#','CMP(', 0,0,'CPYz','CMPz','DECz', 0, 'INYI','CMP#','DEXI', 0,'CPYa','CMPa','DECa', 0,
+'BNEr','CMP)', 0,0, 0,    'CMPx','DECx', 0, 'CLDI','CMPY', 0,     0, 0,    'CMPX','DECX', 0,
+'CPX#','SBC(', 0,0,'CPXz','SBCz','INCz', 0, 'INXI','SBC#','NOPI', 0,'CPXa','SBCa','INCa', 0,
+'BEQr','SBC)', 0,0, 0,    'SBCx','INCx', 0, 'SEDI','SBCY', 0,     0, 0,    'SBCX','INCX', 0,
+];
+
+function opSize(mode) {
+    if (mode === 'I' || mode === 'A') return 1;
+    if (mode === 'a' || mode === 'X' || mode === 'Y' || mode === 'n') return 3;
+    return 2;
+}
+
+function fmtOp(mode, lo, hi, pc, symMap) {
+    const h2 = v => v.toString(16).toUpperCase().padStart(2, '0');
+    const h4 = v => v.toString(16).toUpperCase().padStart(4, '0');
+    // Resolve an address to a symbol name, or fall back to hex
+    const s = (addr, w) => (symMap && symMap.get(addr)) || ('$' + (w === 2 ? h2(addr) : h4(addr)));
+    switch (mode) {
+        case 'I': return '';
+        case 'A': return 'A';
+        case '#': return '#$' + h2(lo);
+        case 'z': return s(lo, 2);
+        case 'x': return s(lo, 2) + ',X';
+        case 'y': return s(lo, 2) + ',Y';
+        case 'a': return s((hi << 8) | lo, 4);
+        case 'X': return s((hi << 8) | lo, 4) + ',X';
+        case 'Y': return s((hi << 8) | lo, 4) + ',Y';
+        case 'n': return '(' + s((hi << 8) | lo, 4) + ')';
+        case '(': return '(' + s(lo, 2) + ',X)';
+        case ')': return '(' + s(lo, 2) + '),Y';
+        case 'r': {
+            const target = (pc + 2 + (lo < 128 ? lo : lo - 256)) & 0xFFFF;
+            return s(target, 4);
+        }
+    }
+    return '';
+}
+
+// ----------------------------------------------------------------
+// Call stack walker — decode return addresses from the 6502 page 1 stack
+// ----------------------------------------------------------------
+
+// Resolve address to nearest symbol label
+function labelFor(addr) {
+    const exact = addrSym.get(addr);
+    if (exact) return exact;
+    let bestAddr = -1, bestName = null;
+    for (const [a, n] of addrSym) {
+        if (a <= addr && a > bestAddr) { bestAddr = a; bestName = n; }
+    }
+    return bestName
+        ? bestName + '+$' + (addr - bestAddr).toString(16).toUpperCase()
+        : '$' + addr.toString(16).toUpperCase().padStart(4, '0');
+}
+
+// Walk the hardware stack (page 1) and identify JSR return addresses.
+// JSR pushes (PC+2) onto the stack (the last byte of the JSR instruction),
+// so the return address is (stack word) + 1.
+// Uses a single GDB read for the stack, then verifies candidates in bulk.
+async function buildCallStack() {
+    if (!regs || regs.sp === undefined) return [];
+
+    const sp = regs.sp;
+    const stackSize = 0xFF - sp;
+    if (stackSize < 2) return [];
+
+    // Read stack bytes — single GDB command
+    const stackAddr = 0x0100 + sp + 1;
+    const readSize = Math.min(stackSize, 64);
+    const reply = await gdbCmd('m' + stackAddr.toString(16) + ',' + readSize.toString(16));
+    if (!reply || reply[0] === 'E') return [];
+
+    const stk = [];
+    for (let i = 0; i < reply.length; i += 2)
+        stk.push(parseInt(reply.substring(i, i + 2), 16));
+
+    // Collect all candidate JSR addresses for bulk verification
+    const candidates = [];
+    for (let pos = 0; pos + 1 < stk.length && candidates.length < 16; pos++) {
+        const lo = stk[pos];
+        const hi = stk[pos + 1];
+        const retAddr = (((hi << 8) | lo) + 1) & 0xFFFF;
+        if (retAddr > 0x01FF && retAddr < 0xFFF0) {
+            candidates.push({ pos: pos, retAddr: retAddr, jsrAddr: (retAddr - 3) & 0xFFFF });
+        }
+    }
+    if (candidates.length === 0) return [];
+
+    // Find contiguous range covering all JSR verification addresses,
+    // then read them in a single GDB command
+    const minAddr = Math.min(...candidates.map(c => c.jsrAddr));
+    const maxAddr = Math.max(...candidates.map(c => c.jsrAddr));
+    const rangeSize = maxAddr - minAddr + 1;
+
+    let verifyMap = null;
+    if (rangeSize <= 4096) {
+        // Reasonable range — read in one shot
+        const vReply = await gdbCmd('m' + minAddr.toString(16) + ',' + rangeSize.toString(16));
+        if (vReply && vReply[0] !== 'E') {
+            verifyMap = new Map();
+            for (let i = 0; i < vReply.length; i += 2)
+                verifyMap.set(minAddr + i / 2, parseInt(vReply.substring(i, i + 2), 16));
+        }
+    }
+
+    // Greedy scan using bulk-fetched verification data
+    const frames = [];
+    let pos = 0;
+    while (pos + 1 < stk.length && frames.length < 16) {
+        const lo = stk[pos];
+        const hi = stk[pos + 1];
+        const retAddr = (((hi << 8) | lo) + 1) & 0xFFFF;
+        const jsrAddr = (retAddr - 3) & 0xFFFF;
+
+        if (retAddr > 0x01FF && retAddr < 0xFFF0) {
+            const opcode = verifyMap ? verifyMap.get(jsrAddr) : undefined;
+            if (opcode === 0x20 || !verifyMap) {
+                frames.push(retAddr);
+                pos += 2;
+                continue;
+            }
+        }
+        pos += 1; // skip single byte (PHA/PHP or non-JSR)
+    }
+
+    return frames;
+}
+
+// ----------------------------------------------------------------
+// DAP request dispatcher
+// ----------------------------------------------------------------
+
+function handleDap(msg) {
+    if (msg.type !== 'request') return;
+    const h = handlers[msg.command];
+    if (h) {
+        Promise.resolve(h(msg)).catch(e => {
+            log('Handler error (' + msg.command + '): ' + e.message);
+            respond(msg, {}, false, 'Internal error: ' + e.message);
+        });
+    } else {
+        respond(msg, {}, false, 'Unsupported: ' + msg.command);
+    }
+}
+
+// ----------------------------------------------------------------
+// DAP request handlers
+// ----------------------------------------------------------------
+
+const handlers = {
+
+    // -- Lifecycle ------------------------------------------------
+
+    initialize(req) {
+        respond(req, {
+            supportsConfigurationDoneRequest: true,
+            supportsFunctionBreakpoints: true,
+            supportsReadMemoryRequest: true,
+            supportsWriteMemoryRequest: true,
+            supportsDisassembleRequest: true,
+            supportsSteppingGranularity: true,
+            supportsInstructionBreakpoints: true,
+            supportsEvaluateForHovers: false,
+            supportsStepBack: false,
+            supportsSetVariable: true,
+            supportsRestartFrame: false,
+            supportsGotoTargetsRequest: true,
+            supportsStepInTargetsRequest: false,
+            supportsCompletionsRequest: false,
+            supportsModulesRequest: false
+        });
+        evt('initialized');
+    },
+
+    async attach(req) {
+        config = req.arguments || {};
+        const host = config.host || 'localhost';
+        const port = config.port || 6502;
+        const retries = config.connectRetries || 10;
+        const retryDelay = config.connectRetryDelay || 1000;
+
+        if (config.symbolFile) loadSymbols(config.symbolFile);
+
+        // Retry loop — gives Oricutron time to start when using preLaunchTask
+        let lastErr;
+        for (let attempt = 0; attempt <= retries; attempt++) {
+            try {
+                await gdbConnect(host, port);
+                log('Connected to Oricutron at ' + host + ':' + port);
+
+                const reply = await gdbCmd('?');
+                log('GDB ? reply: ' + (reply || '(null)'));
+                if (reply) {
+                    regs = parseStopRegs(reply);
+                    log('Parsed regs: PC=$' + (regs.pc !== undefined ? regs.pc.toString(16).toUpperCase().padStart(4, '0') : '??') +
+                        ' A=$' + (regs.a !== undefined ? regs.a.toString(16).toUpperCase().padStart(2, '0') : '??'));
+                }
+
+                respond(req);
+                return;
+            } catch (e) {
+                lastErr = e;
+                if (attempt < retries) {
+                    if (attempt === 0)
+                        log('Waiting for Oricutron on ' + host + ':' + port + '...');
+                    await new Promise(r => setTimeout(r, retryDelay));
+                }
+            }
+        }
+        respond(req, {}, false, 'Could not connect to ' + host + ':' + port +
+            ' after ' + retries + ' retries — is Oricutron running with --gdb_port?');
+    },
+
+    configurationDone(req) {
+        configDone = true;
+        respond(req);
+
+        // Send any deferred stop event, or a fresh entry stop
+        if (pendingStop) {
+            evt('stopped', pendingStop);
+            pendingStop = null;
+        } else if (config.stopOnAttach !== false) {
+            evt('stopped', { reason: 'entry', threadId: 1, allThreadsStopped: true });
+        }
+    },
+
+    async disconnect(req) {
+        disconnecting = true;
+        if (sock) {
+            gdbWrite('D'); // detach — don't wait for reply
+            sock.destroy();
+            sock = null;
+        }
+        respond(req);
+        evt('terminated');
+        setTimeout(() => process.exit(0), 200);
+    },
+
+    // -- Threads / Stack ------------------------------------------
+
+    threads(req) {
+        respond(req, { threads: [{ id: 1, name: '6502 CPU' }] });
+    },
+
+    async stackTrace(req) {
+        if (!regs) {
+            const r = await gdbCmd('g');
+            regs = parseRegsG(r);
+        }
+        const pc = regs ? regs.pc : 0;
+
+        // Frame 0: current PC
+        const stackFrames = [{
+            id: 0,
+            name: labelFor(pc),
+            line: 0,
+            column: 0,
+            instructionPointerReference: '0x' + pc.toString(16).padStart(4, '0')
+        }];
+
+        // Walk the hardware stack to find JSR return addresses
+        const returnAddrs = await buildCallStack();
+        for (let i = 0; i < returnAddrs.length; i++) {
+            const ra = returnAddrs[i];
+            stackFrames.push({
+                id: i + 1,
+                name: labelFor(ra),
+                line: 0,
+                column: 0,
+                instructionPointerReference: '0x' + ra.toString(16).padStart(4, '0')
+            });
+        }
+
+        respond(req, {
+            stackFrames: stackFrames,
+            totalFrames: stackFrames.length
+        });
+    },
+
+    // -- Scopes / Variables ---------------------------------------
+
+    scopes(req) {
+        respond(req, { scopes: [] });
+    },
+
+    async variables(req) {
+        const ref = req.arguments.variablesReference;
+        if (!regs) {
+            const r = await gdbCmd('g');
+            regs = parseRegsG(r);
+        }
+        if (!regs) { respond(req, { variables: [] }); return; }
+
+        const h = (v, w) => '$' + v.toString(16).toUpperCase().padStart(w, '0');
+
+        if (ref === 1) {
+            respond(req, { variables: [
+                { name: 'A',  value: h(regs.a, 2)  + ' (' + regs.a  + ')', variablesReference: 0 },
+                { name: 'X',  value: h(regs.x, 2)  + ' (' + regs.x  + ')', variablesReference: 0 },
+                { name: 'Y',  value: h(regs.y, 2)  + ' (' + regs.y  + ')', variablesReference: 0 },
+                { name: 'SP', value: h(regs.sp, 2) + ' (' + regs.sp + ')', variablesReference: 0 },
+                { name: 'PC', value: h(regs.pc, 4), memoryReference: '0x' + regs.pc.toString(16).padStart(4, '0'), variablesReference: 0 }
+            ]});
+        } else if (ref === 2) {
+            const f = regs.f;
+            respond(req, { variables: [
+                { name: 'N (Negative)',  value: (f & 0x80) ? '1' : '0', variablesReference: 0 },
+                { name: 'V (Overflow)',  value: (f & 0x40) ? '1' : '0', variablesReference: 0 },
+                { name: 'B (Break)',     value: (f & 0x10) ? '1' : '0', variablesReference: 0 },
+                { name: 'D (Decimal)',   value: (f & 0x08) ? '1' : '0', variablesReference: 0 },
+                { name: 'I (Interrupt)', value: (f & 0x04) ? '1' : '0', variablesReference: 0 },
+                { name: 'Z (Zero)',      value: (f & 0x02) ? '1' : '0', variablesReference: 0 },
+                { name: 'C (Carry)',     value: (f & 0x01) ? '1' : '0', variablesReference: 0 }
+            ]});
+        } else if (ref === 3) {
+            // Zero page variables — read all 256 bytes, map symbols to values
+            if (zpSymbols.length === 0) { respond(req, { variables: [] }); return; }
+            const zpReply = await gdbCmd('m0,100');
+            if (!zpReply || zpReply[0] === 'E') { respond(req, { variables: [] }); return; }
+            const zp = [];
+            for (let i = 0; i < zpReply.length && i < 512; i += 2)
+                zp.push(parseInt(zpReply.substring(i, i + 2), 16));
+            const vars = [];
+            for (const s of zpSymbols) {
+                const a = s.addr;
+                if (a >= zp.length) continue;
+                const hAddr = '$' + a.toString(16).toUpperCase().padStart(2, '0');
+                let val;
+                if (s.size >= 2 && a + 1 < zp.length) {
+                    const w = zp[a] | (zp[a + 1] << 8);
+                    val = hAddr + ': $' + w.toString(16).toUpperCase().padStart(4, '0') + ' (' + w + ')';
+                } else {
+                    val = hAddr + ': $' + zp[a].toString(16).toUpperCase().padStart(2, '0') + ' (' + zp[a] + ')';
+                }
+                vars.push({ name: s.name, value: val, variablesReference: 0 });
+            }
+            respond(req, { variables: vars });
+        } else {
+            respond(req, { variables: [] });
+        }
+    },
+
+    async setVariable(req) {
+        const args = req.arguments;
+        const ref = args.variablesReference;
+        const name = args.name;
+        const rawVal = args.value.trim();
+
+        // Parse value: accept "$XX", "0xXX", or plain decimal
+        let val;
+        if (rawVal.startsWith('$') || rawVal.startsWith('0x') || rawVal.startsWith('0X')) {
+            val = parseInt(rawVal.replace(/^\$/, ''), 16);
+        } else {
+            val = parseInt(rawVal, 10);
+        }
+        if (isNaN(val)) { respond(req, {}, false, 'Invalid value: ' + rawVal); return; }
+
+        const h2 = v => (v & 0xFF).toString(16).padStart(2, '0');
+        const h4 = v => '$' + v.toString(16).toUpperCase().padStart(4, '0');
+
+        if (ref === 1) {
+            // CPU registers
+            const regMap = { A: 0, X: 1, Y: 2, SP: 3, PC: 4 };
+            const regNum = regMap[name];
+            if (regNum === undefined) { respond(req, {}, false, 'Unknown register'); return; }
+            let hexVal;
+            if (regNum === 4) {
+                // PC is 2 bytes little-endian
+                hexVal = h2(val & 0xFF) + h2((val >> 8) & 0xFF);
+            } else {
+                hexVal = h2(val);
+            }
+            const r = await gdbCmd('P' + regNum.toString(16) + '=' + hexVal);
+            if (r !== 'OK') { respond(req, {}, false, 'Write failed'); return; }
+            // Refresh registers
+            const g = await gdbCmd('g');
+            regs = parseRegsG(g);
+            const display = (regNum === 4)
+                ? h4(regs.pc)
+                : '$' + regs[name.toLowerCase()].toString(16).toUpperCase().padStart(2, '0') +
+                  ' (' + regs[name.toLowerCase()] + ')';
+            respond(req, { value: display });
+            if (regNum === 4) evt('stopped', { reason: 'step', threadId: 1, allThreadsStopped: true });
+        } else if (ref === 2) {
+            // Flags — set individual flag bits
+            const flagBits = { 'N (Negative)': 0x80, 'V (Overflow)': 0x40, 'B (Break)': 0x10,
+                'D (Decimal)': 0x08, 'I (Interrupt)': 0x04, 'Z (Zero)': 0x02, 'C (Carry)': 0x01 };
+            const bit = flagBits[name];
+            if (!bit) { respond(req, {}, false, 'Unknown flag'); return; }
+            if (!regs) { const g = await gdbCmd('g'); regs = parseRegsG(g); }
+            const newF = val ? (regs.f | bit) : (regs.f & ~bit);
+            const r = await gdbCmd('P5=' + h2(newF));
+            if (r !== 'OK') { respond(req, {}, false, 'Write failed'); return; }
+            regs.f = newF;
+            respond(req, { value: val ? '1' : '0' });
+        } else {
+            respond(req, {}, false, 'Cannot set this variable');
+        }
+    },
+
+    // -- Goto (set next statement / move PC) ----------------------
+
+    gotoTargets(req) {
+        const args = req.arguments;
+        // In disassembly view, the source path is like "0xABCD"
+        let addr = 0;
+        if (args.source && args.source.path) {
+            const parsed = parseInt(args.source.path, 16);
+            if (!isNaN(parsed)) addr = parsed & 0xFFFF;
+        }
+        // Also try line as a fallback (some views encode address there)
+        if (addr === 0 && args.line) addr = args.line & 0xFFFF;
+
+        const id = bpId++;  // unique target ID
+        gotoTargetMap.set(id, addr);
+        respond(req, {
+            targets: [{
+                id: id,
+                label: labelFor(addr),
+                line: 0,
+                column: 0,
+                instructionPointerReference: '0x' + addr.toString(16).padStart(4, '0')
+            }]
+        });
+    },
+
+    async goto(req) {
+        const targetId = req.arguments.targetId;
+        const addr = gotoTargetMap.get(targetId);
+        if (addr === undefined) {
+            respond(req, {}, false, 'Unknown goto target');
+            return;
+        }
+        gotoTargetMap.delete(targetId);
+        // Set PC via GDB P4= command (little-endian)
+        const pcLo = (addr & 0xFF).toString(16).padStart(2, '0');
+        const pcHi = ((addr >> 8) & 0xFF).toString(16).padStart(2, '0');
+        const r = await gdbCmd('P4=' + pcLo + pcHi);
+        if (r !== 'OK') { respond(req, {}, false, 'Failed to set PC'); return; }
+        const g = await gdbCmd('g');
+        regs = parseRegsG(g);
+        respond(req);
+        evt('stopped', { reason: 'goto', threadId: 1, allThreadsStopped: true });
+    },
+
+    // -- Execution control ----------------------------------------
+
+    continue(req) {
+        regs = null;
+        respond(req, { allThreadsContinued: true });
+        running = true;
+        gdbWrite('c');
+        evt('continued', { threadId: 1, allThreadsContinued: true });
+    },
+
+    next(req) {
+        regs = null;
+        respond(req);
+        running = true;
+        gdbWrite('s');
+    },
+
+    stepIn(req) {
+        regs = null;
+        respond(req);
+        running = true;
+        gdbWrite('s');
+    },
+
+    stepOut(req) {
+        // 6502 has no native step-out — just continue
+        regs = null;
+        respond(req, { allThreadsContinued: true });
+        running = true;
+        gdbWrite('c');
+        evt('continued', { threadId: 1, allThreadsContinued: true });
+    },
+
+    pause(req) {
+        respond(req);
+        if (sock) sock.write('\x03');
+    },
+
+    // -- Breakpoints ----------------------------------------------
+
+    setBreakpoints(req) {
+        // Source-line breakpoints require line-to-address mapping we don't have.
+        const result = (req.arguments.breakpoints || []).map(() => ({
+            verified: false,
+            message: 'Use function breakpoints with symbol names'
+        }));
+        respond(req, { breakpoints: result });
+    },
+
+    async setFunctionBreakpoints(req) {
+        // Clear all existing function breakpoints from the stub
+        for (const [, bp] of bps) {
+            await gdbCmd('z0,' + bp.addr.toString(16) + ',1');
+        }
+        bps.clear();
+
+        // Set new ones by resolving symbol names to addresses
+        const result = [];
+        for (const fbp of (req.arguments.breakpoints || [])) {
+            const name = fbp.name;
+            const addr = symbols.get(name);
+            if (addr !== undefined) {
+                const r = await gdbCmd('Z0,' + addr.toString(16) + ',1');
+                const id = bpId++;
+                const ok = r === 'OK';
+                bps.set(id, { id: id, addr: addr, name: name });
+                result.push({
+                    id: id,
+                    verified: ok,
+                    message: ok ? undefined : 'Failed to set breakpoint'
+                });
+            } else {
+                result.push({
+                    id: bpId++,
+                    verified: false,
+                    message: 'Symbol not found: ' + name
+                });
+            }
+        }
+        respond(req, { breakpoints: result });
+    },
+
+    setExceptionBreakpoints(req) {
+        respond(req);
+    },
+
+    async setInstructionBreakpoints(req) {
+        // Clear existing instruction breakpoints
+        for (const [, bp] of ibps) {
+            await gdbCmd('z0,' + bp.addr.toString(16) + ',1');
+        }
+        ibps.clear();
+
+        const result = [];
+        for (const ibp of (req.arguments.breakpoints || [])) {
+            const addr = (parseInt(ibp.instructionReference, 16) + (ibp.offset || 0)) & 0xFFFF;
+            const r = await gdbCmd('Z0,' + addr.toString(16) + ',1');
+            const id = bpId++;
+            const ok = r === 'OK';
+            if (ok) ibps.set(id, { id: id, addr: addr });
+            result.push({
+                id: id,
+                verified: ok,
+                instructionReference: '0x' + addr.toString(16).padStart(4, '0'),
+                message: ok ? undefined : 'Failed to set breakpoint'
+            });
+        }
+        respond(req, { breakpoints: result });
+    },
+
+    // -- Memory / Disassembly -------------------------------------
+
+    async readMemory(req) {
+        const args = req.arguments;
+        const addr = (parseInt(args.memoryReference, 16) + (args.offset || 0)) & 0xFFFF;
+        const count = Math.min(args.count, 0xFFFF - addr + 1);
+        const reply = await gdbCmd('m' + addr.toString(16) + ',' + count.toString(16));
+        if (!reply || reply[0] === 'E') {
+            respond(req, { address: '0x' + addr.toString(16).padStart(4, '0'), data: '' });
+            return;
+        }
+        const buf = Buffer.alloc(reply.length / 2);
+        for (let i = 0; i < reply.length; i += 2)
+            buf[i / 2] = parseInt(reply.substring(i, i + 2), 16);
+        respond(req, {
+            address: '0x' + addr.toString(16).padStart(4, '0'),
+            data: buf.toString('base64')
+        });
+    },
+
+    async writeMemory(req) {
+        const args = req.arguments;
+        const addr = (parseInt(args.memoryReference, 16) + (args.offset || 0)) & 0xFFFF;
+        const buf = Buffer.from(args.data, 'base64');
+        let hex = '';
+        for (const b of buf) hex += b.toString(16).padStart(2, '0');
+        const reply = await gdbCmd('M' + addr.toString(16) + ',' + buf.length.toString(16) + ':' + hex);
+        respond(req, { bytesWritten: reply === 'OK' ? buf.length : 0 });
+    },
+
+    async disassemble(req) {
+        const args = req.arguments;
+        const baseAddr = (parseInt(args.memoryReference, 16) + (args.offset || 0)) & 0xFFFF;
+        const instrOff = args.instructionOffset || 0;
+        const count = args.instructionCount;
+
+        // Back up for negative offsets (max 3 bytes per 6502 instruction)
+        let startAddr = baseAddr;
+        if (instrOff < 0) startAddr = Math.max(0, baseAddr + instrOff * 3);
+
+        // Read enough bytes: (count + |instrOff|) instructions * 3 bytes max each
+        const need = (count + Math.abs(instrOff)) * 3;
+        const readAddr = startAddr & 0xFFFF;
+        const reply = await gdbCmd('m' + readAddr.toString(16) + ',' + Math.min(need, 0xFFFF - readAddr + 1).toString(16));
+        if (!reply || reply[0] === 'E') {
+            respond(req, { instructions: [] });
+            return;
+        }
+
+        const mem = [];
+        for (let i = 0; i < reply.length; i += 2)
+            mem.push(parseInt(reply.substring(i, i + 2), 16));
+
+        // Decode instructions
+        const all = [];
+        let off = 0;
+        while (off < mem.length && all.length < count + Math.abs(instrOff) + 16) {
+            const a = (readAddr + off) & 0xFFFF;
+            const op = mem[off];
+            const entry = OPS[op];
+            if (entry) {
+                const mne = entry.substring(0, 3);
+                const mode = entry[3];
+                const sz = opSize(mode);
+                const lo = off + 1 < mem.length ? mem[off + 1] : 0;
+                const hi = off + 2 < mem.length ? mem[off + 2] : 0;
+                const operand = fmtOp(mode, lo, hi, a, addrSym);
+                let opBytes = '';
+                for (let j = 0; j < sz && off + j < mem.length; j++)
+                    opBytes += mem[off + j].toString(16).toUpperCase().padStart(2, '0') + ' ';
+                const instr = {
+                    address: '0x' + a.toString(16).padStart(4, '0'),
+                    instructionBytes: opBytes.trim(),
+                    instruction: mne + (operand ? ' ' + operand : '')
+                };
+                const sym = addrSym.get(a);
+                if (sym) instr.symbol = sym;
+                all.push(instr);
+                off += sz;
+            } else {
+                all.push({
+                    address: '0x' + a.toString(16).padStart(4, '0'),
+                    instructionBytes: mem[off].toString(16).toUpperCase().padStart(2, '0'),
+                    instruction: '.byte $' + mem[off].toString(16).toUpperCase().padStart(2, '0')
+                });
+                off += 1;
+            }
+        }
+
+        // Find the instruction at/after baseAddr and apply instrOff
+        let pivot = 0;
+        if (instrOff < 0) {
+            for (let i = 0; i < all.length; i++) {
+                if (parseInt(all[i].address, 16) >= baseAddr) { pivot = i; break; }
+            }
+            pivot = Math.max(0, pivot + instrOff);
+        }
+
+        respond(req, { instructions: all.slice(pivot, pivot + count) });
+    },
+
+    // -- Debug console (evaluate) ---------------------------------
+
+    async evaluate(req) {
+        const expr = (req.arguments.expression || '').trim();
+        let m;
+
+        // Skip instruction (like Oricutron's F12):  skip
+        if (expr.toLowerCase() === 'skip') {
+            if (!regs) { respond(req, {}, false, 'No register state'); return; }
+            const pc = regs.pc;
+            const opReply = await gdbCmd('m' + pc.toString(16) + ',1');
+            if (!opReply || opReply[0] === 'E') { respond(req, {}, false, 'Cannot read opcode'); return; }
+            const opcode = parseInt(opReply.substring(0, 2), 16);
+            const entry = OPS[opcode];
+            const sz = entry ? opSize(entry[3]) : 1;
+            const newPc = (pc + sz) & 0xFFFF;
+            const pcLo = (newPc & 0xFF).toString(16).padStart(2, '0');
+            const pcHi = ((newPc >> 8) & 0xFF).toString(16).padStart(2, '0');
+            await gdbCmd('P4=' + pcLo + pcHi);
+            const r = await gdbCmd('g');
+            regs = parseRegsG(r);
+            respond(req, {
+                result: 'Skipped to ' + labelFor(newPc) + ' ($' + newPc.toString(16).toUpperCase().padStart(4, '0') + ')',
+                variablesReference: 0
+            });
+            evt('stopped', { reason: 'step', threadId: 1, allThreadsStopped: true });
+            return;
+        }
+
+        // Memory read:  x $ADDR [LEN]  or  m ADDR,LEN
+        if ((m = expr.match(/^[xm]\s+\$?([0-9a-fA-F]{1,4})(?:[,\s]+(\d+))?$/i))) {
+            const addr = parseInt(m[1], 16);
+            const len  = parseInt(m[2] || '16', 10);
+            const r = await gdbCmd('m' + addr.toString(16) + ',' + len.toString(16));
+            if (r && r[0] !== 'E') {
+                let out = '$' + addr.toString(16).toUpperCase().padStart(4, '0') + ':';
+                for (let i = 0; i < r.length; i += 2) {
+                    if (i > 0 && i % 32 === 0) out += '\n' + ' '.repeat(6);
+                    out += ' ' + r.substring(i, i + 2).toUpperCase();
+                }
+                respond(req, { result: out, variablesReference: 0 });
+            } else {
+                respond(req, {}, false, 'Memory read failed');
+            }
+            return;
+        }
+
+        // Memory write:  w $ADDR $VAL
+        if ((m = expr.match(/^w\s+\$?([0-9a-fA-F]{1,4})\s+\$?([0-9a-fA-F]{1,2})$/i))) {
+            const addr = parseInt(m[1], 16);
+            const val  = parseInt(m[2], 16);
+            const r = await gdbCmd('M' + addr.toString(16) + ',1:' + val.toString(16).padStart(2, '0'));
+            respond(req, {
+                result: r === 'OK' ? 'OK' : 'Write failed',
+                variablesReference: 0
+            });
+            return;
+        }
+
+        // Symbol lookup:  sym NAME
+        if ((m = expr.match(/^sym\s+(\S+)$/i))) {
+            const a = symbols.get(m[1]);
+            if (a !== undefined) {
+                respond(req, {
+                    result: m[1] + ' = $' + a.toString(16).toUpperCase().padStart(4, '0'),
+                    variablesReference: 0
+                });
+            } else {
+                respond(req, { result: 'Symbol not found: ' + m[1], variablesReference: 0 });
+            }
+            return;
+        }
+
+        // Register write:  A=$xx  X=$xx  Y=$xx  SP=$xx  PC=$xxxx  ($ prefix required for hex)
+        //                  A=65   X=10  (no $ = decimal)
+        if ((m = expr.match(/^(A|X|Y|SP|PC)\s*=\s*(\$[0-9a-fA-F]{1,4}|\d+)$/i))) {
+            const rname = m[1].toUpperCase();
+            const raw = m[2];
+            const val = raw.startsWith('$') ? parseInt(raw.substring(1), 16) : parseInt(raw, 10);
+            const regNums = { A: 0, X: 1, Y: 2, SP: 3, PC: 4 };
+            const rn = regNums[rname];
+            let payload;
+            if (rname === 'PC') {
+                payload = (val & 0xFF).toString(16).padStart(2, '0') + ((val >> 8) & 0xFF).toString(16).padStart(2, '0');
+            } else {
+                payload = (val & 0xFF).toString(16).padStart(2, '0');
+            }
+            const r = await gdbCmd('P' + rn + '=' + payload);
+            if (r === 'OK') {
+                const g = await gdbCmd('g');
+                regs = parseRegsG(g);
+                const w = rname === 'PC' ? 4 : 2;
+                respond(req, {
+                    result: rname + ' = $' + (val & (w === 4 ? 0xFFFF : 0xFF)).toString(16).toUpperCase().padStart(w, '0') + ' (' + val + ')',
+                    variablesReference: 0
+                });
+                evt('stopped', { reason: 'pause', threadId: 1, allThreadsStopped: true });
+            } else {
+                respond(req, {}, false, 'Failed to set ' + rname);
+            }
+            return;
+        }
+
+        // Register read:  A, X, Y, SP, PC
+        if (regs) {
+            const u = expr.toUpperCase();
+            const vals = { A: regs.a, X: regs.x, Y: regs.y, SP: regs.sp, PC: regs.pc };
+            if (u in vals) {
+                const v = vals[u];
+                const w = u === 'PC' ? 4 : 2;
+                respond(req, {
+                    result: '$' + v.toString(16).toUpperCase().padStart(w, '0') + ' (' + v + ')',
+                    variablesReference: 0
+                });
+                return;
+            }
+        }
+
+        // Goto (set PC):  goto $ADDR  or  goto symbolName
+        if ((m = expr.match(/^goto\s+\$?([0-9a-fA-F]{1,4})$/i))) {
+            const addr = parseInt(m[1], 16) & 0xFFFF;
+            const pcLo = (addr & 0xFF).toString(16).padStart(2, '0');
+            const pcHi = ((addr >> 8) & 0xFF).toString(16).padStart(2, '0');
+            await gdbCmd('P4=' + pcLo + pcHi);
+            const r = await gdbCmd('g');
+            regs = parseRegsG(r);
+            respond(req, {
+                result: 'PC = ' + labelFor(addr) + ' ($' + addr.toString(16).toUpperCase().padStart(4, '0') + ')',
+                variablesReference: 0
+            });
+            evt('stopped', { reason: 'goto', threadId: 1, allThreadsStopped: true });
+            return;
+        }
+        if ((m = expr.match(/^goto\s+(\S+)$/i))) {
+            const symAddr = symbols.get(m[1]);
+            if (symAddr === undefined) { respond(req, {}, false, 'Symbol not found: ' + m[1]); return; }
+            const pcLo = (symAddr & 0xFF).toString(16).padStart(2, '0');
+            const pcHi = ((symAddr >> 8) & 0xFF).toString(16).padStart(2, '0');
+            await gdbCmd('P4=' + pcLo + pcHi);
+            const r = await gdbCmd('g');
+            regs = parseRegsG(r);
+            respond(req, {
+                result: 'PC = ' + m[1] + ' ($' + symAddr.toString(16).toUpperCase().padStart(4, '0') + ')',
+                variablesReference: 0
+            });
+            evt('stopped', { reason: 'goto', threadId: 1, allThreadsStopped: true });
+            return;
+        }
+
+        // Try as bare symbol name
+        const a = symbols.get(expr);
+        if (a !== undefined) {
+            respond(req, {
+                result: '$' + a.toString(16).toUpperCase().padStart(4, '0'),
+                variablesReference: 0
+            });
+            return;
+        }
+
+        // Help
+        respond(req, {}, false,
+            'Commands: A/X/Y/SP/PC (read) | A=$xx (write) | skip | goto $ADDR | goto SYMBOL | x $ADDR [LEN] | w $ADDR $VAL | sym NAME | <symbol>');
+    },
+
+    // -- Custom requests (called from extension.js) -------------------
+
+    async readCpuExtra(req) {
+        const reply = await gdbCmd('qOricCpuExtra');
+        if (!reply || reply.length < 4) {
+            respond(req, { extra: null });
+            return;
+        }
+        // Parse L:LLHH;C:LLHHLLHH;F:LLHHLLHH;R:LLHH;N:LLHH;T:LLHH;I:LLHH (little-endian hex)
+        const result = {};
+        const sections = reply.split(';');
+        for (const sec of sections) {
+            const colon = sec.indexOf(':');
+            if (colon < 0) continue;
+            const key = sec.substring(0, colon);
+            const hex = sec.substring(colon + 1);
+            // Decode little-endian hex bytes into a number
+            let val = 0;
+            for (let i = 0; i < hex.length; i += 2)
+                val |= parseInt(hex.substring(i, i + 2), 16) << (i * 4);
+            result[key] = val;
+        }
+        respond(req, { extra: result });
+    },
+
+    async readPeripherals(req) {
+        const reply = await gdbCmd('qOricPeripherals');
+        log('readPeripherals GDB reply: ' + (reply ? reply.substring(0, 80) : '(null)'));
+        if (!reply || reply.length < 4) {
+            respond(req, { peripherals: null });
+            return;
+        }
+        // Parse response: V:hex;A:hex;F:hex;M:hex
+        const result = {};
+        const sections = reply.split(';');
+        for (const sec of sections) {
+            const colon = sec.indexOf(':');
+            if (colon < 0) continue;
+            const key = sec.substring(0, colon);
+            const hex = sec.substring(colon + 1);
+            const bytes = [];
+            for (let i = 0; i < hex.length; i += 2)
+                bytes.push(parseInt(hex.substring(i, i + 2), 16));
+            result[key] = bytes;
+        }
+        respond(req, { peripherals: result });
+    }
+};

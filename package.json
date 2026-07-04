@@ -1,0 +1,122 @@
+{
+    "name": "osdk-debug",
+    "displayName": "OSDK",
+    "description": "Oric Software Development Kit - 6502/XA assembly highlighting and Oricutron debugging",
+    "version": "1.0.2",
+    "publisher": "dbug",
+    "engines": {
+        "vscode": "^1.64.0"
+    },
+    "categories": [
+        "Debuggers",
+        "Programming Languages"
+    ],
+    "keywords": [
+        "osdk",
+        "6502",
+        "65C02",
+        "oric",
+        "oricutron"
+    ],
+    "activationEvents": [
+        "onDebugResolve:oric-debug"
+    ],
+    "main": "./extension.js",
+    "contributes": {
+        "languages": [
+            {
+                "id": "osdk",
+                "aliases": ["OSDK"],
+                "extensions": [".asm", ".s"],
+                "configuration": "./language-configuration.json"
+            }
+        ],
+        "grammars": [
+            {
+                "language": "osdk",
+                "scopeName": "source.asm.6502_65816.osdk",
+                "path": "./syntaxes/osdk.tmLanguage"
+            }
+        ],
+        "breakpoints": [
+            { "language": "osdk" }
+        ],
+        "views": {
+            "debug": [
+                {
+                    "id": "oricCpuRegs",
+                    "name": "Oric Registers",
+                    "type": "webview"
+                },
+                {
+                    "id": "oricZeroPage",
+                    "name": "Oric Zero Page"
+                },
+                {
+                    "id": "oricPeripherals",
+                    "name": "Oric Peripherals",
+                    "type": "webview"
+                }
+            ]
+        },
+        "debuggers": [
+            {
+                "type": "oric-debug",
+                "label": "Oric Debug",
+                "program": "./debug_adapter.js",
+                "runtime": "node",
+                "configurationAttributes": {
+                    "attach": {
+                        "required": ["port"],
+                        "properties": {
+                            "host": {
+                                "type": "string",
+                                "description": "Hostname of the Oricutron GDB stub",
+                                "default": "localhost"
+                            },
+                            "port": {
+                                "type": "number",
+                                "description": "TCP port of the Oricutron GDB stub",
+                                "default": 6502
+                            },
+                            "symbolFile": {
+                                "type": "string",
+                                "description": "Path to symbol file (HHHH symbol_name per line)"
+                            },
+                            "stopOnAttach": {
+                                "type": "boolean",
+                                "description": "Break on attach",
+                                "default": true
+                            }
+                        }
+                    }
+                },
+                "initialConfigurations": [
+                    {
+                        "type": "oric-debug",
+                        "request": "attach",
+                        "name": "Attach to Oricutron",
+                        "host": "localhost",
+                        "port": 6502,
+                        "stopOnAttach": true
+                    }
+                ],
+                "configurationSnippets": [
+                    {
+                        "label": "Oric Debug: Attach",
+                        "description": "Attach to a running Oricutron instance with GDB stub enabled",
+                        "body": {
+                            "type": "oric-debug",
+                            "request": "attach",
+                            "name": "Attach to Oricutron",
+                            "host": "localhost",
+                            "port": 6502,
+                            "symbolFile": "${workspaceFolder}/build/symbols",
+                            "stopOnAttach": true
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+}
