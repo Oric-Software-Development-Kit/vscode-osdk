@@ -62,6 +62,9 @@ function respond(req, body, ok, message) {
 
 function evt(name, body) {
     sendDap({ type: 'event', event: name, body: body || {} });
+    if (name === 'stopped') {
+        sendDap({ type: 'event', event: 'invalidated', body: { areas: ['variables'] } });
+    }
 }
 
 function log(msg) {
@@ -192,6 +195,8 @@ function gdbCmd(cmd) {
 
 let symbols    = new Map();   // name  -> address (number)
 let addrSym    = new Map();   // address -> name
+let addrSource = new Map();   // address -> { file, line } (from symbol defs)
+let lineTable  = [];          // [{addr, file, line}] sorted by addr (from #LINES)
 let regs       = null;        // { a, x, y, sp, pc, f }
 let running    = false;
 let config     = {};
@@ -201,6 +206,7 @@ let ibps       = new Map();   // id -> { id, addr }       (instruction breakpoin
 let zpSymbols  = [];          // [{addr, name, size}] sorted by address
 let configDone = false;
 let pendingStop = null;       // deferred stopped event body
+let srcBps     = new Map();   // file -> [{id, addr}] (source breakpoints per file)
 let gotoTargetMap = new Map(); // targetId -> address (for goto/setNextStatement)
 
 // ----------------------------------------------------------------
@@ -210,18 +216,72 @@ let gotoTargetMap = new Map(); // targetId -> address (for goto/setNextStatement
 function loadSymbols(file) {
     symbols.clear();
     addrSym.clear();
+    addrSource.clear();
+    lineTable = [];
     zpSymbols = [];
     try {
         const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
+        let isV2 = false;
+        let section = 'sym';    // 'sym', 'files', or 'lines'
+        let fileIndex = [];     // index -> absolute path (from #FILES)
+
         for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed === '#SYM V2')  { isV2 = true; section = 'sym'; continue; }
+            if (trimmed === '#FILES')   { section = 'files'; fileIndex = []; continue; }
+            if (trimmed === '#LINES')   { section = 'lines'; continue; }
+
+            if (section === 'files') {
+                // Format: "index filepath"
+                const fm = trimmed.match(/^(\d+)\s+(.+)$/);
+                if (fm) fileIndex[parseInt(fm[1], 10)] = fm[2];
+                continue;
+            }
+
+            if (section === 'lines') {
+                // Format: "HHHH fileIndex:line"
+                const lm = trimmed.match(/^([0-9a-fA-F]{4})\s+(\d+):(\d+)$/);
+                if (lm) {
+                    const fi = parseInt(lm[2], 10);
+                    lineTable.push({
+                        addr: parseInt(lm[1], 16),
+                        file: fileIndex[fi] || ('file#' + fi),
+                        line: parseInt(lm[3], 10)
+                    });
+                }
+                continue;
+            }
+
+            // section === 'sym': parse symbol entries
             const m = line.match(/^([0-9a-fA-F]{4})\s+(\S+)/);
             if (m) {
                 const a = parseInt(m[1], 16);
                 const n = m[2];
                 symbols.set(n, a);
                 if (!addrSym.has(a)) addrSym.set(a, n);
+                if (isV2 && !addrSource.has(a)) {
+                    const rest = line.substring(m[0].length).trim();
+                    const cm = rest.match(/^(.+):(\d+)$/);
+                    if (cm) {
+                        addrSource.set(a, { file: cm[1], line: parseInt(cm[2], 10) });
+                    }
+                }
             }
         }
+
+        // Sort line table by address (modules may be concatenated in any order)
+        // then deduplicate: keep last entry for each address (the code-producing line)
+        if (lineTable.length > 1) {
+            lineTable.sort((a, b) => a.addr - b.addr);
+            const deduped = [];
+            for (let i = 0; i < lineTable.length; i++) {
+                if (i === lineTable.length - 1 || lineTable[i + 1].addr !== lineTable[i].addr) {
+                    deduped.push(lineTable[i]);
+                }
+            }
+            lineTable = deduped;
+        }
+
         // Build sorted zero-page symbol list with inferred sizes
         const zpAddrs = [];
         for (const [a, n] of addrSym) {
@@ -233,7 +293,7 @@ function loadSymbols(file) {
             const size = Math.min(next - zpAddrs[i].addr, 2); // 1 or 2 bytes
             zpSymbols.push({ addr: zpAddrs[i].addr, name: zpAddrs[i].name, size: size });
         }
-        log('Loaded ' + symbols.size + ' symbols from ' + file + ' (' + zpSymbols.length + ' zero-page)');
+        log('Loaded ' + symbols.size + ' symbols, ' + lineTable.length + ' line entries from ' + file);
     } catch (e) {
         log('Could not load symbols: ' + e.message);
     }
@@ -377,6 +437,29 @@ function fmtOp(mode, lo, hi, pc, symMap) {
 // Call stack walker — decode return addresses from the 6502 page 1 stack
 // ----------------------------------------------------------------
 
+// Resolve address to source location — prefers line table (instruction-level),
+// falls back to symbol-based addrSource (label-level)
+function sourceFor(addr) {
+    // Binary search the line table for largest address <= addr
+    if (lineTable.length > 0) {
+        let lo = 0, hi = lineTable.length - 1, best = -1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (lineTable[mid].addr <= addr) { best = mid; lo = mid + 1; }
+            else { hi = mid - 1; }
+        }
+        if (best >= 0) return lineTable[best];
+    }
+    // Fall back to symbol-based source map
+    const exact = addrSource.get(addr);
+    if (exact) return exact;
+    let bestAddr = -1, bestSrc = null;
+    for (const [a, src] of addrSource) {
+        if (a <= addr && a > bestAddr) { bestAddr = a; bestSrc = src; }
+    }
+    return bestSrc;
+}
+
 // Resolve address to nearest symbol label
 function labelFor(addr) {
     const exact = addrSym.get(addr);
@@ -504,7 +587,8 @@ const handlers = {
             supportsGotoTargetsRequest: true,
             supportsStepInTargetsRequest: false,
             supportsCompletionsRequest: false,
-            supportsModulesRequest: false
+            supportsModulesRequest: false,
+            supportsInvalidatedEvent: true
         });
         evt('initialized');
     },
@@ -586,26 +670,35 @@ const handlers = {
         }
         const pc = regs ? regs.pc : 0;
 
+        // Build a stack frame with optional source location from V2 symbols
+        function makeFrame(id, addr) {
+            const frame = {
+                id: id,
+                name: labelFor(addr),
+                line: 0,
+                column: 0,
+                instructionPointerReference: '0x' + addr.toString(16).padStart(4, '0')
+            };
+            const src = sourceFor(addr);
+            if (src) {
+                const path = require('path');
+                const filePath = path.isAbsolute(src.file) ? src.file
+                    : config.sourceRoot ? path.resolve(config.sourceRoot, src.file)
+                    : config.workspaceFolder ? path.resolve(config.workspaceFolder, src.file)
+                    : src.file;
+                frame.source = { name: path.basename(filePath), path: filePath };
+                frame.line = src.line;
+            }
+            return frame;
+        }
+
         // Frame 0: current PC
-        const stackFrames = [{
-            id: 0,
-            name: labelFor(pc),
-            line: 0,
-            column: 0,
-            instructionPointerReference: '0x' + pc.toString(16).padStart(4, '0')
-        }];
+        const stackFrames = [makeFrame(0, pc)];
 
         // Walk the hardware stack to find JSR return addresses
         const returnAddrs = await buildCallStack();
         for (let i = 0; i < returnAddrs.length; i++) {
-            const ra = returnAddrs[i];
-            stackFrames.push({
-                id: i + 1,
-                name: labelFor(ra),
-                line: 0,
-                column: 0,
-                instructionPointerReference: '0x' + ra.toString(16).padStart(4, '0')
-            });
+            stackFrames.push(makeFrame(i + 1, returnAddrs[i]));
         }
 
         respond(req, {
@@ -617,7 +710,14 @@ const handlers = {
     // -- Scopes / Variables ---------------------------------------
 
     scopes(req) {
-        respond(req, { scopes: [] });
+        const scopes = [
+            { name: 'Registers', variablesReference: 1, expensive: false },
+            { name: 'Flags',     variablesReference: 2, expensive: false },
+        ];
+        if (zpSymbols.length > 0) {
+            scopes.push({ name: 'Zero Page', variablesReference: 3, expensive: false });
+        }
+        respond(req, { scopes: scopes });
     },
 
     async variables(req) {
@@ -665,11 +765,11 @@ const handlers = {
                 let val;
                 if (s.size >= 2 && a + 1 < zp.length) {
                     const w = zp[a] | (zp[a + 1] << 8);
-                    val = hAddr + ': $' + w.toString(16).toUpperCase().padStart(4, '0') + ' (' + w + ')';
+                    val = '$' + w.toString(16).toUpperCase().padStart(4, '0') + ' (' + w + ')';
                 } else {
-                    val = hAddr + ': $' + zp[a].toString(16).toUpperCase().padStart(2, '0') + ' (' + zp[a] + ')';
+                    val = '$' + zp[a].toString(16).toUpperCase().padStart(2, '0') + ' (' + zp[a] + ')';
                 }
-                vars.push({ name: s.name, value: val, variablesReference: 0 });
+                vars.push({ name: hAddr + ' ' + s.name, value: val, variablesReference: 0 });
             }
             respond(req, { variables: vars });
         } else {
@@ -820,12 +920,56 @@ const handlers = {
 
     // -- Breakpoints ----------------------------------------------
 
-    setBreakpoints(req) {
-        // Source-line breakpoints require line-to-address mapping we don't have.
-        const result = (req.arguments.breakpoints || []).map(() => ({
-            verified: false,
-            message: 'Use function breakpoints with symbol names'
-        }));
+    async setBreakpoints(req) {
+        const args = req.arguments;
+        const srcPath = args.source && args.source.path ? args.source.path : '';
+
+        // Remove previous source breakpoints for this file
+        const prev = srcBps.get(srcPath) || [];
+        for (const bp of prev) {
+            await gdbCmd('z0,' + bp.addr.toString(16) + ',1');
+        }
+        srcBps.set(srcPath, []);
+
+        const result = [];
+        const newBps = [];
+        const path = require('path');
+
+        for (const sbp of (args.breakpoints || [])) {
+            const reqLine = sbp.line;
+
+            // Search line table for best match: same file, nearest line <= requested
+            let bestAddr = -1, bestLine = -1;
+            for (const entry of lineTable) {
+                // Compare paths case-insensitively on Windows
+                const match = path.resolve(entry.file).toLowerCase() === path.resolve(srcPath).toLowerCase();
+                if (match && entry.line <= reqLine && entry.line > bestLine) {
+                    bestLine = entry.line;
+                    bestAddr = entry.addr;
+                }
+            }
+
+            if (bestAddr >= 0) {
+                const r = await gdbCmd('Z0,' + bestAddr.toString(16) + ',1');
+                const id = bpId++;
+                const ok = r === 'OK';
+                newBps.push({ id: id, addr: bestAddr });
+                result.push({
+                    id: id,
+                    verified: ok,
+                    line: bestLine,
+                    source: args.source,
+                    message: ok ? undefined : 'Failed to set breakpoint'
+                });
+            } else {
+                result.push({
+                    id: bpId++,
+                    verified: false,
+                    message: 'No code at this line'
+                });
+            }
+        }
+        srcBps.set(srcPath, newBps);
         respond(req, { breakpoints: result });
     },
 
@@ -1150,9 +1294,42 @@ const handlers = {
             return;
         }
 
+        // Forward to Oricutron monitor via qOricCmd:  ! <command>
+        if (expr.startsWith('!')) {
+            const monCmd = expr.substring(1).trim();
+            if (!monCmd) { respond(req, {}, false, 'Usage: ! <monitor command>  (e.g. ! = tmp0+2)'); return; }
+            const hexCmd = Buffer.from(monCmd, 'utf8').toString('hex');
+            const r = await gdbCmd('qOricCmd,' + hexCmd);
+            if (r && r.length > 0) {
+                // Decode hex-encoded output
+                let text = '';
+                for (let i = 0; i < r.length; i += 2)
+                    text += String.fromCharCode(parseInt(r.substring(i, i + 2), 16));
+                respond(req, { result: text, variablesReference: 0 });
+            } else {
+                respond(req, { result: '(no output)', variablesReference: 0 });
+            }
+            return;
+        }
+
+        // Try qOricEval as fallback for watch expressions
+        {
+            const hexExpr = Buffer.from(expr, 'utf8').toString('hex');
+            const evalReply = await gdbCmd('qOricEval,' + hexExpr);
+            if (evalReply && evalReply.startsWith('V')) {
+                const val = parseInt(evalReply.substring(1), 16);
+                respond(req, {
+                    result: '$' + val.toString(16).toUpperCase().padStart(4, '0') + ' (' + val + ')',
+                    variablesReference: 0,
+                    memoryReference: '0x' + val.toString(16)
+                });
+                return;
+            }
+        }
+
         // Help
         respond(req, {}, false,
-            'Commands: A/X/Y/SP/PC (read) | A=$xx (write) | skip | goto $ADDR | goto SYMBOL | x $ADDR [LEN] | w $ADDR $VAL | sym NAME | <symbol>');
+            'Commands: A/X/Y/SP/PC (read) | A=$xx (write) | skip | goto $ADDR | goto SYMBOL | x $ADDR [LEN] | w $ADDR $VAL | sym NAME | ! <mon cmd> | <symbol>');
     },
 
     // -- Custom requests (called from extension.js) -------------------
@@ -1201,5 +1378,21 @@ const handlers = {
             result[key] = bytes;
         }
         respond(req, { peripherals: result });
+    },
+
+    async evaluateMemory(req) {
+        const expr = req.arguments.expression || '';
+        const count = req.arguments.count || 128;
+        // Evaluate expression via qOricEval
+        const hexExpr = Buffer.from(expr, 'utf8').toString('hex');
+        const evalReply = await gdbCmd('qOricEval,' + hexExpr);
+        if (!evalReply || !evalReply.startsWith('V')) {
+            respond(req, { error: 'Invalid expression: ' + expr });
+            return;
+        }
+        const addr = parseInt(evalReply.substring(1), 16);
+        // Read memory
+        const memReply = await gdbCmd('m' + addr.toString(16) + ',' + count.toString(16));
+        respond(req, { address: addr, data: memReply || '', expression: expr });
     }
 };

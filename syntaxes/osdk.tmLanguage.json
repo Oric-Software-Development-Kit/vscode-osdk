@@ -1,0 +1,314 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "scopeName": "source.asm.6502_65816.osdk",
+  "name": "6502/xa Assembly (OSDK)",
+  "fileTypes": ["asm", "s"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#preprocessor" },
+    { "include": "#xa_scope" },
+    { "include": "#equates" },
+    { "include": "#label_line" },
+    { "include": "#opcodes" },
+    { "include": "#directives" },
+    { "include": "#macro_call" },
+    { "include": "#numeric" },
+    { "include": "#immediate" },
+    { "include": "#registers" },
+    { "include": "#operators" },
+    { "include": "#punctuation" },
+    { "include": "#identifiers" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block",
+          "begin": "/\\*",
+          "end": "\\*/"
+        },
+        {
+          "name": "comment.line.semicolon",
+          "match": ";.*$"
+        },
+        {
+          "name": "comment.line.double-slash",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.line.backslash",
+          "match": "\\\\.*$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "preprocessor": {
+      "patterns": [
+        {
+          "comment": "#define NAME [value] — uses C-compatible scopes",
+          "name": "meta.preprocessor.macro.c",
+          "match": "^\\s*(#)\\s*(define)\\s+([A-Za-z_]\\w*)",
+          "captures": {
+            "1": { "name": "punctuation.definition.directive.c" },
+            "2": { "name": "keyword.control.directive.define.c" },
+            "3": { "name": "entity.name.function.preprocessor.c" }
+          }
+        },
+        {
+          "comment": "#include \"file\"",
+          "name": "meta.preprocessor.include.c",
+          "match": "^\\s*(#)\\s*(include)\\s+(\"[^\"]*\")",
+          "captures": {
+            "1": { "name": "punctuation.definition.directive.c" },
+            "2": { "name": "keyword.control.directive.include.c" },
+            "3": { "name": "string.quoted.double.include.c" }
+          }
+        },
+        {
+          "comment": "#ifdef / #ifndef SYMBOL",
+          "name": "meta.preprocessor.c",
+          "match": "^\\s*(#)\\s*(ifdef|ifndef)\\s+([A-Za-z_]\\w*)",
+          "captures": {
+            "1": { "name": "punctuation.definition.directive.c" },
+            "2": { "name": "keyword.control.directive.conditional.c" },
+            "3": { "name": "entity.name.other.preprocessor.c" }
+          }
+        },
+        {
+          "comment": "#if / #else / #elif / #elseif / #endif / #undef / #pragma",
+          "name": "meta.preprocessor.c",
+          "match": "^\\s*(#)\\s*(if|else|elif|elseif|endif|undef|pragma)\\b",
+          "captures": {
+            "1": { "name": "punctuation.definition.directive.c" },
+            "2": { "name": "keyword.control.directive.conditional.c" }
+          }
+        }
+      ]
+    },
+    "xa_scope": {
+      "patterns": [
+        {
+          "comment": "XA anonymous scope: .( and .) (also .block / .bend)",
+          "match": "\\.([()])",
+          "name": "punctuation.section.scope"
+        }
+      ]
+    },
+    "equates": {
+      "patterns": [
+        {
+          "comment": "Constant/equate definition: SYMBOL = value",
+          "match": "^([A-Za-z_]\\w*)\\s*(=)",
+          "captures": {
+            "1": { "name": "variable.other.constant" },
+            "2": { "name": "keyword.operator.assignment" }
+          }
+        }
+      ]
+    },
+    "label_line": {
+      "patterns": [
+        {
+          "comment": "Global label with + prefix (XA export)",
+          "match": "^(\\+)([A-Za-z_]\\w*)",
+          "captures": {
+            "1": { "name": "punctuation.definition.label" },
+            "2": { "name": "entity.name.function.label" }
+          }
+        },
+        {
+          "comment": "Label at line start (with optional colon)",
+          "match": "^([A-Za-z_]\\w*)\\s*(:)?",
+          "captures": {
+            "1": { "name": "entity.name.function.label" },
+            "2": { "name": "punctuation.separator.colon" }
+          }
+        }
+      ]
+    },
+    "opcodes": {
+      "patterns": [
+        {
+          "comment": "Standard 6502 opcodes",
+          "match": "(?i)(?<=\\s|:)(adc|and|asl|bcc|bcs|beq|bit|bmi|bne|bpl|brk|bvc|bvs|clc|cld|cli|clv|cmp|cpx|cpy|dec|dex|dey|eor|inc|inx|iny|jmp|jsr|lda|ldx|ldy|lsr|nop|ora|pha|php|pla|plp|rol|ror|rti|rts|sbc|sec|sed|sei|sta|stx|sty|tax|tay|tsx|txa|txs|tya)\\b",
+          "name": "keyword.other.opcode.6502"
+        },
+        {
+          "comment": "65C02 extended opcodes",
+          "match": "(?i)(?<=\\s|:)(stz|phx|phy|plx|ply|bra|trb|tsb)\\b",
+          "name": "keyword.other.opcode.65c02"
+        }
+      ]
+    },
+    "directives": {
+      "patterns": [
+        {
+          "comment": "XA data definition: .byt .byte .db .word .dw .long .asc .scr .psc .dsb .dupb .blkb",
+          "match": "(?i)(?<=\\s)(\\.(?:byt|byte|db|word|dw|long|asc|scr|psc|dsb|dupb|blkb))\\b",
+          "name": "storage.type"
+        },
+        {
+          "comment": "XA segment directives: .text .data .bss .zero",
+          "match": "(?i)(?<=\\s)(\\.(?:text|data|bss|zero))\\b",
+          "name": "storage.modifier"
+        },
+        {
+          "comment": "XA block directives: .block .bend",
+          "match": "(?i)(?<=\\s)(\\.(?:block|bend))\\b",
+          "name": "keyword.control.block"
+        },
+        {
+          "comment": "XA layout/option: .align .fopt .bin .memmap",
+          "match": "(?i)(?<=\\s)(\\.(?:align|fopt|bin|memmap))\\b",
+          "name": "keyword.control.directive"
+        },
+        {
+          "comment": "XA 65816 mode: .al .as .xl .xs",
+          "match": "(?i)(?<=\\s)(\\.(?:al|as|xl|xs))\\b",
+          "name": "keyword.control.mode"
+        },
+        {
+          "comment": "XA assertion: .assert .asserteq",
+          "match": "(?i)(?<=\\s)(\\.(?:assert|asserteq))\\b",
+          "name": "keyword.control.assert"
+        },
+        {
+          "comment": "XA compatibility (ignored): .end .list .xlist .dft",
+          "match": "(?i)(?<=\\s)(\\.(?:end|list|xlist|dft))\\b",
+          "name": "keyword.control.misc"
+        },
+        {
+          "comment": "Program counter assignment: *= $addr",
+          "match": "\\*\\s*=",
+          "name": "keyword.operator.assignment.pc"
+        }
+      ]
+    },
+    "macro_call": {
+      "patterns": [
+        {
+          "comment": "Macro or function-like call: IDENT(",
+          "match": "(?<=\\s)([A-Za-z_]\\w*)(?=\\s*\\()",
+          "captures": {
+            "1": { "name": "entity.name.function" }
+          }
+        }
+      ]
+    },
+    "numeric": {
+      "patterns": [
+        {
+          "comment": "$hex (6502/XA convention)",
+          "match": "\\$[0-9A-Fa-f]+",
+          "name": "constant.numeric.hexadecimal"
+        },
+        {
+          "comment": "0xHex (C convention)",
+          "match": "(?i)\\b0x[0-9A-Fa-f]+\\b",
+          "name": "constant.numeric.hexadecimal"
+        },
+        {
+          "comment": "%binary",
+          "match": "%[01]+",
+          "name": "constant.numeric.binary"
+        },
+        {
+          "comment": "Decimal",
+          "match": "\\b[0-9]+\\b",
+          "name": "constant.numeric.decimal"
+        }
+      ]
+    },
+    "immediate": {
+      "patterns": [
+        {
+          "comment": "Immediate addressing prefix: # before a value",
+          "match": "#(?=\\$|%|[0-9]|<|>|[A-Za-z_])",
+          "name": "keyword.operator.immediate"
+        }
+      ]
+    },
+    "registers": {
+      "patterns": [
+        {
+          "comment": "X or Y register in indexed addressing (after comma)",
+          "match": "(?i)(?<=,)\\s*([xy])\\b",
+          "captures": {
+            "1": { "name": "variable.language.register" }
+          }
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "match": "[+\\-*/%|^~<>=!&]",
+          "name": "keyword.operator"
+        },
+        {
+          "match": "(?i)\\bequ\\b",
+          "name": "keyword.operator.assignment"
+        },
+        {
+          "match": "(?i)\\.(and|x?or|not)\\b",
+          "name": "keyword.operator.logical"
+        },
+        {
+          "match": "(?i)\\.(lo|hi)(?=\\s*\\()",
+          "name": "keyword.operator.byte-select"
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "match": "[()]",
+          "name": "punctuation.bracket"
+        },
+        {
+          "match": ",",
+          "name": "punctuation.separator.comma"
+        },
+        {
+          "match": ":",
+          "name": "punctuation.separator.colon"
+        }
+      ]
+    },
+    "identifiers": {
+      "patterns": [
+        {
+          "comment": "General identifier / symbol reference",
+          "match": "\\b[A-Za-z_]\\w*\\b",
+          "name": "variable.other"
+        }
+      ]
+    }
+  }
+}

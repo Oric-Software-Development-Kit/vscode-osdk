@@ -2,8 +2,17 @@
     "name": "osdk-debug",
     "displayName": "OSDK",
     "description": "Oric Software Development Kit - 6502/XA assembly highlighting and Oricutron debugging",
-    "version": "1.0.2",
+    "version": "0.0.1",
     "publisher": "dbug",
+    "icon": "images/oric-icon.png",
+    "homepage": "https://osdk.org",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/Oric-Software-Development-Kit/vscode-osdk"
+    },
+    "bugs": {
+        "url": "https://github.com/Oric-Software-Development-Kit/vscode-osdk/issues"
+    },
     "engines": {
         "vscode": "^1.64.0"
     },
@@ -19,9 +28,33 @@
         "oricutron"
     ],
     "activationEvents": [
-        "onDebugResolve:oric-debug"
+        "onDebugResolve:oric-debug",
+        "onLanguage:osdk",
+        "onCommand:osdk.xaReference",
+        "onCommand:osdk.6502Reference"
     ],
     "main": "./extension.js",
+    "configurationDefaults": {
+        "files.associations": {
+            "*.s": "osdk",
+            "*.asm": "osdk"
+        },
+        "cSpell.words": [
+            "ACIA", "Arkos", "Atmos",
+            "endif", "elif", "elseif", "ifdef", "ifndef", "undef",
+            "Chema", "Cumana", "Cumulus",
+            "Defence", "DDENS", "DDRA", "DDRB", "DRQ",
+            "EPROM", "Erebus", "Euphoric",
+            "HIRES", "INTRQ", "IRQ",
+            "Jasmin", "Loci", "LORES",
+            "Microdisc", "NMI", "NOTRDY",
+            "ORA2", "ORB", "Oric", "Oricutron", "osdk", "OSDK",
+            "PCR", "PSG", "ROMDIS", "RST",
+            "Sedoric", "Stratsed",
+            "Telestrat", "Twilight",
+            "VIA", "WRPROT", "WRTERR"
+        ]
+    },
     "contributes": {
         "languages": [
             {
@@ -35,7 +68,7 @@
             {
                 "language": "osdk",
                 "scopeName": "source.asm.6502_65816.osdk",
-                "path": "./syntaxes/osdk.tmLanguage"
+                "path": "./syntaxes/osdk.tmLanguage.json"
             }
         ],
         "breakpoints": [
@@ -59,6 +92,20 @@
                 }
             ]
         },
+        "commands": [
+            {
+                "command": "oric-debug.openMemoryView",
+                "title": "Oric: Memory View"
+            },
+            {
+                "command": "osdk.xaReference",
+                "title": "OSDK: XA Quick Reference"
+            },
+            {
+                "command": "osdk.6502Reference",
+                "title": "OSDK: 6502 Opcode Reference"
+            }
+        ],
         "debuggers": [
             {
                 "type": "oric-debug",
