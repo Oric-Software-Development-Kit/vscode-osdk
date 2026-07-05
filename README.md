@@ -36,6 +36,18 @@ Three dedicated panels appear in the Debug sidebar:
 - **Oric Zero Page** - Zero page variables with symbol names (from the symbol file)
 - **Oric Peripherals** - Live state of the VIA 6522, AY-3-8912 sound chip, WD1793 floppy disk controller, Microdisc interface, and ACIA 6551 serial controller
 
+### Memory Heatmap
+
+Real-time visualization of memory access patterns across the Oric's 64KB address space. Open via the **Oric: Memory Heatmap** command (or from the Command Palette).
+
+- **Color mapping**: Red = CPU writes, Green = CPU reads, Blue = ULA video fetches. Overlapping accesses blend additively (yellow = read+write, cyan = read+ULA, etc.)
+- **Layout**: Four top blocks (Zero Page, Stack, Page 2, I/O), main RAM ($0400-$BFFF), and ROM/RAM ($C000-$FFFF) with ROMDIS-aware labeling
+- **Hover tooltip**: Shows the hex address under the cursor
+- **Auto-connect**: Connects to Oricutron's heatmap stream on `gdb_port + 1` when a debug session is active
+- **Pause-aware**: Freezes the display when the emulator is paused; resumes when execution continues
+
+The heatmap is useful for spotting memory access patterns, rogue pointers, out-of-bounds accesses, and understanding how the ULA reads video memory.
+
 ### Debug Console Commands
 
 | Command | Description |
@@ -125,17 +137,17 @@ Each line contains a 4-digit hex address followed by a space and the symbol name
 +-------------+     stdin/stdout (DAP)      +-----------------+
 |   VS Code   | <-------------------------> | debug_adapter.js|
 |  Debug UI   |                             |                 |
-+-------------+                             |  TCP (GDB RSP)  |
-                                            +--------+--------+
-                                                     |
-                                            +--------v--------+
-                                            |    Oricutron    |
-                                            |    GDB stub     |
-                                            |    port 6502    |
++------+------+                             |  TCP (GDB RSP)  |
+       |                                    +--------+--------+
+       |  extension.js                               |
+       |  TCP (binary frames, port+1)       +--------v--------+
+       +------------------------------+--> |    Oricutron    |
+              Heatmap stream           |    |  GDB stub :6502 |
+                                       +--> |  VIZ stream:6503|
                                             +-----------------+
 ```
 
-The debug adapter is a pure JavaScript process that communicates with VS Code via the Debug Adapter Protocol (DAP) over stdin/stdout, and with Oricutron via the GDB Remote Serial Protocol over TCP. No npm dependencies are required.
+The debug adapter is a pure JavaScript process that communicates with VS Code via the Debug Adapter Protocol (DAP) over stdin/stdout, and with Oricutron via the GDB Remote Serial Protocol over TCP. The heatmap stream is a separate TCP connection managed directly by extension.js, receiving binary frames (~192KB each at ~16fps) with per-address heat values for reads, writes, and ULA fetches. No npm dependencies are required.
 
 ## License
 

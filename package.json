@@ -2,7 +2,7 @@
     "name": "osdk-debug",
     "displayName": "OSDK",
     "description": "Oric Software Development Kit - 6502/XA assembly highlighting and Oricutron debugging",
-    "version": "0.0.1",
+    "version": "0.0.2",
     "publisher": "dbug",
     "icon": "images/oric-icon.png",
     "homepage": "https://osdk.org",
@@ -96,6 +96,10 @@
             {
                 "command": "oric-debug.openMemoryView",
                 "title": "Oric: Memory View"
+            },
+            {
+                "command": "oric-debug.openHeatmap",
+                "title": "Oric: Memory Heatmap"
             },
             {
                 "command": "osdk.xaReference",

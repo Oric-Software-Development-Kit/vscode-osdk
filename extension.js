@@ -1008,6 +1008,351 @@ render('');
 }
 
 // ----------------------------------------------------------------
+// Heatmap Panel (editor tab — movable, like Memory View)
+// ----------------------------------------------------------------
+
+let heatmapPanel = null;
+let heatmapSocket = null;
+let heatmapRxBuf = Buffer.alloc(0);
+let vizOutputChannel = null;
+
+function createHeatmapPanel() {
+    if (heatmapPanel) {
+        heatmapPanel.reveal();
+        return heatmapPanel;
+    }
+
+    const panel = vscode.window.createWebviewPanel(
+        'oricHeatmap',
+        'Oric Memory Heatmap',
+        vscode.ViewColumn.Beside,
+        { enableScripts: true, retainContextWhenHidden: true }
+    );
+
+    panel.onDidDispose(() => {
+        heatmapPanel = null;
+        heatmapDisconnect();
+    });
+
+    heatmapPanel = panel;
+    panel.webview.html = heatmapPanelHtml();
+
+    // Auto-connect if a debug session is active
+    const session = vscode.debug.activeDebugSession;
+    if (session && session.type === 'oric-debug') {
+        const config = session.configuration;
+        const gdbHost = config.host || 'localhost';
+        const gdbPort = config.port || 6502;
+        heatmapConnect(gdbHost, gdbPort + 1);
+    }
+
+    return panel;
+}
+
+function vizLog(msg) {
+    if (vizOutputChannel) vizOutputChannel.appendLine('[VIZ] ' + msg);
+    const session = vscode.debug.activeDebugSession;
+    if (session && session.type === 'oric-debug') {
+        session.customRequest('logToConsole', { text: msg }).catch(() => {});
+    }
+}
+
+function heatmapConnect(host, port) {
+    heatmapDisconnect();
+    if (!port || !heatmapPanel) return;
+
+    const net = require('net');
+    const sock = new net.Socket();
+    heatmapSocket = sock;
+    heatmapRxBuf = Buffer.alloc(0);
+
+    const FRAME_SIZE = 16 + 65536 * 3;
+    const MAGIC = 0x4349564F;  /* "OVIC" as uint32 LE */
+
+    vizLog('Connecting to heatmap server at ' + host + ':' + port + '...');
+
+    sock.connect(port, host, () => {
+        vizLog('Connected to ' + host + ':' + port);
+        if (heatmapPanel) {
+            heatmapPanel.webview.postMessage({ type: 'status', text: 'Connected to ' + host + ':' + port });
+        }
+    });
+
+    let syncErrors = 0;
+
+    sock.on('data', (chunk) => {
+        heatmapRxBuf = Buffer.concat([heatmapRxBuf, chunk]);
+
+        while (heatmapRxBuf.length >= FRAME_SIZE) {
+            const magic = heatmapRxBuf.readUInt32LE(0);
+            if (magic !== MAGIC) {
+                syncErrors++;
+                let found = -1;
+                for (let i = 1; i <= heatmapRxBuf.length - 4; i++) {
+                    if (heatmapRxBuf.readUInt32LE(i) === MAGIC) { found = i; break; }
+                }
+                if (found < 0) {
+                    const discarded = heatmapRxBuf.length - 3;
+                    heatmapRxBuf = heatmapRxBuf.slice(heatmapRxBuf.length - 3);
+                    vizLog('Frame sync error: bad magic, discarded ' + discarded + ' bytes (' + syncErrors + ' total sync errors)');
+                    if (heatmapPanel) {
+                        heatmapPanel.webview.postMessage({ type: 'error', text: 'Frame sync error (resynchronizing...)' });
+                    }
+                    return;
+                }
+                vizLog('Frame sync: skipped ' + found + ' bytes to re-align');
+                heatmapRxBuf = heatmapRxBuf.slice(found);
+                if (heatmapRxBuf.length < FRAME_SIZE) return;
+            }
+
+            const frame = heatmapRxBuf.slice(0, FRAME_SIZE);
+            heatmapRxBuf = heatmapRxBuf.slice(FRAME_SIZE);
+
+            if (heatmapPanel) {
+                heatmapPanel.webview.postMessage({
+                    type: 'heatmapFrame',
+                    frameCounter: frame.readUInt32LE(4),
+                    romdis: frame[8],
+                    vidMode: frame[9],
+                    vidAddr: frame.readUInt16LE(10),
+                    charsetAddr: frame.readUInt16LE(12),
+                    readHeat: frame.slice(16, 16 + 65536).toString('base64'),
+                    writeHeat: frame.slice(16 + 65536, 16 + 65536 * 2).toString('base64'),
+                    ulaHeat: frame.slice(16 + 65536 * 2, 16 + 65536 * 3).toString('base64')
+                });
+            }
+        }
+    });
+
+    sock.on('error', (err) => {
+        vizLog('Connection error: ' + err.message);
+        if (heatmapPanel) {
+            heatmapPanel.webview.postMessage({ type: 'error', text: 'Connection failed: ' + err.message });
+        }
+    });
+
+    sock.on('close', () => {
+        vizLog('Disconnected from heatmap server');
+        heatmapSocket = null;
+        if (heatmapPanel) {
+            heatmapPanel.webview.postMessage({ type: 'status', text: 'Disconnected' });
+        }
+    });
+}
+
+function heatmapDisconnect() {
+    if (heatmapSocket) {
+        heatmapSocket.destroy();
+        heatmapSocket = null;
+    }
+    heatmapRxBuf = Buffer.alloc(0);
+}
+
+function heatmapPanelHtml() {
+    return `<!DOCTYPE html>
+<html><head><style>
+body {
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: var(--vscode-editor-font-size, 13px);
+    color: var(--vscode-foreground);
+    padding: 8px 12px;
+    margin: 0;
+    background: var(--vscode-editor-background);
+}
+canvas { display: block; image-rendering: pixelated; border: 1px solid #404040; box-sizing: border-box; }
+.top-row { display: flex; gap: 2px; }
+.top-row canvas { flex: 1; height: 20px; }
+#status {
+    color: var(--vscode-descriptionForeground, #888);
+    font-size: 0.85em;
+    margin: 2px 0;
+    white-space: nowrap;
+}
+#error {
+    color: var(--vscode-errorForeground, #f44);
+    font-size: 0.85em;
+    margin: 2px 0;
+    display: none;
+}
+#tooltip {
+    color: var(--vscode-debugTokenExpression-number, #b5cea8);
+    font-size: 0.9em;
+    height: 1.3em;
+    margin: 4px 0;
+}
+.legend {
+    display: flex;
+    gap: 12px;
+    font-size: 0.85em;
+    margin: 6px 0;
+    flex-wrap: wrap;
+}
+.legend span { display: flex; align-items: center; gap: 4px; }
+.swatch { width: 12px; height: 12px; display: inline-block; border: 1px solid #555; }
+.label-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.8em;
+    color: var(--vscode-descriptionForeground, #888);
+    margin: 2px 0;
+}
+</style></head><body>
+<div id="status">Waiting for connection...</div>
+<div id="error"></div>
+<div id="tooltip">&nbsp;</div>
+<div class="legend">
+    <span><span class="swatch" style="background:#f00"></span> Write</span>
+    <span><span class="swatch" style="background:#0f0"></span> Read</span>
+    <span><span class="swatch" style="background:#00f"></span> ULA</span>
+    <span><span class="swatch" style="background:#ff0"></span> R+W</span>
+    <span><span class="swatch" style="background:#0ff"></span> R+U</span>
+    <span><span class="swatch" style="background:#f0f"></span> W+U</span>
+</div>
+<div class="label-row">
+    <span>ZP</span><span>Stack</span><span>Page2</span><span>I/O</span>
+</div>
+<div class="top-row">
+    <canvas id="zpCanvas" width="64" height="4"></canvas>
+    <canvas id="stackCanvas" width="64" height="4"></canvas>
+    <canvas id="page2Canvas" width="64" height="4"></canvas>
+    <canvas id="ioCanvas" width="64" height="4"></canvas>
+</div>
+<div class="label-row">
+    <span>$0400</span><span style="text-align:right">$BFFF</span>
+</div>
+<canvas id="mainCanvas" width="256" height="188"></canvas>
+<div class="label-row" id="romLabel">
+    <span>$C000</span><span id="romLabelRight">ROM $FFFF</span>
+</div>
+<canvas id="bottomCanvas" width="256" height="64"></canvas>
+<script>
+const vscode = acquireVsCodeApi();
+const topCanvases = [
+    document.getElementById('zpCanvas'),
+    document.getElementById('stackCanvas'),
+    document.getElementById('page2Canvas'),
+    document.getElementById('ioCanvas')
+];
+const topCtxs = topCanvases.map(c => c.getContext('2d'));
+const topImgs = topCtxs.map(ctx => ctx.createImageData(64, 4));
+const mainCanvas = document.getElementById('mainCanvas');
+const bottomCanvas = document.getElementById('bottomCanvas');
+const mainCtx = mainCanvas.getContext('2d');
+const bottomCtx = bottomCanvas.getContext('2d');
+const tooltip = document.getElementById('tooltip');
+const errorDiv = document.getElementById('error');
+const status = document.getElementById('status');
+const romLabelRight = document.getElementById('romLabelRight');
+
+mainCanvas.style.width = '100%';
+mainCanvas.style.height = 'auto';
+mainCanvas.style.aspectRatio = '256 / 188';
+bottomCanvas.style.width = '100%';
+bottomCanvas.style.height = 'auto';
+bottomCanvas.style.aspectRatio = '256 / 64';
+
+const mainImg = mainCtx.createImageData(256, 188);
+const bottomImg = bottomCtx.createImageData(256, 64);
+
+function b64decode(str) {
+    const bin = atob(str);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return arr;
+}
+
+function renderFrame(msg) {
+    errorDiv.style.display = 'none';
+    const readHeat = b64decode(msg.readHeat);
+    const writeHeat = b64decode(msg.writeHeat);
+    const ulaHeat = b64decode(msg.ulaHeat);
+
+    for (let block = 0; block < 4; block++) {
+        const baseAddr = block * 256;
+        const img = topImgs[block];
+        for (let row = 0; row < 4; row++) {
+            for (let col = 0; col < 64; col++) {
+                const addr = baseAddr + row * 64 + col;
+                const px = (row * 64 + col) * 4;
+                img.data[px]     = writeHeat[addr];
+                img.data[px + 1] = readHeat[addr];
+                img.data[px + 2] = ulaHeat[addr];
+                img.data[px + 3] = 255;
+            }
+        }
+        topCtxs[block].putImageData(img, 0, 0);
+    }
+
+    for (let i = 0; i < 256 * 188; i++) {
+        const addr = 0x0400 + i;
+        if (addr > 0xBFFF) break;
+        const px = i * 4;
+        mainImg.data[px]     = writeHeat[addr];
+        mainImg.data[px + 1] = readHeat[addr];
+        mainImg.data[px + 2] = ulaHeat[addr];
+        mainImg.data[px + 3] = 255;
+    }
+    mainCtx.putImageData(mainImg, 0, 0);
+
+    for (let i = 0; i < 256 * 64; i++) {
+        const addr = 0xC000 + i;
+        const px = i * 4;
+        bottomImg.data[px]     = writeHeat[addr];
+        bottomImg.data[px + 1] = readHeat[addr];
+        bottomImg.data[px + 2] = ulaHeat[addr];
+        bottomImg.data[px + 3] = 255;
+    }
+    bottomCtx.putImageData(bottomImg, 0, 0);
+
+    romLabelRight.textContent = msg.romdis ? 'RAM $FFFF' : 'ROM $FFFF';
+    status.textContent = 'Frame ' + msg.frameCounter +
+        ' | Mode ' + msg.vidMode +
+        ' | Vid $' + msg.vidAddr.toString(16).toUpperCase().padStart(4, '0');
+}
+
+function addrFromMouse(canvas, e, baseAddr, width, height) {
+    const rect = canvas.getBoundingClientRect();
+    const x = Math.floor((e.clientX - rect.left) / rect.width * width);
+    const y = Math.floor((e.clientY - rect.top) / rect.height * height);
+    if (x < 0 || x >= width || y < 0 || y >= height) return -1;
+    return baseAddr + y * width + x;
+}
+
+function addrFromTopMouse(blockIndex, e) {
+    const canvas = topCanvases[blockIndex];
+    const rect = canvas.getBoundingClientRect();
+    const x = Math.floor((e.clientX - rect.left) / rect.width * 64);
+    const y = Math.floor((e.clientY - rect.top) / rect.height * 4);
+    if (x < 0 || x >= 64 || y < 0 || y >= 4) return -1;
+    return blockIndex * 256 + y * 64 + x;
+}
+
+function showAddr(addr) {
+    if (addr < 0 || addr > 0xFFFF) { tooltip.textContent = ''; return; }
+    tooltip.textContent = '$' + addr.toString(16).toUpperCase().padStart(4, '0');
+}
+
+topCanvases.forEach((c, i) => {
+    c.addEventListener('mousemove', e => showAddr(addrFromTopMouse(i, e)));
+    c.addEventListener('mouseleave', () => { tooltip.textContent = ''; });
+});
+mainCanvas.addEventListener('mousemove', e => showAddr(addrFromMouse(mainCanvas, e, 0x0400, 256, 188)));
+bottomCanvas.addEventListener('mousemove', e => showAddr(addrFromMouse(bottomCanvas, e, 0xC000, 256, 64)));
+
+[mainCanvas, bottomCanvas].forEach(c => {
+    c.addEventListener('mouseleave', () => { tooltip.textContent = ''; });
+});
+
+window.addEventListener('message', e => {
+    if (e.data.type === 'heatmapFrame') renderFrame(e.data);
+    if (e.data.type === 'status') { status.textContent = e.data.text; errorDiv.style.display = 'none'; }
+    if (e.data.type === 'error') { errorDiv.textContent = e.data.text; errorDiv.style.display = 'block'; }
+});
+</script>
+</body></html>`;
+}
+
+// ----------------------------------------------------------------
 // Extension activation
 // ----------------------------------------------------------------
 
@@ -1084,6 +1429,9 @@ function activate(context) {
         }
     }
 
+    vizOutputChannel = vscode.window.createOutputChannel('Oric Debug');
+    context.subscriptions.push(vizOutputChannel);
+
     const regsProvider = new RegistersWebviewProvider();
     const zpProvider = new ZeroPageProvider();
     const periphProvider = new PeripheralsWebviewProvider();
@@ -1093,6 +1441,7 @@ function activate(context) {
         vscode.window.registerTreeDataProvider('oricZeroPage', zpProvider),
         vscode.window.registerWebviewViewProvider('oricPeripherals', periphProvider),
         vscode.commands.registerCommand('oric-debug.openMemoryView', () => createMemoryPanel(context)),
+        vscode.commands.registerCommand('oric-debug.openHeatmap', () => createHeatmapPanel()),
         vscode.commands.registerCommand('osdk.xaReference', () => createXaReferencePanel()),
         vscode.commands.registerCommand('osdk.6502Reference', () => create6502ReferencePanel())
     );
@@ -1118,14 +1467,29 @@ function activate(context) {
             }
         }),
         vscode.debug.onDidStartDebugSession(s => {
-            if (s.type === 'oric-debug')
+            if (s.type === 'oric-debug') {
+                const config = s.configuration;
+                const gdbHost = config.host || 'localhost';
+                const gdbPort = config.port || 6502;
+                vizLog('Debug session started — GDB on ' + gdbHost + ':' + gdbPort);
                 setTimeout(() => refreshAll(), 500);
+                // Auto-connect heatmap if panel is open
+                if (heatmapPanel) {
+                    heatmapConnect(gdbHost, gdbPort + 1);
+                }
+            }
         }),
-        vscode.debug.onDidTerminateDebugSession(() => refreshAll())
+        vscode.debug.onDidTerminateDebugSession(() => {
+            vizLog('Debug session terminated');
+            refreshAll();
+            heatmapDisconnect();
+        })
     );
 }
 
 function deactivate() {
+    heatmapDisconnect();
+    vizOutputChannel = null;
 }
 
 module.exports = { activate, deactivate };

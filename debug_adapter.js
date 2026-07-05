@@ -1394,5 +1394,11 @@ const handlers = {
         // Read memory
         const memReply = await gdbCmd('m' + addr.toString(16) + ',' + count.toString(16));
         respond(req, { address: addr, data: memReply || '', expression: expr });
+    },
+
+    logToConsole(req) {
+        const text = (req.arguments && req.arguments.text) || '';
+        log(text);
+        respond(req, {});
     }
 };
