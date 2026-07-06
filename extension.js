@@ -89,6 +89,7 @@ function decodeMdControl(v) {
 class RegistersWebviewProvider {
     constructor() {
         this._view = null;
+        this._prev = {};  // previous values for change detection
     }
 
     resolveWebviewView(webviewView) {
@@ -103,7 +104,6 @@ class RegistersWebviewProvider {
             this._updateHtml(null);
             return;
         }
-        // Read CPU registers, flags, and extra state from the debug adapter
         Promise.all([
             session.customRequest('variables', { variablesReference: 1 }),
             session.customRequest('variables', { variablesReference: 2 }),
@@ -124,40 +124,52 @@ class RegistersWebviewProvider {
         if (!this._view) return;
         if (!regs) {
             this._view.webview.html = '<body style="color:var(--vscode-foreground);font-family:var(--vscode-editor-font-family);font-size:var(--vscode-editor-font-size);padding:8px"><i>No debug session</i></body>';
+            this._prev = {};  // reset so next session starts fresh
             return;
         }
+
+        // Compare with previous values: returns CSS class 'v' or 'mod'
+        const p = this._prev;
+        const vc = (key, val) => {
+            const changed = p[key] !== undefined && p[key] !== val;
+            p[key] = val;
+            return changed ? 'mod' : 'v';
+        };
+        // Flag: returns 'fon'/'foff' + ' mod' if changed
+        const fc = (key, val) => {
+            const on = val === '1';
+            const changed = p[key] !== undefined && p[key] !== val;
+            p[key] = val;
+            return (on ? 'fon' : 'foff') + (changed ? ' mod' : '');
+        };
 
         const flagNames = ['N', 'V', 'B', 'D', 'I', 'Z', 'C'];
         const flagKeys = ['N (Negative)', 'V (Overflow)', 'B (Break)', 'D (Decimal)', 'I (Interrupt)', 'Z (Zero)', 'C (Carry)'];
         let flagsHtml = flagNames.map((name, i) => {
             const val = flags[flagKeys[i]];
-            const on = val === '1';
-            return '<span class="' + (on ? 'fon' : 'foff') + '" title="' + flagKeys[i] + '">' + name + '</span>';
+            return '<span class="' + fc('f' + name, val) + '" title="' + flagKeys[i] + '">' + name + '</span>';
         }).join(' ');
 
         function hex4(v) { return '$' + (v & 0xFFFF).toString(16).toUpperCase().padStart(4, '0'); }
 
+        const rv = (name) => {
+            const val = regs[name] || '?';
+            return '<span><span class="n">' + name + '</span>=<span class="' + vc('r' + name, val) + '">' + val + '</span></span>';
+        };
+
         let extraHtml = '';
         if (extra) {
-            const lpc = extra.L !== undefined ? hex4(extra.L) : '?';
-            const cy = extra.C !== undefined ? extra.C.toString() : '?';
-            const fm = extra.F !== undefined ? extra.F.toString() : '?';
-            const rs = extra.R !== undefined ? extra.R.toString() : '?';
-            const nmi = extra.N !== undefined ? hex4(extra.N) : '?';
-            const rst = extra.T !== undefined ? hex4(extra.T) : '?';
-            const irq = extra.I !== undefined ? hex4(extra.I) : '?';
+            const ex = (label, key, val) => {
+                const s = val !== undefined ? (typeof val === 'number' ? (key === 'CY' || key === 'FM' || key === 'RS' ? val.toString() : hex4(val)) : val) : '?';
+                return '<span><span class="n">' + label + '</span>=<span class="' + vc('x' + key, s) + '">' + s + '</span></span>';
+            };
             extraHtml = `<div class="sep"></div>
 <div class="r">
- <span><span class="n">LPC</span>=<span class="v">${lpc}</span></span>
- <span><span class="n">CY</span>=<span class="v">${cy}</span></span>
- <span><span class="n">FM</span>=<span class="v">${fm}</span></span>
- <span><span class="n">RS</span>=<span class="v">${rs}</span></span>
+ ${ex('LPC', 'LPC', extra.L)} ${ex('CY', 'CY', extra.C)} ${ex('FM', 'FM', extra.F)} ${ex('RS', 'RS', extra.R)}
 </div>
 <div class="sep"></div>
 <div class="r">
- <span><span class="n">NMI</span>=<span class="v">${nmi}</span></span>
- <span><span class="n">RST</span>=<span class="v">${rst}</span></span>
- <span><span class="n">IRQ</span>=<span class="v">${irq}</span></span>
+ ${ex('NMI', 'NMI', extra.N)} ${ex('RST', 'RST', extra.T)} ${ex('IRQ', 'IRQ', extra.I)}
 </div>`;
         }
 
@@ -167,16 +179,15 @@ body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(
 .r { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 3px 0; align-items: baseline; }
 .n { color: var(--vscode-debugTokenExpression-name, #9cdcfe); }
 .v { color: var(--vscode-debugTokenExpression-number, #b5cea8); }
+.mod { color: #e04040; }
 .fon { color: var(--vscode-debugTokenExpression-number, #b5cea8); font-weight: bold; }
+.fon.mod { color: #e04040; font-weight: bold; }
 .foff { opacity: 0.35; }
+.foff.mod { opacity: 1.0; color: #e04040; }
 .sep { border-top: 1px solid var(--vscode-widget-border, #444); margin: 4px 0; }
 </style></head><body>
 <div class="r">
- <span><span class="n">A</span>=<span class="v">${regs.A || '?'}</span></span>
- <span><span class="n">X</span>=<span class="v">${regs.X || '?'}</span></span>
- <span><span class="n">Y</span>=<span class="v">${regs.Y || '?'}</span></span>
- <span><span class="n">SP</span>=<span class="v">${regs.SP || '?'}</span></span>
- <span><span class="n">PC</span>=<span class="v">${regs.PC || '?'}</span></span>
+ ${rv('A')} ${rv('X')} ${rv('Y')} ${rv('SP')} ${rv('PC')}
 </div>
 <div class="sep"></div>
 <div class="r">${flagsHtml}</div>${extraHtml}
@@ -191,6 +202,7 @@ body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(
 class PeripheralsWebviewProvider {
     constructor() {
         this._view = null;
+        this._prev = {};  // previous values for change detection
     }
 
     resolveWebviewView(webviewView) {
@@ -214,8 +226,17 @@ class PeripheralsWebviewProvider {
         if (!this._view) return;
         if (!d) {
             this._view.webview.html = '<body style="color:var(--vscode-foreground);font-family:var(--vscode-editor-font-family);font-size:var(--vscode-editor-font-size);padding:8px"><i>No debug session</i></body>';
+            this._prev = {};
             return;
         }
+
+        // Compare with previous values: returns CSS class 'v' or 'mod'
+        const p = this._prev;
+        const vc = (key, val) => {
+            const changed = p[key] !== undefined && p[key] !== val;
+            p[key] = val;
+            return changed ? 'mod' : 'v';
+        };
 
         const sections = [];
 
@@ -225,7 +246,8 @@ class PeripheralsWebviewProvider {
                 let extra = '';
                 if (i === 11 || i === 12) extra = ' ' + bin8(d.V[i]);
                 else if (i === 13 || i === 14) extra = ' ' + decodeViaIFR(d.V[i]);
-                rows += '<span title="$030' + i.toString(16).toUpperCase() + '"><span class="n">' + VIA_REG_NAMES[i] + '</span>=<span class="v">' + h2(d.V[i]) + '</span>' + (extra ? '<span class="x">' + extra + '</span>' : '') + '</span> ';
+                const cls = vc('V' + i, d.V[i]);
+                rows += '<span title="$030' + i.toString(16).toUpperCase() + '"><span class="n">' + VIA_REG_NAMES[i] + '</span>=<span class="' + cls + '">' + h2(d.V[i]) + '</span>' + (extra ? '<span class="x">' + extra + '</span>' : '') + '</span> ';
             }
             sections.push({ name: 'VIA 6522', addr: '$0300', html: rows });
         }
@@ -235,7 +257,8 @@ class PeripheralsWebviewProvider {
             for (let i = 0; i < d.A.length; i++) {
                 let extra = '';
                 if (i === 7) extra = ' ' + decodeAyEnable(d.A[i]);
-                rows += '<span title="AY R' + i + '"><span class="n">' + AY_REG_NAMES[i] + '</span>=<span class="v">' + h2(d.A[i]) + '</span>' + (extra ? '<span class="x">' + extra + '</span>' : '') + '</span> ';
+                const cls = vc('A' + i, d.A[i]);
+                rows += '<span title="AY R' + i + '"><span class="n">' + AY_REG_NAMES[i] + '</span>=<span class="' + cls + '">' + h2(d.A[i]) + '</span>' + (extra ? '<span class="x">' + extra + '</span>' : '') + '</span> ';
             }
             sections.push({ name: 'AY-3-8912', addr: 'Sound', html: rows });
         }
@@ -245,7 +268,8 @@ class PeripheralsWebviewProvider {
             for (let i = 0; i < d.F.length; i++) {
                 let extra = '';
                 if (i === 0) extra = ' ' + decodeFdcStatus(d.F[i]);
-                rows += '<span title="$031' + i.toString(16).toUpperCase() + '"><span class="n">' + FDC_REG_NAMES[i] + '</span>=<span class="v">' + h2(d.F[i]) + '</span>' + (extra ? '<span class="x">' + extra + '</span>' : '') + '</span> ';
+                const cls = vc('F' + i, d.F[i]);
+                rows += '<span title="$031' + i.toString(16).toUpperCase() + '"><span class="n">' + FDC_REG_NAMES[i] + '</span>=<span class="' + cls + '">' + h2(d.F[i]) + '</span>' + (extra ? '<span class="x">' + extra + '</span>' : '') + '</span> ';
             }
             sections.push({ name: 'WD1793 FDC', addr: '$0310', html: rows });
         }
@@ -255,7 +279,8 @@ class PeripheralsWebviewProvider {
             for (let i = 0; i < d.M.length; i++) {
                 let extra = '';
                 if (i === 0) extra = ' ' + decodeMdControl(d.M[i]);
-                rows += '<span><span class="n">' + MD_REG_NAMES[i] + '</span>=<span class="v">' + h2(d.M[i]) + '</span>' + (extra ? '<span class="x">' + extra + '</span>' : '') + '</span> ';
+                const cls = vc('M' + i, d.M[i]);
+                rows += '<span><span class="n">' + MD_REG_NAMES[i] + '</span>=<span class="' + cls + '">' + h2(d.M[i]) + '</span>' + (extra ? '<span class="x">' + extra + '</span>' : '') + '</span> ';
             }
             sections.push({ name: 'Microdisc', addr: '$0314', html: rows });
         }
@@ -263,7 +288,8 @@ class PeripheralsWebviewProvider {
         if (d.C) {
             let rows = '';
             for (let i = 0; i < d.C.length; i++) {
-                rows += '<span title="$031' + (0xC + i).toString(16).toUpperCase() + '"><span class="n">' + ACIA_REG_NAMES[i] + '</span>=<span class="v">' + h2(d.C[i]) + '</span></span> ';
+                const cls = vc('C' + i, d.C[i]);
+                rows += '<span title="$031' + (0xC + i).toString(16).toUpperCase() + '"><span class="n">' + ACIA_REG_NAMES[i] + '</span>=<span class="' + cls + '">' + h2(d.C[i]) + '</span></span> ';
             }
             sections.push({ name: 'ACIA 6551', addr: '$031C', html: rows });
         }
@@ -281,49 +307,12 @@ body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(
 .r { display: flex; flex-wrap: wrap; gap: 2px 10px; margin: 2px 0 6px 0; }
 .n { color: var(--vscode-debugTokenExpression-name, #9cdcfe); }
 .v { color: var(--vscode-debugTokenExpression-number, #b5cea8); }
+.mod { color: #e04040; }
 .x { color: var(--vscode-descriptionForeground, #888); font-size: 0.9em; }
 .hdr { color: var(--vscode-sideBarSectionHeader-foreground, #ccc); font-weight: bold; font-size: 0.95em; margin-top: 2px; }
 .addr { color: var(--vscode-descriptionForeground, #888); font-weight: normal; font-size: 0.9em; }
 .hr { border-top: 1px solid var(--vscode-widget-border, #444); margin: 4px 0; }
 </style></head><body>${body}</body></html>`;
-    }
-}
-
-// ----------------------------------------------------------------
-// Zero Page TreeDataProvider
-// ----------------------------------------------------------------
-
-class ZeroPageProvider {
-    constructor() {
-        this._onDidChange = new vscode.EventEmitter();
-        this.onDidChangeTreeData = this._onDidChange.event;
-        this._vars = null;
-    }
-
-    refresh(session) {
-        if (!session || session.type !== 'oric-debug') {
-            this._vars = null;
-            this._onDidChange.fire();
-            return;
-        }
-        session.customRequest('variables', { variablesReference: 3 }).then(resp => {
-            this._vars = resp && resp.variables;
-            this._onDidChange.fire();
-        }).catch(() => {
-            this._vars = null;
-            this._onDidChange.fire();
-        });
-    }
-
-    getTreeItem(element) { return element; }
-
-    getChildren() {
-        if (!this._vars) return [];
-        return this._vars.map(v => {
-            const item = new vscode.TreeItem(v.name, vscode.TreeItemCollapsibleState.None);
-            item.description = v.value;
-            return item;
-        });
     }
 }
 
@@ -1226,6 +1215,32 @@ const heatmapConsumer = {
 };
 
 // ----------------------------------------------------------------
+// Heatmap address highlight relay
+// ----------------------------------------------------------------
+
+let lastPcAddr = -1;
+
+function highlightHeatmapAddr(addr) {
+    if (heatmapPanel) {
+        heatmapPanel.webview.postMessage({ type: 'highlightAddr', addr });
+    }
+}
+
+function clearHeatmapHighlight() {
+    if (heatmapPanel) {
+        heatmapPanel.webview.postMessage({ type: 'clearHighlight' });
+    }
+}
+
+function restoreHeatmapPcHighlight() {
+    if (lastPcAddr >= 0 && vscode.debug.activeDebugSession) {
+        highlightHeatmapAddr(lastPcAddr);
+    } else {
+        clearHeatmapHighlight();
+    }
+}
+
+// ----------------------------------------------------------------
 // Screen View consumer
 // ----------------------------------------------------------------
 
@@ -1290,6 +1305,10 @@ body {
 }
 canvas { display: block; image-rendering: pixelated; border: 1px solid #404040; box-sizing: border-box; width: 100%; }
 .page-canvas { height: 14px; }
+.canvas-wrap { position: relative; }
+.canvas-wrap .highlight-overlay {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;
+}
 #status {
     color: var(--vscode-descriptionForeground, #888);
     font-size: 0.85em;
@@ -1337,19 +1356,19 @@ canvas { display: block; image-rendering: pixelated; border: 1px solid #404040; 
     <span><span class="swatch" style="background:#f0f"></span> W+U</span>
 </div>
 <div class="label-row"><span>$0000 Zero Page</span><span>$00FF</span></div>
-<canvas id="zpCanvas" class="page-canvas" width="256" height="1"></canvas>
+<div class="canvas-wrap"><canvas id="zpCanvas" class="page-canvas" width="256" height="1"></canvas><canvas class="highlight-overlay page-canvas" id="zpOverlay" width="256" height="1"></canvas></div>
 <div class="label-row"><span>$0100 Stack</span><span>$01FF</span></div>
-<canvas id="stackCanvas" class="page-canvas" width="256" height="1"></canvas>
+<div class="canvas-wrap"><canvas id="stackCanvas" class="page-canvas" width="256" height="1"></canvas><canvas class="highlight-overlay page-canvas" id="stackOverlay" width="256" height="1"></canvas></div>
 <div class="label-row"><span>$0200 Page 2</span><span>$02FF</span></div>
-<canvas id="page2Canvas" class="page-canvas" width="256" height="1"></canvas>
+<div class="canvas-wrap"><canvas id="page2Canvas" class="page-canvas" width="256" height="1"></canvas><canvas class="highlight-overlay page-canvas" id="page2Overlay" width="256" height="1"></canvas></div>
 <div class="label-row"><span>$0300 I/O</span><span>$03FF</span></div>
-<canvas id="ioCanvas" class="page-canvas" width="256" height="1"></canvas>
+<div class="canvas-wrap"><canvas id="ioCanvas" class="page-canvas" width="256" height="1"></canvas><canvas class="highlight-overlay page-canvas" id="ioOverlay" width="256" height="1"></canvas></div>
 <div class="label-row"><span>$0400</span><span>$BFFF</span></div>
-<canvas id="mainCanvas" width="256" height="188"></canvas>
+<div class="canvas-wrap"><canvas id="mainCanvas" width="256" height="188"></canvas><canvas class="highlight-overlay" id="mainOverlay" width="256" height="188"></canvas></div>
 <div class="label-row" id="romLabel">
     <span>$C000</span><span id="romLabelRight">ROM $FFFF</span>
 </div>
-<canvas id="bottomCanvas" width="256" height="64"></canvas>
+<div class="canvas-wrap"><canvas id="bottomCanvas" width="256" height="64"></canvas><canvas class="highlight-overlay" id="bottomOverlay" width="256" height="64"></canvas></div>
 <script>
 const vscode = acquireVsCodeApi();
 const topCanvases = [
@@ -1463,10 +1482,108 @@ bottomCanvas.addEventListener('mousemove', e => showAddr(addrFromMouse(bottomCan
     c.addEventListener('mouseleave', () => { tooltip.textContent = ''; });
 });
 
+// --- Address highlight crosshair ---
+const topOverlays = [
+    document.getElementById('zpOverlay'),
+    document.getElementById('stackOverlay'),
+    document.getElementById('page2Overlay'),
+    document.getElementById('ioOverlay')
+];
+const mainOverlay = document.getElementById('mainOverlay');
+const bottomOverlay = document.getElementById('bottomOverlay');
+const allOverlays = [...topOverlays, mainOverlay, bottomOverlay];
+let highlightAddr = -1;
+
+function resizeOverlayCanvas(overlay, refCanvas) {
+    const rect = refCanvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.round(rect.width * dpr);
+    const h = Math.round(rect.height * dpr);
+    if (overlay.width !== w || overlay.height !== h) {
+        overlay.width = w;
+        overlay.height = h;
+    }
+}
+
+function drawHighlight() {
+    // Clear all overlays
+    for (const ov of allOverlays) {
+        const ctx = ov.getContext('2d');
+        ctx.clearRect(0, 0, ov.width, ov.height);
+    }
+    if (highlightAddr < 0 || highlightAddr > 0xFFFF) return;
+    const addr = highlightAddr;
+
+    // Determine which canvas region
+    let overlay, refCanvas, x, y, cw, ch;
+    if (addr < 0x0400) {
+        const block = addr >> 8;
+        overlay = topOverlays[block];
+        refCanvas = topCanvases[block];
+        x = addr & 0xFF;
+        y = 0;
+        cw = 256; ch = 1;
+    } else if (addr < 0xC000) {
+        overlay = mainOverlay;
+        refCanvas = mainCanvas;
+        const off = addr - 0x0400;
+        x = off & 0xFF;
+        y = off >> 8;
+        cw = 256; ch = 188;
+    } else {
+        overlay = bottomOverlay;
+        refCanvas = bottomCanvas;
+        const off = addr - 0xC000;
+        x = off & 0xFF;
+        y = off >> 8;
+        cw = 256; ch = 64;
+    }
+
+    resizeOverlayCanvas(overlay, refCanvas);
+    const ctx = overlay.getContext('2d');
+    const w = overlay.width;
+    const h = overlay.height;
+    const sx = w / cw;
+    const sy = h / ch;
+    const cx = Math.round((x + 0.5) * sx);
+    const cy = Math.round((y + 0.5) * sy);
+
+    const lines = [
+        { offset: -1, color: 'rgba(0,0,0,0.6)' },
+        { offset:  0, color: 'rgba(255,255,255,0.9)' },
+        { offset:  1, color: 'rgba(0,0,0,0.6)' }
+    ];
+    ctx.lineWidth = 1;
+    for (const l of lines) {
+        ctx.strokeStyle = l.color;
+        ctx.beginPath();
+        ctx.moveTo(cx + l.offset + 0.5, 0);
+        ctx.lineTo(cx + l.offset + 0.5, h);
+        ctx.stroke();
+        if (ch > 1) {
+            ctx.beginPath();
+            ctx.moveTo(0, cy + l.offset + 0.5);
+            ctx.lineTo(w, cy + l.offset + 0.5);
+            ctx.stroke();
+        }
+    }
+}
+
+const hlResizeObs = new ResizeObserver(() => drawHighlight());
+hlResizeObs.observe(mainCanvas);
+
 window.addEventListener('message', e => {
     if (e.data.type === 'heatmapFrame') renderFrame(e.data);
     if (e.data.type === 'status') { status.textContent = e.data.text; errorDiv.style.display = 'none'; }
     if (e.data.type === 'error') { errorDiv.textContent = e.data.text; errorDiv.style.display = 'block'; }
+    if (e.data.type === 'highlightAddr') {
+        highlightAddr = typeof e.data.addr === 'number' ? e.data.addr : -1;
+        drawHighlight();
+    }
+    if (e.data.type === 'clearHighlight') {
+        highlightAddr = -1;
+        drawHighlight();
+    }
 });
 </script>
 </body></html>`;
@@ -2031,8 +2148,28 @@ screenWrap.addEventListener('mouseleave', () => {
 });
 
 // Zoom controls: refresh inspector on change
-zoomFactorSel.addEventListener('change', () => { saveSettings(); if (hoverPx >= 0) updateInspector(hoverPx, hoverPy); });
-zoomRegionSel.addEventListener('change', () => { saveSettings(); if (hoverPx >= 0) updateInspector(hoverPx, hoverPy); });
+zoomFactorSel.addEventListener('change', () => {
+    saveSettings();
+    if (hoverPx >= 0) updateInspector(hoverPx, hoverPy);
+    else {
+        const zf = parseInt(zoomFactorSel.value) || 6;
+        const region = parseInt(zoomRegionSel.value) || 20;
+        const sz = region * zf;
+        zoomCanvas.width = sz; zoomCanvas.height = sz;
+        zoomCtx.clearRect(0, 0, sz, sz);
+    }
+});
+zoomRegionSel.addEventListener('change', () => {
+    saveSettings();
+    if (hoverPx >= 0) updateInspector(hoverPx, hoverPy);
+    else {
+        const zf = parseInt(zoomFactorSel.value) || 6;
+        const region = parseInt(zoomRegionSel.value) || 20;
+        const sz = region * zf;
+        zoomCanvas.width = sz; zoomCanvas.height = sz;
+        zoomCtx.clearRect(0, 0, sz, sz);
+    }
+});
 
 // --- Save / Copy buttons ---
 document.getElementById('btnSave').addEventListener('click', () => {
@@ -2048,6 +2185,412 @@ window.addEventListener('message', e => {
     if (e.data.type === 'screenFrame') renderScreen(e.data);
     if (e.data.type === 'status') { status.textContent = e.data.text; errorDiv.style.display = 'none'; }
     if (e.data.type === 'error') { errorDiv.textContent = e.data.text; errorDiv.style.display = 'block'; }
+});
+</script>
+</body></html>`;
+}
+
+// ----------------------------------------------------------------
+// Oric Symbols Panel (searchable/sortable symbol browser)
+// ----------------------------------------------------------------
+
+let symbolsPanel = null;
+
+// Symbol cache: populated from readAllSymbols responses, used by hover provider
+const symbolCache = new Map(); // name -> { addr, size, value, group, source }
+
+// Define cache: populated by scanning workspace source files for #define directives
+const defineCache = new Map(); // name -> { value (string), numValue (number|null), file, line }
+
+async function scanDefines() {
+    defineCache.clear();
+    const files = await vscode.workspace.findFiles('**/*.{s,h,asm}', '**/node_modules/**', 500);
+    const fs = require('fs');
+    for (const uri of files) {
+        try {
+            const content = fs.readFileSync(uri.fsPath, 'utf8');
+            const lines = content.split(/\r?\n/);
+            for (let i = 0; i < lines.length; i++) {
+                const m = lines[i].match(/^\s*#\s*define\s+([A-Za-z_]\w*)\s+(.+?)\s*$/);
+                if (!m) continue;
+                const name = m[1];
+                const rawValue = m[2];
+                // Skip macro-style defines with parentheses (parameterized macros)
+                if (name.includes('(') || rawValue.startsWith('\\')) continue;
+                // Try to resolve numeric value
+                let numValue = null;
+                const hexM = rawValue.match(/^\$([0-9a-fA-F]{1,4})$/);
+                const decM = rawValue.match(/^(\d+)$/);
+                const binM = rawValue.match(/^%([01]+)$/);
+                if (hexM) numValue = parseInt(hexM[1], 16);
+                else if (decM) numValue = parseInt(decM[1], 10);
+                else if (binM) numValue = parseInt(binM[1], 2);
+                // Don't overwrite — first definition wins (matches preprocessor behavior)
+                if (!defineCache.has(name)) {
+                    defineCache.set(name, { value: rawValue, numValue, file: uri.fsPath, line: i + 1 });
+                }
+            }
+        } catch (_) { /* skip unreadable files */ }
+    }
+}
+
+function createSymbolsPanel(context) {
+    if (symbolsPanel) {
+        symbolsPanel.reveal();
+        return;
+    }
+    symbolsPanel = vscode.window.createWebviewPanel(
+        'oricSymbols', 'Oric Symbols',
+        vscode.ViewColumn.Two,
+        { enableScripts: true, retainContextWhenHidden: true }
+    );
+    symbolsPanel.webview.html = symbolsPanelHtml();
+    symbolsPanel.onDidDispose(() => { symbolsPanel = null; });
+
+    // Handle messages from symbols webview
+    symbolsPanel.webview.onDidReceiveMessage(msg => {
+        if (msg.type === 'symbolHover' && typeof msg.addr === 'number') {
+            highlightHeatmapAddr(msg.addr);
+        } else if (msg.type === 'symbolLeave') {
+            restoreHeatmapPcHighlight();
+        } else if (msg.type === 'gotoSymbol' && msg.file && msg.line > 0) {
+            const uri = vscode.Uri.file(msg.file);
+            vscode.workspace.openTextDocument(uri).then(doc => {
+                vscode.window.showTextDocument(doc, { preview: true, viewColumn: vscode.ViewColumn.One }).then(editor => {
+                    const line = msg.line - 1;
+                    const range = new vscode.Range(line, 0, line, 0);
+                    editor.selection = new vscode.Selection(range.start, range.start);
+                    editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+                });
+            }).catch(() => {});
+        }
+    });
+
+    // Initial data fetch
+    const session = vscode.debug.activeDebugSession;
+    if (session && session.type === 'oric-debug') {
+        session.customRequest('readAllSymbols').then(resp => {
+            if (symbolsPanel && resp && resp.symbols) {
+                const combined = [...resp.symbols, ...buildDefineEntries()];
+                symbolsPanel.webview.postMessage({ type: 'symbols', data: combined });
+            }
+        }).catch(() => {});
+    } else {
+        // No debug session — still show defines
+        const defines = buildDefineEntries();
+        if (defines.length > 0 && symbolsPanel) {
+            symbolsPanel.webview.postMessage({ type: 'symbols', data: defines });
+        }
+    }
+}
+
+function buildDefineEntries() {
+    const entries = [];
+    for (const [name, def] of defineCache) {
+        // Skip defines that shadow a runtime symbol (symbol takes priority)
+        if (symbolCache.has(name)) continue;
+        entries.push({
+            name, aliases: [], addr: def.numValue !== null ? def.numValue : -1,
+            size: 0, value: [], group: 'define',
+            source: { file: def.file, line: def.line },
+            nameSources: { [name]: { file: def.file, line: def.line } },
+            defineValue: def.value
+        });
+    }
+    return entries;
+}
+
+function refreshSymbolsPanel(session) {
+    if (!session || session.type !== 'oric-debug') {
+        if (symbolsPanel) {
+            // Even without a debug session, show defines if available
+            const defines = buildDefineEntries();
+            symbolsPanel.webview.postMessage({ type: 'symbols', data: defines.length > 0 ? defines : null });
+        }
+        symbolCache.clear();
+        return;
+    }
+    session.customRequest('readAllSymbols').then(resp => {
+        if (resp && resp.symbols) {
+            // Update symbol cache (primary name + aliases all point to same entry)
+            symbolCache.clear();
+            for (const s of resp.symbols) {
+                const entry = { addr: s.addr, size: s.size, value: s.value, group: s.group,
+                                source: s.source, aliases: s.aliases, nameSources: s.nameSources };
+                symbolCache.set(s.name, entry);
+                if (s.aliases) {
+                    for (const alias of s.aliases) symbolCache.set(alias, entry);
+                }
+            }
+            if (symbolsPanel) {
+                // Merge runtime symbols with defines
+                const combined = [...resp.symbols, ...buildDefineEntries()];
+                symbolsPanel.webview.postMessage({ type: 'symbols', data: combined });
+            }
+        }
+    }).catch(() => {});
+}
+
+function symbolsPanelHtml() {
+    return `<!DOCTYPE html>
+<html><head><style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: var(--vscode-editor-font-size, 13px);
+    color: var(--vscode-foreground);
+    background: var(--vscode-editor-background);
+    padding: 0;
+}
+.toolbar {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--vscode-editor-background);
+    padding: 6px 8px;
+    display: flex; gap: 8px; align-items: center;
+    border-bottom: 1px solid var(--vscode-widget-border, #444);
+}
+.toolbar input {
+    flex: 1; min-width: 100px;
+    background: var(--vscode-input-background, #3c3c3c);
+    color: var(--vscode-input-foreground, #ccc);
+    border: 1px solid var(--vscode-input-border, #555);
+    padding: 3px 6px;
+    font-family: inherit; font-size: inherit;
+}
+.toolbar select {
+    background: var(--vscode-dropdown-background, #3c3c3c);
+    color: var(--vscode-dropdown-foreground, #ccc);
+    border: 1px solid var(--vscode-dropdown-border, #555);
+    padding: 3px 4px;
+    font-family: inherit; font-size: inherit;
+}
+.toolbar .count {
+    color: var(--vscode-descriptionForeground, #888);
+    font-size: 0.9em;
+    white-space: nowrap;
+}
+table {
+    width: 100%; border-collapse: collapse; table-layout: fixed;
+}
+col.col-name  { width: auto; }
+col.col-addr  { width: 60px; }
+col.col-size  { width: 38px; }
+col.col-value { width: 120px; }
+col.col-group { width: 44px; }
+th {
+    position: sticky; top: 33px; z-index: 5;
+    background: var(--vscode-editor-background);
+    text-align: left; padding: 3px 8px;
+    cursor: pointer; user-select: none;
+    border-bottom: 1px solid var(--vscode-widget-border, #444);
+    color: var(--vscode-sideBarSectionHeader-foreground, #ccc);
+    font-weight: bold; font-size: 0.95em;
+    white-space: nowrap;
+}
+th:hover { color: var(--vscode-foreground); }
+th .arrow { font-size: 0.8em; margin-left: 2px; }
+td {
+    padding: 2px 8px; white-space: nowrap;
+}
+tr:nth-child(even) td {
+    background: rgba(255,255,255,0.03);
+}
+.name { color: var(--vscode-debugTokenExpression-name, #9cdcfe); overflow: hidden; text-overflow: ellipsis; }
+.alias { color: var(--vscode-descriptionForeground, #888); font-size: 0.9em; }
+.addr { color: var(--vscode-descriptionForeground, #888); }
+.sz   { color: var(--vscode-descriptionForeground, #888); }
+.val  { color: var(--vscode-debugTokenExpression-number, #b5cea8); }
+.val.mod { color: #e04040; }
+.grp  { color: var(--vscode-descriptionForeground, #888); font-size: 0.9em; }
+.dim  { color: var(--vscode-descriptionForeground, #888); padding: 16px 8px; }
+.sym-link { cursor: pointer; }
+.sym-link:hover { text-decoration: underline; }
+</style></head><body>
+<div class="toolbar">
+    <input type="text" id="search" placeholder="Search symbols..." />
+    <select id="groupFilter">
+        <option value="all">All</option>
+        <option value="zp">Zero Page</option>
+        <option value="ram">RAM</option>
+        <option value="high">High</option>
+        <option value="define">Define</option>
+    </select>
+    <span class="count" id="count"></span>
+</div>
+<table>
+    <colgroup>
+        <col class="col-name">
+        <col class="col-addr">
+        <col class="col-size">
+        <col class="col-value">
+        <col class="col-group">
+    </colgroup>
+    <thead><tr>
+        <th data-col="name">Name <span class="arrow"></span></th>
+        <th data-col="addr">Addr <span class="arrow"></span></th>
+        <th data-col="size">Size <span class="arrow"></span></th>
+        <th data-col="value">Value <span class="arrow"></span></th>
+        <th data-col="group">Group <span class="arrow"></span></th>
+    </tr></thead>
+    <tbody id="tbody"></tbody>
+</table>
+<div class="dim" id="nodata">No debug session or no symbols loaded</div>
+<script>
+const vscode = acquireVsCodeApi();
+const searchEl = document.getElementById('search');
+const groupEl = document.getElementById('groupFilter');
+const tbody = document.getElementById('tbody');
+const countEl = document.getElementById('count');
+const nodata = document.getElementById('nodata');
+const headers = document.querySelectorAll('th[data-col]');
+
+let allSymbols = null;
+let prevValues = {};   // name -> value string for change detection
+let sortCol = 'addr';
+let sortAsc = true;
+let filterText = '';
+let filterGroup = 'all';
+
+function h(v, w) { return '$' + v.toString(16).toUpperCase().padStart(w, '0'); }
+
+function fmtValue(sym) {
+    if (sym.defineValue !== undefined) return sym.defineValue;
+    const v = sym.value;
+    if (!v || v.length === 0) return '?';
+    if (v.length === 1) return h(v[0], 2) + ' (' + v[0] + ')';
+    if (v.length === 2) {
+        const w = v[0] | (v[1] << 8);
+        return h(w, 4) + ' (' + w + ')';
+    }
+    return v.map(b => b.toString(16).toUpperCase().padStart(2, '0')).join(' ');
+}
+
+function valueKey(sym) {
+    return sym.value ? sym.value.join(',') : '';
+}
+
+function groupLabel(g) {
+    if (g === 'zp') return 'ZP';
+    if (g === 'ram') return 'RAM';
+    if (g === 'high') return 'High';
+    if (g === 'define') return '#def';
+    return g;
+}
+
+function render() {
+    if (!allSymbols) {
+        tbody.innerHTML = '';
+        nodata.style.display = 'block';
+        countEl.textContent = '';
+        return;
+    }
+    nodata.style.display = 'none';
+
+    let list = allSymbols;
+    if (filterGroup !== 'all') list = list.filter(s => s.group === filterGroup);
+    if (filterText) {
+        const ft = filterText.toLowerCase();
+        list = list.filter(s => s.name.toLowerCase().includes(ft) ||
+            (s.aliases && s.aliases.some(a => a.toLowerCase().includes(ft))));
+    }
+
+    list.sort((a, b) => {
+        let cmp = 0;
+        if (sortCol === 'name') cmp = a.name.localeCompare(b.name);
+        else if (sortCol === 'addr') {
+            // Non-numeric defines (addr=-1) sort to the end
+            if (a.addr < 0 && b.addr >= 0) cmp = 1;
+            else if (b.addr < 0 && a.addr >= 0) cmp = -1;
+            else cmp = a.addr - b.addr;
+        }
+        else if (sortCol === 'size') cmp = a.size - b.size;
+        else if (sortCol === 'value') cmp = fmtValue(a).localeCompare(fmtValue(b));
+        else if (sortCol === 'group') cmp = a.group.localeCompare(b.group);
+        return sortAsc ? cmp : -cmp;
+    });
+
+    countEl.textContent = list.length + ' / ' + allSymbols.length;
+
+    // Update sort arrows
+    headers.forEach(th => {
+        const arrow = th.querySelector('.arrow');
+        if (th.dataset.col === sortCol) arrow.textContent = sortAsc ? '\\u25B2' : '\\u25BC';
+        else arrow.textContent = '';
+    });
+
+    let html = '';
+    for (const s of list) {
+        const vk = valueKey(s);
+        const prev = prevValues[s.name];
+        const mod = prev !== undefined && prev !== vk ? ' mod' : '';
+        let attrs = ' data-addr="' + s.addr + '"';
+        // Build name cell with individually clickable names
+        const ns = s.nameSources || {};
+        function nameSpan(name) {
+            const src = ns[name];
+            if (src && src.file) {
+                return '<span class="sym-link" data-file="' + src.file.replace(/"/g, '&quot;') + '" data-line="' + src.line + '">' + name + '</span>';
+            }
+            return name;
+        }
+        let nameHtml = nameSpan(s.name);
+        if (s.aliases && s.aliases.length > 0) {
+            nameHtml += ' <span class="alias">/ ' + s.aliases.map(a => nameSpan(a)).join(' / ') + '</span>';
+        }
+        html += '<tr' + attrs + ' title="' + s.name + (s.aliases && s.aliases.length ? ' / ' + s.aliases.join(' / ') : '') + '">'
+            + '<td class="name">' + nameHtml + '</td>'
+            + '<td class="addr">' + (s.addr >= 0 ? h(s.addr, 4) : '\u2014') + '</td>'
+            + '<td class="sz">' + (s.size > 0 ? s.size : '\u2014') + '</td>'
+            + '<td class="val' + mod + '">' + fmtValue(s) + '</td>'
+            + '<td class="grp">' + groupLabel(s.group) + '</td>'
+            + '</tr>';
+    }
+    tbody.innerHTML = html;
+}
+
+searchEl.addEventListener('input', () => { filterText = searchEl.value; render(); });
+groupEl.addEventListener('change', () => { filterGroup = groupEl.value; render(); });
+
+headers.forEach(th => {
+    th.addEventListener('click', () => {
+        const col = th.dataset.col;
+        if (sortCol === col) sortAsc = !sortAsc;
+        else { sortCol = col; sortAsc = true; }
+        render();
+    });
+});
+
+// --- Hover → heatmap highlight, Click → go-to-definition ---
+tbody.addEventListener('mouseover', e => {
+    const tr = e.target.closest('tr[data-addr]');
+    if (tr) vscode.postMessage({ type: 'symbolHover', addr: parseInt(tr.dataset.addr, 10) });
+});
+tbody.addEventListener('mouseleave', () => {
+    vscode.postMessage({ type: 'symbolLeave' });
+});
+tbody.addEventListener('click', e => {
+    const link = e.target.closest('.sym-link[data-file]');
+    if (link) {
+        vscode.postMessage({ type: 'gotoSymbol', file: link.dataset.file, line: parseInt(link.dataset.line, 10) });
+    }
+});
+
+window.addEventListener('message', e => {
+    if (e.data.type === 'symbols') {
+        if (e.data.data) {
+            // Update prevValues from old data before replacing
+            if (allSymbols) {
+                const pv = {};
+                for (const s of allSymbols) pv[s.name] = valueKey(s);
+                prevValues = pv;
+            }
+            allSymbols = e.data.data;
+        } else {
+            allSymbols = null;
+            prevValues = {};
+        }
+        render();
+    }
 });
 </script>
 </body></html>`;
@@ -2161,6 +2704,9 @@ function activate(context) {
     vizOutputChannel = vscode.window.createOutputChannel('Oric Debug');
     context.subscriptions.push(vizOutputChannel);
 
+    // --- Scan workspace for #define directives ---
+    scanDefines();
+
     // --- Cycle annotation decorations ---
     const cycleDecorationType = vscode.window.createTextEditorDecorationType({
         after: {
@@ -2206,16 +2752,185 @@ function activate(context) {
 
     context.subscriptions.push(
         cycleDecorationType,
-        vscode.window.onDidChangeVisibleTextEditors(() => applyCycleDecorations())
+        vscode.window.onDidChangeVisibleTextEditors(() => { applyCycleDecorations(); applyInstrDecoration(); })
+    );
+
+    // --- Instruction annotation decoration (resolved operands) ---
+    const instrDecorationType = vscode.window.createTextEditorDecorationType({
+        after: {
+            color: '#888888',
+            fontStyle: 'italic',
+            margin: '0 0 0 3em'
+        },
+        isWholeLine: true
+    });
+    let instrDecoFile = null;
+    let instrDecoLine = -1;
+    let instrDecoText = '';
+
+    function applyInstrDecoration() {
+        for (const editor of vscode.window.visibleTextEditors) {
+            const filePath = editor.document.uri.fsPath;
+            if (filePath === instrDecoFile && instrDecoLine > 0 && instrDecoText) {
+                const range = new vscode.Range(instrDecoLine - 1, 0, instrDecoLine - 1, 0);
+                editor.setDecorations(instrDecorationType, [{
+                    range,
+                    renderOptions: { after: { contentText: instrDecoText } }
+                }]);
+            } else {
+                editor.setDecorations(instrDecorationType, []);
+            }
+        }
+    }
+
+    function clearInstrDecoration() {
+        instrDecoFile = null;
+        instrDecoLine = -1;
+        instrDecoText = '';
+        for (const editor of vscode.window.visibleTextEditors) {
+            editor.setDecorations(instrDecorationType, []);
+        }
+    }
+
+    function refreshInstructionAnnotation(session) {
+        if (!session || session.type !== 'oric-debug') { clearInstrDecoration(); return; }
+        session.customRequest('resolveInstruction').then(resp => {
+            if (resp && resp.annotation && resp.file && resp.line > 0) {
+                instrDecoFile = resp.file;
+                instrDecoLine = resp.line;
+                instrDecoText = resp.annotation;
+                // Also auto-highlight PC on heatmap
+                lastPcAddr = resp.pc;
+                highlightHeatmapAddr(resp.pc);
+                applyInstrDecoration();
+            } else {
+                if (resp && typeof resp.pc === 'number') {
+                    lastPcAddr = resp.pc;
+                    highlightHeatmapAddr(resp.pc);
+                }
+                clearInstrDecoration();
+            }
+        }).catch(() => { clearInstrDecoration(); });
+    }
+
+    context.subscriptions.push(instrDecorationType);
+
+    // --- Editor hover provider: show symbol info + heatmap highlight ---
+    context.subscriptions.push(
+        vscode.languages.registerHoverProvider('osdk', {
+            provideHover(document, position) {
+                const range = document.getWordRangeAtPosition(position, /[a-zA-Z_]\w*/);
+                if (!range) {
+                    // Try hex address like $XXXX
+                    const hexRange = document.getWordRangeAtPosition(position, /\$[0-9a-fA-F]{2,4}/);
+                    if (hexRange) {
+                        const hexWord = document.getText(hexRange);
+                        const addr = parseInt(hexWord.substring(1), 16);
+                        if (addr >= 0 && addr <= 0xFFFF) {
+                            highlightHeatmapAddr(addr);
+                            return new vscode.Hover(
+                                new vscode.MarkdownString('**$' + addr.toString(16).toUpperCase().padStart(4, '0') + '** (address ' + addr + ')'),
+                                hexRange
+                            );
+                        }
+                    }
+                    return null;
+                }
+                const word = document.getText(range);
+
+                // Check symbol cache first (runtime symbols with live values)
+                const sym = symbolCache.get(word);
+                if (sym) {
+                    highlightHeatmapAddr(sym.addr);
+
+                    const h4 = v => '$' + (v & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
+                    const h2 = v => '$' + (v & 0xFF).toString(16).toUpperCase().padStart(2, '0');
+                    let valueTxt = '?';
+                    if (sym.value && sym.value.length === 1) {
+                        valueTxt = h2(sym.value[0]) + ' (' + sym.value[0] + ')';
+                    } else if (sym.value && sym.value.length === 2) {
+                        const w = sym.value[0] | (sym.value[1] << 8);
+                        valueTxt = h4(w) + ' (' + w + ')';
+                    } else if (sym.value && sym.value.length > 2) {
+                        valueTxt = sym.value.map(b => b.toString(16).toUpperCase().padStart(2, '0')).join(' ');
+                    }
+                    const groupLabel = sym.group === 'zp' ? 'ZP' : sym.group === 'ram' ? 'RAM' : 'High';
+                    let md = '**' + word + '** \u2014 ' + h4(sym.addr) + ' (' + sym.size + ' byte' + (sym.size > 1 ? 's' : '') + ', ' + groupLabel + ')  \n';
+                    if (sym.aliases && sym.aliases.length > 0) {
+                        const allNames = [word];
+                        for (const [k, v] of symbolCache) {
+                            if (v === sym && k !== word && !allNames.includes(k)) allNames.push(k);
+                        }
+                        if (allNames.length > 1) {
+                            md += 'Also known as: ' + allNames.filter(n => n !== word).join(', ') + '  \n';
+                        }
+                    }
+                    md += 'Value: ' + valueTxt;
+                    const perNameSrc = sym.nameSources && sym.nameSources[word];
+                    const src = perNameSrc || sym.source;
+                    if (src && src.file) {
+                        const pathMod = require('path');
+                        md += '  \nDefined in: ' + pathMod.basename(src.file) + ':' + src.line + ' \u2014 Ctrl+Click or F12 to go';
+                    }
+                    return new vscode.Hover(new vscode.MarkdownString(md), range);
+                }
+
+                // Check define cache (preprocessor #define constants)
+                const def = defineCache.get(word);
+                if (def) {
+                    if (def.numValue !== null && def.numValue >= 0 && def.numValue <= 0xFFFF) {
+                        highlightHeatmapAddr(def.numValue);
+                    }
+                    const pathMod = require('path');
+                    let md = '**' + word + '** \u2014 `#define`  \n';
+                    md += 'Value: `' + def.value + '`';
+                    if (def.numValue !== null) md += ' (' + def.numValue + ')';
+                    md += '  \nDefined in: ' + pathMod.basename(def.file) + ':' + def.line + ' \u2014 Ctrl+Click or F12 to go';
+                    return new vscode.Hover(new vscode.MarkdownString(md), range);
+                }
+
+                return null;
+            }
+        }),
+        // Definition provider: Ctrl+Click / F12 to jump to symbol/define source
+        vscode.languages.registerDefinitionProvider('osdk', {
+            provideDefinition(document, position) {
+                const range = document.getWordRangeAtPosition(position, /[a-zA-Z_]\w*/);
+                if (!range) return null;
+                const word = document.getText(range);
+                // Check symbols
+                const sym = symbolCache.get(word);
+                if (sym) {
+                    const perNameSrc = sym.nameSources && sym.nameSources[word];
+                    const src = perNameSrc || sym.source;
+                    if (src && src.file) {
+                        return new vscode.Location(
+                            vscode.Uri.file(src.file),
+                            new vscode.Position((src.line || 1) - 1, 0)
+                        );
+                    }
+                }
+                // Check defines
+                const def = defineCache.get(word);
+                if (def && def.file) {
+                    return new vscode.Location(
+                        vscode.Uri.file(def.file),
+                        new vscode.Position((def.line || 1) - 1, 0)
+                    );
+                }
+                return null;
+            }
+        }),
+        vscode.window.onDidChangeTextEditorSelection(() => {
+            restoreHeatmapPcHighlight();
+        })
     );
 
     const regsProvider = new RegistersWebviewProvider();
-    const zpProvider = new ZeroPageProvider();
     const periphProvider = new PeripheralsWebviewProvider();
 
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider('oricCpuRegs', regsProvider),
-        vscode.window.registerTreeDataProvider('oricZeroPage', zpProvider),
         vscode.window.registerWebviewViewProvider('oricPeripherals', periphProvider),
         vscode.commands.registerCommand('oric-debug.openMemoryView', () => createMemoryPanel(context)),
         vscode.commands.registerCommand('oric-debug.openHeatmap', () => createHeatmapPanel()),
@@ -2254,7 +2969,20 @@ function activate(context) {
             }
         }),
         vscode.commands.registerCommand('osdk.xaReference', () => createXaReferencePanel()),
-        vscode.commands.registerCommand('osdk.6502Reference', () => create6502ReferencePanel())
+        vscode.commands.registerCommand('osdk.6502Reference', () => create6502ReferencePanel()),
+        vscode.commands.registerCommand('oric-debug.openSymbols', () => createSymbolsPanel(context)),
+        vscode.commands.registerCommand('oric-debug.showCurrentLocation', async () => {
+            const session = vscode.debug.activeDebugSession;
+            if (!session || session.type !== 'oric-debug') return;
+            try {
+                const threads = await session.customRequest('threads');
+                const threadId = (threads.threads && threads.threads[0]) ? threads.threads[0].id : 1;
+                const stack = await session.customRequest('stackTrace', { threadId, startFrame: 0, levels: 1 });
+                if (stack.stackFrames && stack.stackFrames.length > 0) {
+                    autoNavigateFromFrame(stack.stackFrames[0]);
+                }
+            } catch (_) {}
+        })
     );
 
     // --- Webview serializers: restore panels after VS Code reload ---
@@ -2314,13 +3042,39 @@ function activate(context) {
             vizRegisterConsumer(screenConsumer);
         }
     });
+    vscode.window.registerWebviewPanelSerializer('oricSymbols', {
+        async deserializeWebviewPanel(panel) {
+            symbolsPanel = panel;
+            panel.webview.options = { enableScripts: true, retainContextWhenHidden: true };
+            panel.webview.html = symbolsPanelHtml();
+            panel.onDidDispose(() => { symbolsPanel = null; });
+            panel.webview.onDidReceiveMessage(msg => {
+                if (msg.type === 'symbolHover' && typeof msg.addr === 'number') {
+                    highlightHeatmapAddr(msg.addr);
+                } else if (msg.type === 'symbolLeave') {
+                    restoreHeatmapPcHighlight();
+                } else if (msg.type === 'gotoSymbol' && msg.file && msg.line > 0) {
+                    const uri = vscode.Uri.file(msg.file);
+                    vscode.workspace.openTextDocument(uri).then(doc => {
+                        vscode.window.showTextDocument(doc, { preview: true, viewColumn: vscode.ViewColumn.One }).then(editor => {
+                            const line = msg.line - 1;
+                            const range = new vscode.Range(line, 0, line, 0);
+                            editor.selection = new vscode.Selection(range.start, range.start);
+                            editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+                        });
+                    }).catch(() => {});
+                }
+            });
+        }
+    });
 
     function refreshAll() {
         const session = vscode.debug.activeDebugSession;
         regsProvider.refresh(session);
-        zpProvider.refresh(session);
         periphProvider.refresh(session);
         refreshMemoryPanels(session);
+        refreshSymbolsPanel(session);
+        refreshInstructionAnnotation(session);
     }
 
     // Auto-navigate: VS Code doesn't always switch back from a virtual
@@ -2395,6 +3149,7 @@ function activate(context) {
                 const gdbHost = config.host || 'localhost';
                 const gdbPort = config.port || 6502;
                 vizLog('Debug session started — GDB on ' + gdbHost + ':' + gdbPort);
+                scanDefines(); // Rescan defines (build may have regenerated headers)
                 setTimeout(() => refreshAll(), 500);
                 // Auto-connect viz stream if any consumer panels are open
                 if (vizConsumers.size > 0) {
@@ -2407,6 +3162,10 @@ function activate(context) {
             refreshAll();
             vizDisconnect();
             clearCycleAnnotations();
+            clearInstrDecoration();
+            lastPcAddr = -1;
+            clearHeatmapHighlight();
+            symbolCache.clear();
         })
     );
 }

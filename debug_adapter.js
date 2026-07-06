@@ -227,6 +227,7 @@ function gdbCmd(cmd) {
 let symbols    = new Map();   // name  -> address (number)
 let addrSym    = new Map();   // address -> name
 let addrSource = new Map();   // address -> { file, line } (from symbol defs)
+let symSource  = new Map();   // name  -> { file, line } (per-symbol source)
 let lineTable  = [];          // [{addr, file, line}] sorted by addr (from #LINES)
 let regs       = null;        // { a, x, y, sp, pc, f }
 let running    = false;
@@ -320,6 +321,7 @@ function loadSymbols(file) {
     symbols.clear();
     addrSym.clear();
     addrSource.clear();
+    symSource.clear();
     lineTable = [];
     zpSymbols = [];
     try {
@@ -362,11 +364,13 @@ function loadSymbols(file) {
                 const n = m[2];
                 symbols.set(n, a);
                 if (!addrSym.has(a)) addrSym.set(a, n);
-                if (isV2 && !addrSource.has(a)) {
+                if (isV2) {
                     const rest = line.substring(m[0].length).trim();
                     const cm = rest.match(/^(.+):(\d+)$/);
                     if (cm) {
-                        addrSource.set(a, { file: cm[1], line: parseInt(cm[2], 10) });
+                        const src = { file: cm[1], line: parseInt(cm[2], 10) };
+                        symSource.set(n, src);
+                        if (!addrSource.has(a)) addrSource.set(a, src);
                     }
                 }
             }
@@ -713,9 +717,84 @@ async function buildCallStack() {
 // Virtual disassembly sources — for frames with no source mapping
 // ----------------------------------------------------------------
 
-const DISASM_CONTEXT = 40;      // instructions before/after PC
+const DISASM_CONTEXT = 100;     // instructions before/after PC in the cached window
 let disasmRefCounter = 100000;  // sourceReference counter (high to avoid clash)
-const disasmRefMap = new Map(); // sourceReference → target address
+const disasmRefMap = new Map(); // sourceReference → target address (fallback for non-cached frames)
+
+// Cached disassembly window — reused across steps to avoid tab flicker.
+// When the PC stays within the window, the same sourceReference is reused
+// and VS Code just scrolls to the right line (no re-fetch, no tab change).
+let disasmCache = null;         // { ref, content, lineForAddr: Map<addr,line>, startAddr, endAddr }
+
+async function buildDisasmCache(centerAddr) {
+    const startAddr = Math.max(0, centerAddr - DISASM_CONTEXT * 3);
+    const totalBytes = (DISASM_CONTEXT * 2 + 20) * 3;
+    const readAddr = startAddr & 0xFFFF;
+    const readLen = Math.min(totalBytes, 0xFFFF - readAddr + 1);
+    const reply = await gdbCmd('m' + readAddr.toString(16) + ',' + readLen.toString(16));
+    if (!reply || reply[0] === 'E') { disasmCache = null; return; }
+
+    const mem = [];
+    for (let i = 0; i < reply.length; i += 2)
+        mem.push(parseInt(reply.substring(i, i + 2), 16));
+
+    // Decode instructions
+    const insts = [];
+    let off = 0;
+    while (off < mem.length) {
+        const a = (readAddr + off) & 0xFFFF;
+        const op = mem[off];
+        const entry = OPS[op];
+        if (entry) {
+            const mne = entry.substring(0, 3);
+            const mode = entry[3];
+            const sz = opSize(mode);
+            const lo = off + 1 < mem.length ? mem[off + 1] : 0;
+            const hi = off + 2 < mem.length ? mem[off + 2] : 0;
+            const operand = fmtOp(mode, lo, hi, a, addrSym);
+            let bytes = '';
+            for (let j = 0; j < sz && off + j < mem.length; j++)
+                bytes += mem[off + j].toString(16).toUpperCase().padStart(2, '0') + ' ';
+            insts.push({ addr: a, bytes: bytes.trimEnd(), text: mne + (operand ? ' ' + operand : ''), sym: addrSym.get(a) });
+            off += sz;
+        } else {
+            const bh = mem[off].toString(16).toUpperCase().padStart(2, '0');
+            insts.push({ addr: a, bytes: bh, text: '.byte $' + bh });
+            off += 1;
+        }
+    }
+
+    // Find instruction at centerAddr and extract window
+    let pivotIdx = 0;
+    for (let i = 0; i < insts.length; i++) {
+        if (insts[i].addr >= centerAddr) { pivotIdx = i; break; }
+    }
+    const si = Math.max(0, pivotIdx - DISASM_CONTEXT);
+    const ei = Math.min(insts.length, pivotIdx + DISASM_CONTEXT + 1);
+    const window = insts.slice(si, ei);
+
+    // Build content and address→line map
+    const lines = [];
+    const lineForAddr = new Map();
+    let lineNum = 1; // 1-based
+    for (const inst of window) {
+        const ah = inst.addr.toString(16).toUpperCase().padStart(4, '0');
+        if (inst.sym) { lines.push(inst.sym + ':'); lineNum++; }
+        lineForAddr.set(inst.addr, lineNum);
+        lines.push(ah + '  ' + inst.bytes.padEnd(9) + ' ' + inst.text);
+        lineNum++;
+    }
+
+    const ref = ++disasmRefCounter;
+    disasmRefMap.set(ref, centerAddr);  // register for fallback in source() handler
+    disasmCache = {
+        ref,
+        content: lines.join('\n') + '\n',
+        lineForAddr,
+        startAddr: window[0].addr,
+        endAddr: window[window.length - 1].addr
+    };
+}
 
 // ----------------------------------------------------------------
 // DAP request dispatcher
@@ -1032,6 +1111,14 @@ const handlers = {
         }
         const pc = regs ? regs.pc : 0;
 
+        // Pre-generate disassembly cache if the PC has no source and is
+        // outside the current cached window (or no cache exists yet).
+        if (!sourceFor(pc)) {
+            if (!disasmCache || pc < disasmCache.startAddr || pc > disasmCache.endAddr) {
+                await buildDisasmCache(pc);
+            }
+        }
+
         // Build a stack frame with optional source location from V2 symbols
         function makeFrame(id, addr) {
             const frame = {
@@ -1049,16 +1136,20 @@ const handlers = {
                     : src.file;
                 frame.source = { name: path.basename(filePath), path: filePath };
                 frame.line = src.line;
+            } else if (disasmCache && disasmCache.lineForAddr.has(addr)) {
+                // Address is within the cached disassembly window — reuse
+                // the same sourceReference so VS Code just scrolls, no tab refresh.
+                frame.source = { name: 'Disassembly', sourceReference: disasmCache.ref };
+                frame.line = disasmCache.lineForAddr.get(addr);
             } else {
-                // No source mapping — provide a virtual disassembly source.
-                // VS Code will request the content via the DAP 'source' request.
+                // Fallback for call stack frames outside the cache window
                 const ref = ++disasmRefCounter;
                 disasmRefMap.set(ref, addr);
                 frame.source = {
                     name: 'Disassembly @ $' + addr.toString(16).toUpperCase().padStart(4, '0'),
                     sourceReference: ref
                 };
-                frame.line = DISASM_CONTEXT + 1; // PC is in the middle
+                frame.line = DISASM_CONTEXT + 1;
             }
             return frame;
         }
@@ -1240,6 +1331,12 @@ const handlers = {
             return;
         }
         gotoTargetMap.delete(targetId);
+        // Safety check: refuse to jump to dubious addresses
+        if (addr < 0x0400) {
+            const region = addr < 0x0100 ? 'zero page' : (addr < 0x0200 ? 'stack' : (addr < 0x0300 ? 'page 2' : 'I/O page'));
+            respond(req, {}, false, 'Refused: $' + addr.toString(16).toUpperCase().padStart(4, '0') + ' is in ' + region + ' — not executable code');
+            return;
+        }
         // Set PC via GDB P4= command (little-endian)
         const pcLo = (addr & 0xFF).toString(16).padStart(2, '0');
         const pcHi = ((addr >> 8) & 0xFF).toString(16).padStart(2, '0');
@@ -1436,73 +1533,26 @@ const handlers = {
 
     async source(req) {
         const ref = req.arguments.sourceReference;
+
+        // Check cached disassembly window first (most common path)
+        if (disasmCache && disasmCache.ref === ref) {
+            respond(req, { content: disasmCache.content, mimeType: 'text/x-asm' });
+            return;
+        }
+
+        // Fallback: generate on-the-fly for non-cached frames (call stack entries)
         const addr = disasmRefMap.get(ref);
         if (addr === undefined) {
             respond(req, { content: '; Source not available\n' });
             return;
         }
 
-        // Read memory around the target address and disassemble
-        const startAddr = Math.max(0, addr - DISASM_CONTEXT * 3);
-        const totalBytes = (DISASM_CONTEXT * 2 + 20) * 3;
-        const readAddr = startAddr & 0xFFFF;
-        const readLen = Math.min(totalBytes, 0xFFFF - readAddr + 1);
-        const reply = await gdbCmd('m' + readAddr.toString(16) + ',' + readLen.toString(16));
-        if (!reply || reply[0] === 'E') {
-            respond(req, { content: '; Failed to read memory at $' + readAddr.toString(16).toUpperCase().padStart(4, '0') + '\n' });
-            return;
+        await buildDisasmCache(addr);
+        if (disasmCache) {
+            respond(req, { content: disasmCache.content, mimeType: 'text/x-asm' });
+        } else {
+            respond(req, { content: '; Failed to disassemble at $' + addr.toString(16).toUpperCase().padStart(4, '0') + '\n' });
         }
-
-        const mem = [];
-        for (let i = 0; i < reply.length; i += 2)
-            mem.push(parseInt(reply.substring(i, i + 2), 16));
-
-        // Decode instructions
-        const insts = [];
-        let off = 0;
-        while (off < mem.length) {
-            const a = (readAddr + off) & 0xFFFF;
-            const op = mem[off];
-            const entry = OPS[op];
-            if (entry) {
-                const mne = entry.substring(0, 3);
-                const mode = entry[3];
-                const sz = opSize(mode);
-                const lo = off + 1 < mem.length ? mem[off + 1] : 0;
-                const hi = off + 2 < mem.length ? mem[off + 2] : 0;
-                const operand = fmtOp(mode, lo, hi, a, addrSym);
-                let bytes = '';
-                for (let j = 0; j < sz && off + j < mem.length; j++)
-                    bytes += mem[off + j].toString(16).toUpperCase().padStart(2, '0') + ' ';
-                insts.push({ addr: a, bytes: bytes.trimEnd(), text: mne + (operand ? ' ' + operand : ''), sym: addrSym.get(a) });
-                off += sz;
-            } else {
-                const bh = mem[off].toString(16).toUpperCase().padStart(2, '0');
-                insts.push({ addr: a, bytes: bh, text: '.byte $' + bh });
-                off += 1;
-            }
-        }
-
-        // Find instruction at target addr
-        let pivotIdx = 0;
-        for (let i = 0; i < insts.length; i++) {
-            if (insts[i].addr >= addr) { pivotIdx = i; break; }
-        }
-
-        // Extract window around pivot
-        const startIdx = Math.max(0, pivotIdx - DISASM_CONTEXT);
-        const endIdx = Math.min(insts.length, pivotIdx + DISASM_CONTEXT + 1);
-        const window = insts.slice(startIdx, endIdx);
-
-        // Format as assembly text
-        const lines = [];
-        for (const inst of window) {
-            const ah = inst.addr.toString(16).toUpperCase().padStart(4, '0');
-            if (inst.sym) lines.push(inst.sym + ':');
-            lines.push(ah + '  ' + inst.bytes.padEnd(9) + ' ' + inst.text);
-        }
-
-        respond(req, { content: lines.join('\n') + '\n', mimeType: 'text/x-asm' });
     },
 
     // -- Disassemble (native DAP) ------------------------------------
@@ -1872,6 +1922,112 @@ const handlers = {
         respond(req, { result: reply === 'OK' ? 'Cycles reset' : 'Failed' });
     },
 
+    // -- Read all symbols with current values (custom request) ---------
+
+    async readAllSymbols(req) {
+        if (symbols.size === 0) {
+            respond(req, { symbols: [] });
+            return;
+        }
+
+        // Build sorted list of all symbols with addresses and sizes
+        const allAddrs = [];
+        for (const [name, addr] of symbols) {
+            allAddrs.push({ name, addr });
+        }
+        allAddrs.sort((a, b) => a.addr - b.addr);
+
+        // Infer sizes from gaps (cap at 8 for display, min 1)
+        // For ZP symbols, reuse zpSymbols sizes if available
+        const zpSizeMap = new Map();
+        for (const zs of zpSymbols) zpSizeMap.set(zs.addr, zs.size);
+
+        for (let i = 0; i < allAddrs.length; i++) {
+            const s = allAddrs[i];
+            if (s.addr <= 0xFF && zpSizeMap.has(s.addr)) {
+                s.size = zpSizeMap.get(s.addr);
+            } else {
+                // Skip aliases (same address) to find next distinct address
+                let ni = i + 1;
+                while (ni < allAddrs.length && allAddrs[ni].addr === s.addr) ni++;
+                const next = ni < allAddrs.length ? allAddrs[ni].addr : s.addr + 2;
+                s.size = Math.min(Math.max(next - s.addr, 1), 8);
+            }
+            s.group = s.addr <= 0xFF ? 'zp' : (s.addr < 0xC000 ? 'ram' : 'high');
+        }
+
+        // Collect unique 256-byte pages that need reading
+        const pages = new Set();
+        for (const s of allAddrs) {
+            const page = s.addr >> 8;
+            const endPage = (s.addr + s.size - 1) >> 8;
+            pages.add(page);
+            if (endPage !== page) pages.add(endPage);
+        }
+
+        // Batch-read each page
+        const mem = new Map(); // page -> Uint8Array(256)
+        const pageArr = Array.from(pages).sort((a, b) => a - b);
+        for (const page of pageArr) {
+            const baseAddr = page << 8;
+            const reply = await gdbCmd('m' + baseAddr.toString(16) + ',100');
+            if (reply && reply[0] !== 'E') {
+                const bytes = new Uint8Array(256);
+                for (let i = 0; i < reply.length && i < 512; i += 2)
+                    bytes[i >> 1] = parseInt(reply.substring(i, i + 2), 16);
+                mem.set(page, bytes);
+            }
+        }
+
+        // Merge symbols at the same address (aliases)
+        const merged = [];
+        for (let i = 0; i < allAddrs.length; ) {
+            const s = allAddrs[i];
+            const names = [s.name];
+            let j = i + 1;
+            while (j < allAddrs.length && allAddrs[j].addr === s.addr) {
+                names.push(allAddrs[j].name);
+                j++;
+            }
+            merged.push({ names, addr: s.addr, size: s.size, group: s.group });
+            i = j;
+        }
+
+        // Build result with values
+        const result = [];
+        for (const s of merged) {
+            const value = [];
+            for (let i = 0; i < s.size; i++) {
+                const a = s.addr + i;
+                const page = a >> 8;
+                const off = a & 0xFF;
+                const pageData = mem.get(page);
+                value.push(pageData ? pageData[off] : 0);
+            }
+            // Order: master define first (the one addrSym returns, i.e. first in
+            // symbol file), then aliases sorted by name length
+            const master = addrSym.get(s.addr);
+            if (master && s.names.includes(master)) {
+                s.names = [master, ...s.names.filter(n => n !== master).sort((a, b) => a.length - b.length)];
+            } else {
+                s.names.sort((a, b) => a.length - b.length);
+            }
+            // Build per-name source locations
+            const nameSources = {};
+            for (const n of s.names) {
+                const ns = symSource.get(n);
+                if (ns) nameSources[n] = { file: ns.file, line: ns.line };
+            }
+            const src = addrSource.get(s.addr);
+            result.push({ name: s.names[0], aliases: s.names.slice(1),
+                          addr: s.addr, size: s.size, value, group: s.group,
+                          source: src ? { file: src.file, line: src.line } : null,
+                          nameSources });
+        }
+
+        respond(req, { symbols: result });
+    },
+
     // -- Data breakpoints (watchpoints) -------------------------------
 
     dataBreakpointInfo(req) {
@@ -1938,6 +2094,149 @@ const handlers = {
             });
         }
         respond(req, { breakpoints: result });
+    },
+
+    // -- Resolve current instruction operands (custom request) --------
+
+    async resolveInstruction(req) {
+        if (!regs) { respond(req, { annotation: '', pc: 0 }); return; }
+        const pc = regs.pc;
+        // Read 3 bytes at PC
+        const raw = await gdbCmd('m' + pc.toString(16) + ',3');
+        if (!raw || raw[0] === 'E') { respond(req, { annotation: '', pc }); return; }
+        const opcode = parseInt(raw.substring(0, 2), 16);
+        const lo = raw.length >= 4 ? parseInt(raw.substring(2, 4), 16) : 0;
+        const hi = raw.length >= 6 ? parseInt(raw.substring(4, 6), 16) : 0;
+        const op = OPS[opcode];
+        if (!op) { respond(req, { annotation: '', pc }); return; }
+        const mne = op.substring(0, 3);
+        const mode = op[3];
+
+        const h2 = v => '$' + (v & 0xFF).toString(16).toUpperCase().padStart(2, '0');
+        const h4 = v => (v & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
+        const sym = addr => addrSym.get(addr);
+
+        // Helper to read 1 byte from memory
+        async function readByte(addr) {
+            const r = await gdbCmd('m' + (addr & 0xFFFF).toString(16) + ',1');
+            return (r && r[0] !== 'E') ? parseInt(r.substring(0, 2), 16) : 0;
+        }
+        // Helper to read 2 bytes (little-endian word) from memory
+        async function readWord(addr) {
+            const r = await gdbCmd('m' + (addr & 0xFFFF).toString(16) + ',2');
+            if (!r || r[0] === 'E') return 0;
+            return parseInt(r.substring(0, 2), 16) | (parseInt(r.substring(2, 4), 16) << 8);
+        }
+
+        let annotation = '';
+        try {
+            switch (mode) {
+                case '#': { // immediate
+                    annotation = '#' + h2(lo) + ' (' + lo + ')';
+                    break;
+                }
+                case 'z': { // zero page
+                    const val = await readByte(lo);
+                    const s = sym(lo);
+                    annotation = '(' + (s || h2(lo)) + ')=' + h2(val);
+                    break;
+                }
+                case 'x': { // zp,X
+                    const ea = (lo + regs.x) & 0xFF;
+                    const val = await readByte(ea);
+                    const s = sym(lo);
+                    annotation = '(' + (s || h2(lo)) + '+X:' + h2(regs.x) + '=' + h2(ea) + ')=' + h2(val);
+                    break;
+                }
+                case 'y': { // zp,Y
+                    const ea = (lo + regs.y) & 0xFF;
+                    const val = await readByte(ea);
+                    const s = sym(lo);
+                    annotation = '(' + (s || h2(lo)) + '+Y:' + h2(regs.y) + '=' + h2(ea) + ')=' + h2(val);
+                    break;
+                }
+                case 'a': { // absolute
+                    const addr = (hi << 8) | lo;
+                    // JSR/JMP don't need value annotation
+                    if (mne === 'JSR' || mne === 'JMP') {
+                        const s = sym(addr);
+                        if (s) annotation = s;
+                    } else {
+                        const val = await readByte(addr);
+                        const s = sym(addr);
+                        annotation = '(' + (s || '$' + h4(addr)) + ')=' + h2(val);
+                    }
+                    break;
+                }
+                case 'X': { // abs,X
+                    const base = (hi << 8) | lo;
+                    const ea = (base + regs.x) & 0xFFFF;
+                    const val = await readByte(ea);
+                    annotation = '$' + h4(base) + '+X:' + h2(regs.x) + '=$' + h4(ea) + ' =' + h2(val);
+                    break;
+                }
+                case 'Y': { // abs,Y
+                    const base = (hi << 8) | lo;
+                    const ea = (base + regs.y) & 0xFFFF;
+                    const val = await readByte(ea);
+                    annotation = '$' + h4(base) + '+Y:' + h2(regs.y) + '=$' + h4(ea) + ' =' + h2(val);
+                    break;
+                }
+                case '(': { // (zp,X) indirect X
+                    const ptr = (lo + regs.x) & 0xFF;
+                    const ea = await readWord(ptr);
+                    const val = await readByte(ea);
+                    const s = sym(lo);
+                    annotation = '(' + (s || h2(lo)) + '+X:' + h2(regs.x) + '=' + h2(ptr) + ')=$' + h4(ea) + ' =' + h2(val);
+                    break;
+                }
+                case ')': { // (zp),Y indirect Y
+                    const ptr = await readWord(lo);
+                    const ea = (ptr + regs.y) & 0xFFFF;
+                    const val = await readByte(ea);
+                    const s = sym(lo);
+                    annotation = '(*(' + (s || h2(lo)) + ')=$' + h4(ptr) + '+Y:' + h2(regs.y) + ')=$' + h4(ea) + ' =' + h2(val);
+                    break;
+                }
+                case 'n': { // indirect (JMP only)
+                    const addr = (hi << 8) | lo;
+                    const target = await readWord(addr);
+                    annotation = '($' + h4(addr) + ')=$' + h4(target);
+                    break;
+                }
+                case 'r': { // relative (branches)
+                    const offset = lo < 128 ? lo : lo - 256;
+                    const target = (pc + 2 + offset) & 0xFFFF;
+                    const s = sym(target);
+                    // Determine branch taken/not-taken from flags
+                    const f = regs.f;
+                    let taken = false;
+                    switch (opcode) {
+                        case 0x10: taken = !(f & 0x80); break; // BPL: N=0
+                        case 0x30: taken = !!(f & 0x80); break; // BMI: N=1
+                        case 0x50: taken = !(f & 0x40); break; // BVC: V=0
+                        case 0x70: taken = !!(f & 0x40); break; // BVS: V=1
+                        case 0x90: taken = !(f & 0x01); break; // BCC: C=0
+                        case 0xB0: taken = !!(f & 0x01); break; // BCS: C=1
+                        case 0xD0: taken = !(f & 0x02); break; // BNE: Z=0
+                        case 0xF0: taken = !!(f & 0x02); break; // BEQ: Z=1
+                    }
+                    annotation = (s || '$' + h4(target)) + (taken ? ' [taken]' : ' [not taken]');
+                    break;
+                }
+                // I (implied), A (accumulator): no memory operand
+                default:
+                    break;
+            }
+        } catch (_) { /* annotation stays empty */ }
+
+        const src = sourceFor(pc);
+        respond(req, {
+            annotation,
+            pc,
+            file: src ? src.file : null,
+            line: src ? src.line : 0
+        });
     },
 
     // -- Get last cycle annotation (custom request) -------------------

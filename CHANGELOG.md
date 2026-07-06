@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.0.4
+
+### Symbol Browser
+- New "Oric: Symbol Browser" webview panel listing all runtime symbols and `#define` constants
+- Alias merging: symbols at the same address are grouped into a single row, master definition listed first
+- Live values displayed during debug sessions
+- Group filter dropdown (ZP, BSS, Code, Data, Define)
+- Sortable columns and text search
+- Hover a row to highlight the address on the Memory Heatmap
+- Click any symbol name to jump to its source definition
+
+### Instruction Operand Annotations
+- On each debug stop, the current source line shows resolved operand values inline
+- All 6502 addressing modes decoded: immediate, zero page, absolute, indexed, indirect, relative
+- Branch instructions show "taken" or "not taken" based on current flags
+- Example: `sta ($50),Y` → `(*(ptr=$50)=$A398+Y:$02)=$A39A`
+
+### Heatmap Address Crosshair
+- Crosshair overlay drawn on the Memory Heatmap when hovering symbols in the Symbol Browser or editor
+- Auto-follows the PC address on each debug stop
+- Black-white-black 3-line technique for universal contrast on any heatmap color
+
+### Code Navigation
+- **Hover provider**: hover over symbol names or `#define` constants to see address, value, aliases, and source location
+- **Definition provider**: Ctrl+Click or F12 on symbols to jump to their definition in source code
+- `#define` directives (`#define NAME value`) scanned from workspace `.s`, `.h`, `.asm` files
+- Hex addresses (`$HHHH`) in source code also show heatmap crosshair on hover
+
+### Show Current Location
+- New "Oric: Show Current Location" command (Ctrl+Alt+Home) to navigate back to the current PC
+- Also available as a stackframe icon button in the debug toolbar
+
+### Safety Improvements
+- "Jump to Cursor" (goto) now refuses addresses below $0400 (zero page, stack, page 2, I/O) to prevent accidental PC corruption
+
+### Documentation
+- Comprehensive README with all commands, keyboard shortcuts, debug console commands, configuration reference, and symbol file format documentation
+
 ## 0.0.3
 
 ### Screen View
