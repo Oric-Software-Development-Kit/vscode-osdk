@@ -10,6 +10,8 @@
 
 const net = require('net');
 const fs = require('fs');
+const path = require('path');
+const child_process = require('child_process');
 
 // ----------------------------------------------------------------
 // DAP protocol I/O  (Content-Length framing over stdin/stdout)
@@ -61,14 +63,25 @@ function respond(req, body, ok, message) {
 }
 
 function evt(name, body) {
+    if (name !== 'output' && name !== 'invalidated' && name !== 'cycleAnnotation') {
+        logVerbose('[DAP] → event: ' + name +
+            (body && body.reason ? ' reason=' + body.reason : ''));
+    }
     sendDap({ type: 'event', event: name, body: body || {} });
     if (name === 'stopped') {
         sendDap({ type: 'event', event: 'invalidated', body: { areas: ['variables'] } });
     }
 }
 
+// Log levels: 0 = errors only, 1 = normal (default), 2 = verbose/debug
+let logLevel = 1;
+
 function log(msg) {
     evt('output', { category: 'console', output: msg + '\n' });
+}
+
+function logVerbose(msg) {
+    if (logLevel >= 2) log(msg);
 }
 
 // ----------------------------------------------------------------
@@ -133,6 +146,7 @@ function onGdbData(data) {
         // ACK
         if (sock) sock.write('+');
 
+        logVerbose('[GDB] ← ' + payload.substring(0, 40));
         // Route the packet: if we're waiting for a command response,
         // deliver it — UNLESS it's an unsolicited stop notification
         // (T05/S05) while we're waiting for a non-'?' response.
@@ -156,19 +170,36 @@ function onGdbData(data) {
 }
 
 function gdbWrite(cmd) {
-    if (!sock) return;
+    if (!sock) { logVerbose('[GDB] write failed: no socket (cmd=' + cmd.substring(0, 20) + ')'); return; }
     let cs = 0;
     for (let i = 0; i < cmd.length; i++) cs = (cs + cmd.charCodeAt(i)) & 0xff;
+    logVerbose('[GDB] → ' + cmd.substring(0, 40));
     sock.write('$' + cmd + '#' + cs.toString(16).padStart(2, '0'));
 }
 
 /** Send the next queued GDB command (if any). */
+let gdbIdleCallbacks = [];
 function gdbSendNext() {
-    if (gdbQueue.length === 0) return;
+    if (gdbQueue.length === 0) {
+        // Queue empty and no pending command — fire idle callbacks
+        const cbs = gdbIdleCallbacks;
+        gdbIdleCallbacks = [];
+        for (const cb of cbs) cb();
+        return;
+    }
     const { cmd, resolve } = gdbQueue.shift();
     pendingResolve = resolve;
     pendingCmdType = cmd[0];
     gdbWrite(cmd);
+}
+
+/** Run callback when no GDB command is in-flight and queue is empty. */
+function whenGdbIdle(cb) {
+    if (!pendingResolve && gdbQueue.length === 0) {
+        cb();
+    } else {
+        gdbIdleCallbacks.push(cb);
+    }
 }
 
 /** Send a GDB command and wait for the response packet.
@@ -207,7 +238,79 @@ let zpSymbols  = [];          // [{addr, name, size}] sorted by address
 let configDone = false;
 let pendingStop = null;       // deferred stopped event body
 let srcBps     = new Map();   // file -> [{id, addr}] (source breakpoints per file)
+let dataBps    = new Map();   // id -> { addr, accessType, gdbType } (data breakpoints)
 let gotoTargetMap = new Map(); // targetId -> address (for goto/setNextStatement)
+let lastCycleAnnotation = null; // { pc, cycles } from last step-over
+let launchedProcess = null;     // child_process handle if we launched Oricutron
+
+// ----------------------------------------------------------------
+// Build staleness check (pure Node.js, cross-platform)
+// ----------------------------------------------------------------
+
+function readdirRecursive(dir) {
+    let results = [];
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch (e) { return results; }
+    for (const ent of entries) {
+        const full = path.join(dir, ent.name);
+        if (ent.isDirectory()) {
+            results = results.concat(readdirRecursive(full));
+        } else {
+            results.push(full);
+        }
+    }
+    return results;
+}
+
+function checkStale(outputPath, sourceDirs) {
+    let outMtime;
+    try { outMtime = fs.statSync(outputPath).mtimeMs; }
+    catch (e) { return true; } // output missing → stale
+    if (!sourceDirs || sourceDirs.length === 0) return false;
+    for (const dir of sourceDirs) {
+        let stat;
+        try { stat = fs.statSync(dir); } catch (e) { continue; }
+        if (stat.isFile()) {
+            if (stat.mtimeMs > outMtime) return true;
+            continue;
+        }
+        const files = readdirRecursive(dir);
+        for (const f of files) {
+            try {
+                if (fs.statSync(f).mtimeMs > outMtime) return true;
+            } catch (e) { /* skip unreadable */ }
+        }
+    }
+    return false;
+}
+
+// ----------------------------------------------------------------
+// Build runner (spawns shell, streams output to DAP console)
+// ----------------------------------------------------------------
+
+function runBuild(command, cwd) {
+    return new Promise((resolve, reject) => {
+        const isWin = process.platform === 'win32';
+        const shell = isWin ? 'cmd' : 'sh';
+        const shellArgs = isWin ? ['/c', command] : ['-c', command];
+        const child = child_process.spawn(shell, shellArgs, {
+            cwd: cwd || process.cwd(),
+            windowsHide: true
+        });
+        child.stdout.on('data', d => {
+            evt('output', { category: 'stdout', output: d.toString() });
+        });
+        child.stderr.on('data', d => {
+            evt('output', { category: 'stderr', output: d.toString() });
+        });
+        child.on('error', err => reject(new Error('Build failed to start: ' + err.message)));
+        child.on('close', code => {
+            if (code === 0) resolve();
+            else reject(new Error('Build failed with exit code ' + code));
+        });
+    });
+}
 
 // ----------------------------------------------------------------
 // Symbol file loader  (format: "HHHH symbol_name" per line)
@@ -351,10 +454,48 @@ function onStopReply(payload) {
     regs = parseStopRegs(payload);
     const sig = parseInt(payload.substring(1, 3), 16);
 
+    // Parse extended stop-reply fields
+    let cyclesDelta = null;
+    let watchAddr = null;
+    let watchType = null;
+    const parts = payload.substring(3).split(';');
+    for (const p of parts) {
+        if (p.startsWith('OricCycles:')) {
+            cyclesDelta = parseInt(p.substring(11), 16);
+        } else if (p.startsWith('watch:')) {
+            watchAddr = parseInt(p.substring(6), 16);
+            watchType = 'write';
+        } else if (p.startsWith('rwatch:')) {
+            watchAddr = parseInt(p.substring(7), 16);
+            watchType = 'read';
+        } else if (p.startsWith('awatch:')) {
+            watchAddr = parseInt(p.substring(7), 16);
+            watchType = 'access';
+        }
+    }
+
+    // Handle cycle annotation from step-over
+    // The annotation belongs on the JSR instruction line (PC-3), not the return address
+    lastCycleAnnotation = null;
+    if (cyclesDelta !== null && regs && regs.pc !== undefined) {
+        const jsrPc = (regs.pc - 3) & 0xFFFF;
+        const src = sourceFor(jsrPc);
+        lastCycleAnnotation = {
+            pc: jsrPc,
+            cycles: cyclesDelta,
+            symbol: addrSym.get(jsrPc) || null,
+            file: src ? src.file : null,
+            line: src ? src.line : 0
+        };
+    }
+
     // Determine stop reason
     let reason = sig === 5 ? 'step' : 'pause';
     let hitIds;
-    if (sig === 5 && regs && regs.pc !== undefined) {
+
+    if (watchAddr !== null) {
+        reason = 'data breakpoint';
+    } else if (sig === 5 && regs && regs.pc !== undefined) {
         for (const [id, bp] of bps) {
             if (bp.addr === regs.pc) { reason = 'breakpoint'; hitIds = [id]; break; }
         }
@@ -369,7 +510,14 @@ function onStopReply(payload) {
     if (hitIds) body.hitBreakpointIds = hitIds;
 
     if (configDone) {
+        const pc = regs ? regs.pc : -1;
+        log('Stop: reason=' + reason + ' pc=$' + (pc >= 0 ? pc.toString(16).toUpperCase().padStart(4, '0') : '?') +
+            (hitIds ? ' bp=' + hitIds.join(',') : ''));
         evt('stopped', body);
+        // Send cycle annotation as custom event
+        if (lastCycleAnnotation) {
+            evt('cycleAnnotation', lastCycleAnnotation);
+        }
     } else {
         pendingStop = body;
     }
@@ -552,6 +700,7 @@ async function buildCallStack() {
 
 function handleDap(msg) {
     if (msg.type !== 'request') return;
+    logVerbose('[DAP] ← ' + msg.command);
     const h = handlers[msg.command];
     if (h) {
         Promise.resolve(h(msg)).catch(e => {
@@ -588,13 +737,17 @@ const handlers = {
             supportsStepInTargetsRequest: false,
             supportsCompletionsRequest: false,
             supportsModulesRequest: false,
-            supportsInvalidatedEvent: true
+            supportsInvalidatedEvent: true,
+            supportsDataBreakpoints: true,
+            supportsRestartRequest: true
         });
-        evt('initialized');
+        // Note: 'initialized' event is deferred to launch/attach handler
+        // so breakpoints & configurationDone arrive after GDB is connected.
     },
 
     async attach(req) {
         config = req.arguments || {};
+        if (config.logLevel !== undefined) logLevel = config.logLevel;
         const host = config.host || 'localhost';
         const port = config.port || 6502;
         const retries = config.connectRetries || 10;
@@ -618,6 +771,7 @@ const handlers = {
                 }
 
                 respond(req);
+                evt('initialized');
                 return;
             } catch (e) {
                 lastErr = e;
@@ -632,17 +786,189 @@ const handlers = {
             ' after ' + retries + ' retries — is Oricutron running with --gdb_port?');
     },
 
+    async launch(req) {
+        config = req.arguments || {};
+        if (config.logLevel !== undefined) logLevel = config.logLevel;
+        const port = config.port || 6502;
+
+        if (config.symbolFile) loadSymbols(config.symbolFile);
+
+        // --- Step 1: Build if stale ---
+        if (config.build) {
+            const buildOutput = config.build.output;
+            const sourceDirs  = config.build.sources;
+            const buildCmd    = config.build.command;
+            const buildCwd    = config.build.cwd;
+
+            if (buildOutput && buildCmd) {
+                const stale = checkStale(buildOutput, sourceDirs);
+                if (stale) {
+                    log('Build is stale, running ' + buildCmd + '...');
+                    try {
+                        await runBuild(buildCmd, buildCwd);
+                        log('Build succeeded.');
+                    } catch (e) {
+                        respond(req, {}, false, e.message);
+                        return;
+                    }
+                } else {
+                    log('Build is up to date.');
+                }
+            }
+        }
+
+        // --- Step 2: Launch Oricutron ---
+        if (config.emulatorPath) {
+            // VS Code sends noDebug inside arguments for Ctrl+F5
+            const isNoDebug = config.noDebug || false;
+            const emuArgs = isNoDebug
+                ? [config.diskImage, '-s', 'symbols', ...(config.emulatorArgs || [])]
+                : [config.diskImage, '--gdb_port', String(port), '-s', 'symbols', ...(config.emulatorArgs || [])];
+            const emuCwd = config.emulatorCwd || path.dirname(config.emulatorPath);
+
+            log('Launching: ' + config.emulatorPath + ' ' + emuArgs.join(' '));
+            log('Cwd: ' + emuCwd);
+
+            launchedProcess = child_process.spawn(config.emulatorPath, emuArgs, {
+                cwd: emuCwd,
+                detached: false,
+                windowsHide: false
+            });
+            launchedProcess.on('error', err => {
+                log('Emulator failed to start: ' + err.message);
+                evt('terminated');
+            });
+            launchedProcess.on('close', (code) => {
+                launchedProcess = null;
+                if (!disconnecting) {
+                    log('Emulator exited (code ' + code + ')');
+                    evt('terminated');
+                }
+            });
+            // Pipe emulator output to debug console
+            if (launchedProcess.stdout)
+                launchedProcess.stdout.on('data', d => evt('output', { category: 'stdout', output: d.toString() }));
+            if (launchedProcess.stderr)
+                launchedProcess.stderr.on('data', d => evt('output', { category: 'stderr', output: d.toString() }));
+        }
+
+        // --- Ctrl+F5 (noDebug): launched, no GDB connection ---
+        if (config.noDebug) {
+            respond(req);
+            evt('initialized');
+            return;
+        }
+
+        // --- Step 3: Connect GDB (same retry logic as attach) ---
+        const host = config.host || 'localhost';
+        const retries = config.connectRetries || 10;
+        const retryDelay = config.connectRetryDelay || 1000;
+
+        let lastErr;
+        for (let attempt = 0; attempt <= retries; attempt++) {
+            try {
+                await gdbConnect(host, port);
+                log('Connected to Oricutron at ' + host + ':' + port);
+                const reply = await gdbCmd('?');
+                if (reply) {
+                    regs = parseStopRegs(reply);
+                }
+                respond(req);
+                evt('initialized');
+                return;
+            } catch (e) {
+                lastErr = e;
+                if (attempt < retries) {
+                    if (attempt === 0)
+                        log('Waiting for Oricutron on ' + host + ':' + port + '...');
+                    await new Promise(r => setTimeout(r, retryDelay));
+                }
+            }
+        }
+        respond(req, {}, false, 'Could not connect to ' + host + ':' + port +
+            ' after ' + retries + ' retries — is Oricutron running?');
+    },
+
     configurationDone(req) {
         configDone = true;
         respond(req);
 
-        // Send any deferred stop event, or a fresh entry stop
-        if (pendingStop) {
-            evt('stopped', pendingStop);
-            pendingStop = null;
-        } else if (config.stopOnAttach !== false) {
-            evt('stopped', { reason: 'entry', threadId: 1, allThreadsStopped: true });
+        function doContinue() {
+            log('Free-run: sending GDB continue');
+            running = true;
+            gdbWrite('c');
         }
+
+        if (pendingStop) {
+            if (config.stopOnAttach === false) {
+                log('configurationDone: free-run (had pendingStop)');
+                pendingStop = null;
+                whenGdbIdle(doContinue);
+            } else {
+                log('configurationDone: stop on attach (had pendingStop)');
+                evt('stopped', pendingStop);
+                pendingStop = null;
+            }
+        } else if (config.stopOnAttach !== false) {
+            log('configurationDone: stop on attach (entry)');
+            evt('stopped', { reason: 'entry', threadId: 1, allThreadsStopped: true });
+        } else {
+            log('configurationDone: free-run (no pendingStop)');
+            whenGdbIdle(doContinue);
+        }
+    },
+
+    async restart(req) {
+        const args = req.arguments || {};
+        // Merge restart arguments into config (VS Code re-sends the launch config)
+        if (args.configuration) Object.assign(config, args.configuration);
+
+        log('Restarting debug session...');
+
+        // --- Step 1: Build if stale ---
+        if (config.build) {
+            const buildOutput = config.build.output;
+            const sourceDirs  = config.build.sources;
+            const buildCmd    = config.build.command;
+            const buildCwd    = config.build.cwd;
+
+            if (buildOutput && buildCmd) {
+                const stale = checkStale(buildOutput, sourceDirs);
+                if (stale) {
+                    log('Build is stale, running ' + buildCmd + '...');
+                    try {
+                        await runBuild(buildCmd, buildCwd);
+                        log('Build succeeded.');
+                    } catch (e) {
+                        respond(req, {}, false, 'Rebuild failed: ' + e.message);
+                        return;
+                    }
+                } else {
+                    log('Build is up to date.');
+                }
+            }
+        }
+
+        // --- Step 2: Reload symbols ---
+        if (config.symbolFile) {
+            loadSymbols(config.symbolFile);
+        }
+
+        // --- Step 3: Hard reset Oricutron (reloads disk + resets CPU, pauses) ---
+        configDone = false;
+        pendingStop = null;
+        running = false;
+
+        const reply = await gdbCmd('qOricHardReset');
+        if (reply) {
+            regs = parseStopRegs(reply);
+            log('Hard reset complete, PC=$' + (regs.pc !== undefined ? regs.pc.toString(16).toUpperCase().padStart(4, '0') : '??'));
+        }
+
+        respond(req);
+
+        // Send initialized so VS Code re-sends breakpoints, then configurationDone
+        evt('initialized');
     },
 
     async disconnect(req) {
@@ -651,6 +977,19 @@ const handlers = {
             gdbWrite('D'); // detach — don't wait for reply
             sock.destroy();
             sock = null;
+        }
+        // Kill emulator if we launched it
+        if (launchedProcess) {
+            try {
+                if (process.platform === 'win32') {
+                    // Tree-kill on Windows to catch child processes
+                    child_process.execSync('taskkill /pid ' + launchedProcess.pid + ' /T /F',
+                        { windowsHide: true, stdio: 'ignore' });
+                } else {
+                    launchedProcess.kill('SIGTERM');
+                }
+            } catch (e) { /* already exited */ }
+            launchedProcess = null;
         }
         respond(req);
         evt('terminated');
@@ -681,7 +1020,6 @@ const handlers = {
             };
             const src = sourceFor(addr);
             if (src) {
-                const path = require('path');
                 const filePath = path.isAbsolute(src.file) ? src.file
                     : config.sourceRoot ? path.resolve(config.sourceRoot, src.file)
                     : config.workspaceFolder ? path.resolve(config.workspaceFolder, src.file)
@@ -894,7 +1232,7 @@ const handlers = {
         regs = null;
         respond(req);
         running = true;
-        gdbWrite('s');
+        gdbWrite('N');
     },
 
     stepIn(req) {
@@ -905,12 +1243,10 @@ const handlers = {
     },
 
     stepOut(req) {
-        // 6502 has no native step-out — just continue
         regs = null;
-        respond(req, { allThreadsContinued: true });
+        respond(req);
         running = true;
-        gdbWrite('c');
-        evt('continued', { threadId: 1, allThreadsContinued: true });
+        gdbWrite('O');
     },
 
     pause(req) {
@@ -933,7 +1269,6 @@ const handlers = {
 
         const result = [];
         const newBps = [];
-        const path = require('path');
 
         for (const sbp of (args.breakpoints || [])) {
             const reqLine = sbp.line;
@@ -1400,5 +1735,106 @@ const handlers = {
         const text = (req.arguments && req.arguments.text) || '';
         log(text);
         respond(req, {});
+    },
+
+    // -- Skip instruction (custom request) ----------------------------
+
+    async skip(req) {
+        if (!regs) { respond(req, {}, false, 'No register state'); return; }
+        gdbWrite('K');
+        // K sends a stop reply — route through normal stop handling
+        respond(req, { result: 'skip sent' });
+    },
+
+    // -- Warp speed toggle (custom request) ---------------------------
+
+    async toggleWarp(req) {
+        const reply = await gdbCmd('qOricWarp');
+        if (reply === null) { respond(req, {}, false, 'Not connected'); return; }
+        const current = reply === '1';
+        const newState = !current;
+        const setReply = await gdbCmd('qOricWarp,' + (newState ? '1' : '0'));
+        respond(req, { warp: newState });
+    },
+
+    // -- Reset cycle counter (custom request) -------------------------
+
+    async resetCycles(req) {
+        const reply = await gdbCmd('qOricResetCycles');
+        respond(req, { result: reply === 'OK' ? 'Cycles reset' : 'Failed' });
+    },
+
+    // -- Data breakpoints (watchpoints) -------------------------------
+
+    dataBreakpointInfo(req) {
+        const args = req.arguments;
+        const name = args.name || '';
+        const ref = args.variablesReference;
+
+        // Try to resolve to an address
+        let addr = -1;
+        let description = name;
+
+        // Check if it's a hex address like "$xx" or "0xxx"
+        const hexMatch = name.match(/^\$([0-9a-fA-F]{1,4})/);
+        if (hexMatch) {
+            addr = parseInt(hexMatch[1], 16);
+        } else {
+            // Try zero-page variable name (strip address prefix like "$00 name")
+            const zpMatch = name.match(/^\$[0-9a-fA-F]{2}\s+(.+)/);
+            const symName = zpMatch ? zpMatch[1] : name;
+            const symAddr = symbols.get(symName);
+            if (symAddr !== undefined) {
+                addr = symAddr;
+                description = symName + ' ($' + addr.toString(16).toUpperCase().padStart(4, '0') + ')';
+            }
+        }
+
+        if (addr >= 0) {
+            respond(req, {
+                dataId: addr.toString(16).padStart(4, '0'),
+                description: description,
+                accessTypes: ['read', 'write', 'readWrite']
+            });
+        } else {
+            respond(req, { dataId: null, description: 'Cannot watch: ' + name });
+        }
+    },
+
+    async setDataBreakpoints(req) {
+        // Clear all existing data breakpoints
+        for (const [, bp] of dataBps) {
+            await gdbCmd('z' + bp.gdbType + ',' + bp.addr.toString(16) + ',1');
+        }
+        dataBps.clear();
+
+        const result = [];
+        for (const dbp of (req.arguments.breakpoints || [])) {
+            const addr = parseInt(dbp.dataId, 16);
+            const access = dbp.accessType || 'write';
+            // Map DAP accessType to GDB Z type: write=Z2, read=Z3, readWrite=Z4
+            let gdbType;
+            switch (access) {
+                case 'read':      gdbType = '3'; break;
+                case 'readWrite': gdbType = '4'; break;
+                default:          gdbType = '2'; break; // write
+            }
+            const r = await gdbCmd('Z' + gdbType + ',' + addr.toString(16) + ',1');
+            const id = bpId++;
+            const ok = r === 'OK';
+            if (ok) dataBps.set(id, { id, addr, accessType: access, gdbType });
+            result.push({
+                id: id,
+                verified: ok,
+                message: ok ? undefined : 'Failed to set watchpoint'
+            });
+        }
+        respond(req, { breakpoints: result });
+    },
+
+    // -- Get last cycle annotation (custom request) -------------------
+
+    getCycleAnnotation(req) {
+        respond(req, { annotation: lastCycleAnnotation });
     }
 };

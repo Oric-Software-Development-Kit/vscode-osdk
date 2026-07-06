@@ -102,6 +102,21 @@
                 "title": "Oric: Memory Heatmap"
             },
             {
+                "command": "oric-debug.skipInstruction",
+                "title": "Oric: Skip Instruction",
+                "icon": "$(debug-step-over)"
+            },
+            {
+                "command": "oric-debug.toggleWarp",
+                "title": "Oric: Toggle Warp Speed",
+                "icon": "$(rocket)"
+            },
+            {
+                "command": "oric-debug.resetCycleCounter",
+                "title": "Oric: Reset Cycle Counter",
+                "icon": "$(history)"
+            },
+            {
                 "command": "osdk.xaReference",
                 "title": "OSDK: XA Quick Reference"
             },
@@ -110,6 +125,39 @@
                 "title": "OSDK: 6502 Opcode Reference"
             }
         ],
+        "keybindings": [
+            {
+                "command": "oric-debug.skipInstruction",
+                "key": "ctrl+shift+f12",
+                "when": "debugType == 'oric-debug' && debugState == 'stopped'"
+            },
+            {
+                "command": "oric-debug.toggleWarp",
+                "key": "ctrl+shift+f6",
+                "when": "debugType == 'oric-debug'"
+            },
+            {
+                "command": "oric-debug.resetCycleCounter",
+                "key": "ctrl+shift+f9",
+                "when": "debugType == 'oric-debug' && debugState == 'stopped'"
+            }
+        ],
+        "menus": {
+            "debug/toolBar": [
+                {
+                    "command": "oric-debug.skipInstruction",
+                    "when": "debugType == 'oric-debug' && debugState == 'stopped'"
+                },
+                {
+                    "command": "oric-debug.toggleWarp",
+                    "when": "debugType == 'oric-debug'"
+                },
+                {
+                    "command": "oric-debug.resetCycleCounter",
+                    "when": "debugType == 'oric-debug' && debugState == 'stopped'"
+                }
+            ]
+        },
         "debuggers": [
             {
                 "type": "oric-debug",
@@ -138,6 +186,81 @@
                                 "type": "boolean",
                                 "description": "Break on attach",
                                 "default": true
+                            },
+                            "logLevel": {
+                                "type": "number",
+                                "description": "Debug log verbosity: 0=errors, 1=normal, 2=verbose",
+                                "default": 1
+                            }
+                        }
+                    },
+                    "launch": {
+                        "required": ["emulatorPath", "diskImage"],
+                        "properties": {
+                            "emulatorPath": {
+                                "type": "string",
+                                "description": "Path to Oricutron executable"
+                            },
+                            "emulatorArgs": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Additional emulator arguments",
+                                "default": []
+                            },
+                            "diskImage": {
+                                "type": "string",
+                                "description": "Disk image to load (.dsk or .tap)"
+                            },
+                            "emulatorCwd": {
+                                "type": "string",
+                                "description": "Working directory for emulator (defaults to emulator's directory)"
+                            },
+                            "host": {
+                                "type": "string",
+                                "description": "Hostname for GDB connection",
+                                "default": "localhost"
+                            },
+                            "port": {
+                                "type": "number",
+                                "description": "TCP port for Oricutron GDB stub",
+                                "default": 6502
+                            },
+                            "symbolFile": {
+                                "type": "string",
+                                "description": "Path to symbol file (HHHH symbol_name per line)"
+                            },
+                            "stopOnAttach": {
+                                "type": "boolean",
+                                "description": "Break on attach",
+                                "default": true
+                            },
+                            "logLevel": {
+                                "type": "number",
+                                "description": "Debug log verbosity: 0=errors, 1=normal, 2=verbose",
+                                "default": 1
+                            },
+                            "build": {
+                                "type": "object",
+                                "description": "Optional build configuration (staleness check + build)",
+                                "properties": {
+                                    "command": {
+                                        "type": "string",
+                                        "description": "Build command (e.g. osdk_build.bat)"
+                                    },
+                                    "cwd": {
+                                        "type": "string",
+                                        "description": "Working directory for build command"
+                                    },
+                                    "output": {
+                                        "type": "string",
+                                        "description": "Build output file to check for staleness"
+                                    },
+                                    "sources": {
+                                        "type": "array",
+                                        "items": { "type": "string" },
+                                        "description": "Source directories/files to check for staleness"
+                                    }
+                                }
                             }
                         }
                     }
@@ -145,14 +268,42 @@
                 "initialConfigurations": [
                     {
                         "type": "oric-debug",
-                        "request": "attach",
-                        "name": "Attach to Oricutron",
-                        "host": "localhost",
+                        "request": "launch",
+                        "name": "Build & Debug",
+                        "emulatorPath": "${env:OSDK}/Oricutron/Oricutron.exe",
+                        "diskImage": "${workspaceFolder}/build/program.dsk",
                         "port": 6502,
-                        "stopOnAttach": true
+                        "symbolFile": "${workspaceFolder}/build/symbols",
+                        "stopOnAttach": true,
+                        "build": {
+                            "command": "osdk_build.bat",
+                            "cwd": "${workspaceFolder}",
+                            "output": "${workspaceFolder}/build/program.dsk",
+                            "sources": ["${workspaceFolder}/code"]
+                        }
                     }
                 ],
                 "configurationSnippets": [
+                    {
+                        "label": "Oric Debug: Build & Launch",
+                        "description": "Build if stale, launch Oricutron, and attach debugger",
+                        "body": {
+                            "type": "oric-debug",
+                            "request": "launch",
+                            "name": "Build & Debug",
+                            "emulatorPath": "^\"\\${env:OSDK}/Oricutron/Oricutron.exe\"",
+                            "diskImage": "^\"\\${workspaceFolder}/build/${1:program}.dsk\"",
+                            "port": 6502,
+                            "symbolFile": "^\"\\${workspaceFolder}/build/symbols\"",
+                            "stopOnAttach": true,
+                            "build": {
+                                "command": "osdk_build.bat",
+                                "cwd": "^\"\\${workspaceFolder}\"",
+                                "output": "^\"\\${workspaceFolder}/build/${1:program}.dsk\"",
+                                "sources": ["^\"\\${workspaceFolder}/code\""]
+                            }
+                        }
+                    },
                     {
                         "label": "Oric Debug: Attach",
                         "description": "Attach to a running Oricutron instance with GDB stub enabled",
@@ -162,7 +313,7 @@
                             "name": "Attach to Oricutron",
                             "host": "localhost",
                             "port": 6502,
-                            "symbolFile": "${workspaceFolder}/build/symbols",
+                            "symbolFile": "^\"\\${workspaceFolder}/build/symbols\"",
                             "stopOnAttach": true
                         }
                     }

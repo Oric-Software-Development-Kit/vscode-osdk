@@ -1429,8 +1429,84 @@ function activate(context) {
         }
     }
 
+    // --- Debug configuration validation ---
+    context.subscriptions.push(
+        vscode.debug.registerDebugConfigurationProvider('oric-debug', {
+            resolveDebugConfiguration(folder, config, token) {
+                // Warn if user has attach config but likely wants launch
+                if (config.request === 'attach' && config.emulatorPath) {
+                    vscode.window.showWarningMessage(
+                        'This debug config has "request": "attach" but also specifies emulatorPath. ' +
+                        'Change to "request": "launch" to auto-launch Oricutron.');
+                }
+                // Warn if launch config is missing required fields
+                if (config.request === 'launch') {
+                    if (!config.emulatorPath) {
+                        vscode.window.showErrorMessage(
+                            'Launch config is missing "emulatorPath". Set it to the Oricutron executable path.');
+                        return undefined; // abort launch
+                    }
+                    if (!config.diskImage) {
+                        vscode.window.showErrorMessage(
+                            'Launch config is missing "diskImage". Set it to the .dsk or .tap file.');
+                        return undefined;
+                    }
+                }
+                return config;
+            }
+        })
+    );
+
     vizOutputChannel = vscode.window.createOutputChannel('Oric Debug');
     context.subscriptions.push(vizOutputChannel);
+
+    // --- Cycle annotation decorations ---
+    const cycleDecorationType = vscode.window.createTextEditorDecorationType({
+        after: {
+            color: new vscode.ThemeColor('editorCodeLens.foreground'),
+            fontStyle: 'italic',
+            margin: '0 0 0 2em'
+        },
+        isWholeLine: true
+    });
+    // Map<filePath, Map<lineNumber, { cycles, symbol }>>
+    const cycleAnnotations = new Map();
+
+    function applyCycleDecorations() {
+        for (const editor of vscode.window.visibleTextEditors) {
+            const filePath = editor.document.uri.fsPath;
+            const fileAnnotations = cycleAnnotations.get(filePath);
+            if (!fileAnnotations || fileAnnotations.size === 0) {
+                editor.setDecorations(cycleDecorationType, []);
+                continue;
+            }
+            const decorations = [];
+            for (const [line, info] of fileAnnotations) {
+                if (line < 1 || line > editor.document.lineCount) continue;
+                const range = new vscode.Range(line - 1, 0, line - 1, 0);
+                const cyclesStr = info.cycles.toLocaleString();
+                decorations.push({
+                    range,
+                    renderOptions: {
+                        after: { contentText: '\u23F1 ' + cyclesStr + ' cycles' }
+                    }
+                });
+            }
+            editor.setDecorations(cycleDecorationType, decorations);
+        }
+    }
+
+    function clearCycleAnnotations() {
+        cycleAnnotations.clear();
+        for (const editor of vscode.window.visibleTextEditors) {
+            editor.setDecorations(cycleDecorationType, []);
+        }
+    }
+
+    context.subscriptions.push(
+        cycleDecorationType,
+        vscode.window.onDidChangeVisibleTextEditors(() => applyCycleDecorations())
+    );
 
     const regsProvider = new RegistersWebviewProvider();
     const zpProvider = new ZeroPageProvider();
@@ -1442,6 +1518,39 @@ function activate(context) {
         vscode.window.registerWebviewViewProvider('oricPeripherals', periphProvider),
         vscode.commands.registerCommand('oric-debug.openMemoryView', () => createMemoryPanel(context)),
         vscode.commands.registerCommand('oric-debug.openHeatmap', () => createHeatmapPanel()),
+        vscode.commands.registerCommand('oric-debug.skipInstruction', () => {
+            const session = vscode.debug.activeDebugSession;
+            if (session && session.type === 'oric-debug') {
+                session.customRequest('skip').catch(e => {
+                    vscode.window.showErrorMessage('Skip failed: ' + e.message);
+                });
+            }
+        }),
+        vscode.commands.registerCommand('oric-debug.toggleWarp', () => {
+            const session = vscode.debug.activeDebugSession;
+            if (session && session.type === 'oric-debug') {
+                session.customRequest('toggleWarp').then(resp => {
+                    if (resp) {
+                        vscode.window.setStatusBarMessage(
+                            resp.warp ? 'Warp: ON' : 'Warp: OFF', 3000
+                        );
+                    }
+                }).catch(e => {
+                    vscode.window.showErrorMessage('Warp toggle failed: ' + e.message);
+                });
+            }
+        }),
+        vscode.commands.registerCommand('oric-debug.resetCycleCounter', () => {
+            const session = vscode.debug.activeDebugSession;
+            if (session && session.type === 'oric-debug') {
+                session.customRequest('resetCycles').then(() => {
+                    vscode.window.setStatusBarMessage('Cycle counter reset', 3000);
+                    regsProvider.refresh(session);
+                }).catch(e => {
+                    vscode.window.showErrorMessage('Reset cycles failed: ' + e.message);
+                });
+            }
+        }),
         vscode.commands.registerCommand('osdk.xaReference', () => createXaReferencePanel()),
         vscode.commands.registerCommand('osdk.6502Reference', () => create6502ReferencePanel())
     );
@@ -1461,6 +1570,22 @@ function activate(context) {
                     onDidSendMessage(msg) {
                         if (msg.type === 'event' && msg.event === 'stopped') {
                             setTimeout(() => refreshAll(), 50);
+                        }
+                        // Handle cycle annotation events from the debug adapter
+                        if (msg.type === 'event' && msg.event === 'cycleAnnotation' && msg.body) {
+                            const ann = msg.body;
+                            if (ann.file && ann.line > 0 && ann.cycles !== undefined) {
+                                const path = require('path');
+                                const filePath = path.isAbsolute(ann.file) ? ann.file : ann.file;
+                                if (!cycleAnnotations.has(filePath)) {
+                                    cycleAnnotations.set(filePath, new Map());
+                                }
+                                cycleAnnotations.get(filePath).set(ann.line, {
+                                    cycles: ann.cycles,
+                                    symbol: ann.symbol
+                                });
+                                applyCycleDecorations();
+                            }
                         }
                     }
                 };
@@ -1483,6 +1608,7 @@ function activate(context) {
             vizLog('Debug session terminated');
             refreshAll();
             heatmapDisconnect();
+            clearCycleAnnotations();
         })
     );
 }
