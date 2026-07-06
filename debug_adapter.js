@@ -587,6 +587,19 @@ function fmtOp(mode, lo, hi, pc, symMap) {
 
 // Resolve address to source location — prefers line table (instruction-level),
 // falls back to symbol-based addrSource (label-level)
+// Check if a symbol at symAddr is a plausible source mapping for targetAddr.
+// Pages 0-3 ($0000-$03FF) are ZP/stack/page2/IO — a symbol there can never
+// be a valid reference for code outside that page.  For the rest of memory
+// ($0400+) allow up to 1KB offset within the same general region.
+function isPlausibleMapping(symAddr, targetAddr) {
+    const offset = targetAddr - symAddr;
+    if (offset < 0) return false;
+    // Symbol in pages 0-3: only valid if target is on the exact same page
+    if (symAddr < 0x0400) return (symAddr >> 8) === (targetAddr >> 8);
+    // Symbol in main/ROM memory: allow up to 1KB
+    return offset <= 1024;
+}
+
 function sourceFor(addr) {
     // Binary search the line table for largest address <= addr
     if (lineTable.length > 0) {
@@ -596,7 +609,8 @@ function sourceFor(addr) {
             if (lineTable[mid].addr <= addr) { best = mid; lo = mid + 1; }
             else { hi = mid - 1; }
         }
-        if (best >= 0) return lineTable[best];
+        if (best >= 0 && isPlausibleMapping(lineTable[best].addr, addr))
+            return lineTable[best];
     }
     // Fall back to symbol-based source map
     const exact = addrSource.get(addr);
@@ -605,6 +619,7 @@ function sourceFor(addr) {
     for (const [a, src] of addrSource) {
         if (a <= addr && a > bestAddr) { bestAddr = a; bestSrc = src; }
     }
+    if (bestSrc && !isPlausibleMapping(bestAddr, addr)) return null;
     return bestSrc;
 }
 
@@ -616,9 +631,9 @@ function labelFor(addr) {
     for (const [a, n] of addrSym) {
         if (a <= addr && a > bestAddr) { bestAddr = a; bestName = n; }
     }
-    return bestName
-        ? bestName + '+$' + (addr - bestAddr).toString(16).toUpperCase()
-        : '$' + addr.toString(16).toUpperCase().padStart(4, '0');
+    if (bestName && isPlausibleMapping(bestAddr, addr))
+        return bestName + '+$' + (addr - bestAddr).toString(16).toUpperCase();
+    return '$' + addr.toString(16).toUpperCase().padStart(4, '0');
 }
 
 // Walk the hardware stack (page 1) and identify JSR return addresses.
@@ -693,6 +708,14 @@ async function buildCallStack() {
 
     return frames;
 }
+
+// ----------------------------------------------------------------
+// Virtual disassembly sources — for frames with no source mapping
+// ----------------------------------------------------------------
+
+const DISASM_CONTEXT = 40;      // instructions before/after PC
+let disasmRefCounter = 100000;  // sourceReference counter (high to avoid clash)
+const disasmRefMap = new Map(); // sourceReference → target address
 
 // ----------------------------------------------------------------
 // DAP request dispatcher
@@ -1026,6 +1049,16 @@ const handlers = {
                     : src.file;
                 frame.source = { name: path.basename(filePath), path: filePath };
                 frame.line = src.line;
+            } else {
+                // No source mapping — provide a virtual disassembly source.
+                // VS Code will request the content via the DAP 'source' request.
+                const ref = ++disasmRefCounter;
+                disasmRefMap.set(ref, addr);
+                frame.source = {
+                    name: 'Disassembly @ $' + addr.toString(16).toUpperCase().padStart(4, '0'),
+                    sourceReference: ref
+                };
+                frame.line = DISASM_CONTEXT + 1; // PC is in the middle
             }
             return frame;
         }
@@ -1398,6 +1431,81 @@ const handlers = {
         const reply = await gdbCmd('M' + addr.toString(16) + ',' + buf.length.toString(16) + ':' + hex);
         respond(req, { bytesWritten: reply === 'OK' ? buf.length : 0 });
     },
+
+    // -- Virtual disassembly source ---------------------------------
+
+    async source(req) {
+        const ref = req.arguments.sourceReference;
+        const addr = disasmRefMap.get(ref);
+        if (addr === undefined) {
+            respond(req, { content: '; Source not available\n' });
+            return;
+        }
+
+        // Read memory around the target address and disassemble
+        const startAddr = Math.max(0, addr - DISASM_CONTEXT * 3);
+        const totalBytes = (DISASM_CONTEXT * 2 + 20) * 3;
+        const readAddr = startAddr & 0xFFFF;
+        const readLen = Math.min(totalBytes, 0xFFFF - readAddr + 1);
+        const reply = await gdbCmd('m' + readAddr.toString(16) + ',' + readLen.toString(16));
+        if (!reply || reply[0] === 'E') {
+            respond(req, { content: '; Failed to read memory at $' + readAddr.toString(16).toUpperCase().padStart(4, '0') + '\n' });
+            return;
+        }
+
+        const mem = [];
+        for (let i = 0; i < reply.length; i += 2)
+            mem.push(parseInt(reply.substring(i, i + 2), 16));
+
+        // Decode instructions
+        const insts = [];
+        let off = 0;
+        while (off < mem.length) {
+            const a = (readAddr + off) & 0xFFFF;
+            const op = mem[off];
+            const entry = OPS[op];
+            if (entry) {
+                const mne = entry.substring(0, 3);
+                const mode = entry[3];
+                const sz = opSize(mode);
+                const lo = off + 1 < mem.length ? mem[off + 1] : 0;
+                const hi = off + 2 < mem.length ? mem[off + 2] : 0;
+                const operand = fmtOp(mode, lo, hi, a, addrSym);
+                let bytes = '';
+                for (let j = 0; j < sz && off + j < mem.length; j++)
+                    bytes += mem[off + j].toString(16).toUpperCase().padStart(2, '0') + ' ';
+                insts.push({ addr: a, bytes: bytes.trimEnd(), text: mne + (operand ? ' ' + operand : ''), sym: addrSym.get(a) });
+                off += sz;
+            } else {
+                const bh = mem[off].toString(16).toUpperCase().padStart(2, '0');
+                insts.push({ addr: a, bytes: bh, text: '.byte $' + bh });
+                off += 1;
+            }
+        }
+
+        // Find instruction at target addr
+        let pivotIdx = 0;
+        for (let i = 0; i < insts.length; i++) {
+            if (insts[i].addr >= addr) { pivotIdx = i; break; }
+        }
+
+        // Extract window around pivot
+        const startIdx = Math.max(0, pivotIdx - DISASM_CONTEXT);
+        const endIdx = Math.min(insts.length, pivotIdx + DISASM_CONTEXT + 1);
+        const window = insts.slice(startIdx, endIdx);
+
+        // Format as assembly text
+        const lines = [];
+        for (const inst of window) {
+            const ah = inst.addr.toString(16).toUpperCase().padStart(4, '0');
+            if (inst.sym) lines.push(inst.sym + ':');
+            lines.push(ah + '  ' + inst.bytes.padEnd(9) + ' ' + inst.text);
+        }
+
+        respond(req, { content: lines.join('\n') + '\n', mimeType: 'text/x-asm' });
+    },
+
+    // -- Disassemble (native DAP) ------------------------------------
 
     async disassemble(req) {
         const args = req.arguments;

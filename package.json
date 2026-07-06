@@ -2,7 +2,7 @@
     "name": "osdk-debug",
     "displayName": "OSDK",
     "description": "Oric Software Development Kit - 6502/XA assembly highlighting and Oricutron debugging",
-    "version": "0.0.2",
+    "version": "0.0.3",
     "publisher": "dbug",
     "icon": "images/oric-icon.png",
     "homepage": "https://osdk.org",
@@ -31,7 +31,10 @@
         "onDebugResolve:oric-debug",
         "onLanguage:osdk",
         "onCommand:osdk.xaReference",
-        "onCommand:osdk.6502Reference"
+        "onCommand:osdk.6502Reference",
+        "onCommand:oric-debug.openScreenView",
+        "onWebviewPanel:oricHeatmap",
+        "onWebviewPanel:oricScreenView"
     ],
     "main": "./extension.js",
     "configurationDefaults": {
@@ -115,6 +118,10 @@
                 "command": "oric-debug.resetCycleCounter",
                 "title": "Oric: Reset Cycle Counter",
                 "icon": "$(history)"
+            },
+            {
+                "command": "oric-debug.openScreenView",
+                "title": "Oric: Screen View"
             },
             {
                 "command": "osdk.xaReference",

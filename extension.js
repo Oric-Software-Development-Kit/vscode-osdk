@@ -1012,9 +1012,245 @@ render('');
 // ----------------------------------------------------------------
 
 let heatmapPanel = null;
-let heatmapSocket = null;
-let heatmapRxBuf = Buffer.alloc(0);
+let screenPanel = null;
 let vizOutputChannel = null;
+
+// ----------------------------------------------------------------
+// Shared viz_stream connection (single TCP, multiple consumers)
+// ----------------------------------------------------------------
+
+let vizSocket = null;
+let vizRxBuf = Buffer.alloc(0);
+const vizConsumers = new Set();  // { postFrame(msg), postStatus(text), postError(text) }
+let vizHost = null;
+let vizPort = null;
+
+const VIZ_FRAME_SIZE_V0 = 16 + 65536 * 3;          // 196624
+const VIZ_SCR_SIZE       = 240 * 224;                // 53760
+const VIZ_VIDBASES_SIZE  = 4 * 2;                    // 8
+const VIZ_VIDRAM_MAIN    = 8000;
+const VIZ_VIDRAM_BOTTOM  = 120;
+const VIZ_FRAME_SIZE_V1  = VIZ_FRAME_SIZE_V0 + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN + VIZ_VIDRAM_BOTTOM; // 258512
+const VIZ_MAGIC          = 0x4349564F;  // "OVIC" as uint32 LE
+
+function vizLog(msg) {
+    if (vizOutputChannel) vizOutputChannel.appendLine('[VIZ] ' + msg);
+    const session = vscode.debug.activeDebugSession;
+    if (session && session.type === 'oric-debug') {
+        session.customRequest('logToConsole', { text: msg }).catch(() => {});
+    }
+}
+
+let vizReconnectTimer = null;
+
+function vizScheduleReconnect() {
+    if (vizReconnectTimer) return;
+    if (vizConsumers.size === 0) return;
+    // Only reconnect if a debug session is still active
+    const session = vscode.debug.activeDebugSession;
+    if (!session || session.type !== 'oric-debug') return;
+    vizReconnectTimer = setTimeout(() => {
+        vizReconnectTimer = null;
+        if (vizSocket) return; // already reconnected
+        if (vizConsumers.size === 0) return;
+        const s = vscode.debug.activeDebugSession;
+        if (!s || s.type !== 'oric-debug') return;
+        const config = s.configuration;
+        const h = config.host || 'localhost';
+        const p = (config.port || 6502) + 1;
+        vizLog('Auto-reconnecting to ' + h + ':' + p + '...');
+        vizConnect(h, p);
+    }, 2000);
+}
+
+function vizCancelReconnect() {
+    if (vizReconnectTimer) {
+        clearTimeout(vizReconnectTimer);
+        vizReconnectTimer = null;
+    }
+}
+
+function vizConnect(host, port) {
+    if (vizSocket) return; // already connected
+    if (!port) return;
+
+    const net = require('net');
+    const sock = new net.Socket();
+    vizSocket = sock;
+    vizRxBuf = Buffer.alloc(0);
+    vizHost = host;
+    vizPort = port;
+
+    vizLog('Connecting to viz server at ' + host + ':' + port + '...');
+
+    sock.connect(port, host, () => {
+        vizLog('Connected to ' + host + ':' + port);
+        for (const c of vizConsumers) c.postStatus('Connected to ' + host + ':' + port);
+    });
+
+    let syncErrors = 0;
+
+    sock.on('data', (chunk) => {
+        vizRxBuf = Buffer.concat([vizRxBuf, chunk]);
+
+        // Determine frame size from version field once we have the header
+        while (vizRxBuf.length >= 16) {
+            const magic = vizRxBuf.readUInt32LE(0);
+            if (magic !== VIZ_MAGIC) {
+                syncErrors++;
+                let found = -1;
+                for (let i = 1; i <= vizRxBuf.length - 4; i++) {
+                    if (vizRxBuf.readUInt32LE(i) === VIZ_MAGIC) { found = i; break; }
+                }
+                if (found < 0) {
+                    const discarded = vizRxBuf.length - 3;
+                    vizRxBuf = vizRxBuf.slice(vizRxBuf.length - 3);
+                    vizLog('Frame sync error: bad magic, discarded ' + discarded + ' bytes (' + syncErrors + ' total sync errors)');
+                    for (const c of vizConsumers) c.postError('Frame sync error (resynchronizing...)');
+                    return;
+                }
+                vizLog('Frame sync: skipped ' + found + ' bytes to re-align');
+                vizRxBuf = vizRxBuf.slice(found);
+                if (vizRxBuf.length < 16) return;
+            }
+
+            const version = vizRxBuf.readUInt16LE(14);
+            const frameSize = (version >= 1) ? VIZ_FRAME_SIZE_V1 : VIZ_FRAME_SIZE_V0;
+
+            if (vizRxBuf.length < frameSize) return; // wait for more data
+
+            const frame = vizRxBuf.slice(0, frameSize);
+            vizRxBuf = vizRxBuf.slice(frameSize);
+
+            // Build parsed message
+            const msg = {
+                version,
+                frameCounter: frame.readUInt32LE(4),
+                romdis: frame[8],
+                vidMode: frame[9],
+                vidAddr: frame.readUInt16LE(10),
+                charsetAddr: frame.readUInt16LE(12),
+                readHeat: frame.slice(16, 16 + 65536).toString('base64'),
+                writeHeat: frame.slice(16 + 65536, 16 + 65536 * 2).toString('base64'),
+                ulaHeat: frame.slice(16 + 65536 * 2, 16 + 65536 * 3).toString('base64')
+            };
+
+            if (version >= 1) {
+                const v1Off = VIZ_FRAME_SIZE_V0;
+                msg.scrBuf = frame.slice(v1Off, v1Off + VIZ_SCR_SIZE).toString('base64');
+                msg.vidbases = [
+                    frame.readUInt16LE(v1Off + VIZ_SCR_SIZE),
+                    frame.readUInt16LE(v1Off + VIZ_SCR_SIZE + 2),
+                    frame.readUInt16LE(v1Off + VIZ_SCR_SIZE + 4),
+                    frame.readUInt16LE(v1Off + VIZ_SCR_SIZE + 6)
+                ];
+                msg.vidRamMain = frame.slice(v1Off + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE,
+                                             v1Off + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN).toString('base64');
+                msg.vidRamBottom = frame.slice(v1Off + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN,
+                                               v1Off + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN + VIZ_VIDRAM_BOTTOM).toString('base64');
+            }
+
+            for (const c of vizConsumers) c.postFrame(msg);
+        }
+    });
+
+    sock.on('error', (err) => {
+        vizLog('Connection error: ' + err.message);
+        for (const c of vizConsumers) c.postError('Connection error: ' + err.message);
+    });
+
+    sock.on('close', () => {
+        vizLog('Disconnected from viz server');
+        vizSocket = null;
+        for (const c of vizConsumers) c.postStatus('Disconnected — reconnecting...');
+        vizScheduleReconnect();
+    });
+}
+
+function vizDisconnect() {
+    vizCancelReconnect();
+    if (vizSocket) {
+        vizSocket.destroy();
+        vizSocket = null;
+    }
+    vizRxBuf = Buffer.alloc(0);
+}
+
+function vizRegisterConsumer(consumer) {
+    vizConsumers.add(consumer);
+    // Auto-connect if a debug session is active and we're not already connected
+    if (!vizSocket) {
+        const session = vscode.debug.activeDebugSession;
+        if (session && session.type === 'oric-debug') {
+            const config = session.configuration;
+            const gdbHost = config.host || 'localhost';
+            const gdbPort = config.port || 6502;
+            vizConnect(gdbHost, gdbPort + 1);
+        }
+    }
+}
+
+function vizUnregisterConsumer(consumer) {
+    vizConsumers.delete(consumer);
+    if (vizConsumers.size === 0) {
+        vizDisconnect();
+    }
+}
+
+// ----------------------------------------------------------------
+// Heatmap consumer
+// ----------------------------------------------------------------
+
+const heatmapConsumer = {
+    postFrame(msg) {
+        if (heatmapPanel) {
+            heatmapPanel.webview.postMessage({
+                type: 'heatmapFrame',
+                frameCounter: msg.frameCounter,
+                romdis: msg.romdis,
+                vidMode: msg.vidMode,
+                vidAddr: msg.vidAddr,
+                charsetAddr: msg.charsetAddr,
+                readHeat: msg.readHeat,
+                writeHeat: msg.writeHeat,
+                ulaHeat: msg.ulaHeat
+            });
+        }
+    },
+    postStatus(text) {
+        if (heatmapPanel) heatmapPanel.webview.postMessage({ type: 'status', text });
+    },
+    postError(text) {
+        if (heatmapPanel) heatmapPanel.webview.postMessage({ type: 'error', text });
+    }
+};
+
+// ----------------------------------------------------------------
+// Screen View consumer
+// ----------------------------------------------------------------
+
+const screenConsumer = {
+    postFrame(msg) {
+        if (screenPanel && msg.version >= 1) {
+            screenPanel.webview.postMessage({
+                type: 'screenFrame',
+                frameCounter: msg.frameCounter,
+                vidMode: msg.vidMode,
+                vidAddr: msg.vidAddr,
+                vidbases: msg.vidbases,
+                scrBuf: msg.scrBuf,
+                vidRamMain: msg.vidRamMain,
+                vidRamBottom: msg.vidRamBottom
+            });
+        }
+    },
+    postStatus(text) {
+        if (screenPanel) screenPanel.webview.postMessage({ type: 'status', text });
+    },
+    postError(text) {
+        if (screenPanel) screenPanel.webview.postMessage({ type: 'error', text });
+    }
+};
 
 function createHeatmapPanel() {
     if (heatmapPanel) {
@@ -1031,121 +1267,14 @@ function createHeatmapPanel() {
 
     panel.onDidDispose(() => {
         heatmapPanel = null;
-        heatmapDisconnect();
+        vizUnregisterConsumer(heatmapConsumer);
     });
 
     heatmapPanel = panel;
     panel.webview.html = heatmapPanelHtml();
-
-    // Auto-connect if a debug session is active
-    const session = vscode.debug.activeDebugSession;
-    if (session && session.type === 'oric-debug') {
-        const config = session.configuration;
-        const gdbHost = config.host || 'localhost';
-        const gdbPort = config.port || 6502;
-        heatmapConnect(gdbHost, gdbPort + 1);
-    }
+    vizRegisterConsumer(heatmapConsumer);
 
     return panel;
-}
-
-function vizLog(msg) {
-    if (vizOutputChannel) vizOutputChannel.appendLine('[VIZ] ' + msg);
-    const session = vscode.debug.activeDebugSession;
-    if (session && session.type === 'oric-debug') {
-        session.customRequest('logToConsole', { text: msg }).catch(() => {});
-    }
-}
-
-function heatmapConnect(host, port) {
-    heatmapDisconnect();
-    if (!port || !heatmapPanel) return;
-
-    const net = require('net');
-    const sock = new net.Socket();
-    heatmapSocket = sock;
-    heatmapRxBuf = Buffer.alloc(0);
-
-    const FRAME_SIZE = 16 + 65536 * 3;
-    const MAGIC = 0x4349564F;  /* "OVIC" as uint32 LE */
-
-    vizLog('Connecting to heatmap server at ' + host + ':' + port + '...');
-
-    sock.connect(port, host, () => {
-        vizLog('Connected to ' + host + ':' + port);
-        if (heatmapPanel) {
-            heatmapPanel.webview.postMessage({ type: 'status', text: 'Connected to ' + host + ':' + port });
-        }
-    });
-
-    let syncErrors = 0;
-
-    sock.on('data', (chunk) => {
-        heatmapRxBuf = Buffer.concat([heatmapRxBuf, chunk]);
-
-        while (heatmapRxBuf.length >= FRAME_SIZE) {
-            const magic = heatmapRxBuf.readUInt32LE(0);
-            if (magic !== MAGIC) {
-                syncErrors++;
-                let found = -1;
-                for (let i = 1; i <= heatmapRxBuf.length - 4; i++) {
-                    if (heatmapRxBuf.readUInt32LE(i) === MAGIC) { found = i; break; }
-                }
-                if (found < 0) {
-                    const discarded = heatmapRxBuf.length - 3;
-                    heatmapRxBuf = heatmapRxBuf.slice(heatmapRxBuf.length - 3);
-                    vizLog('Frame sync error: bad magic, discarded ' + discarded + ' bytes (' + syncErrors + ' total sync errors)');
-                    if (heatmapPanel) {
-                        heatmapPanel.webview.postMessage({ type: 'error', text: 'Frame sync error (resynchronizing...)' });
-                    }
-                    return;
-                }
-                vizLog('Frame sync: skipped ' + found + ' bytes to re-align');
-                heatmapRxBuf = heatmapRxBuf.slice(found);
-                if (heatmapRxBuf.length < FRAME_SIZE) return;
-            }
-
-            const frame = heatmapRxBuf.slice(0, FRAME_SIZE);
-            heatmapRxBuf = heatmapRxBuf.slice(FRAME_SIZE);
-
-            if (heatmapPanel) {
-                heatmapPanel.webview.postMessage({
-                    type: 'heatmapFrame',
-                    frameCounter: frame.readUInt32LE(4),
-                    romdis: frame[8],
-                    vidMode: frame[9],
-                    vidAddr: frame.readUInt16LE(10),
-                    charsetAddr: frame.readUInt16LE(12),
-                    readHeat: frame.slice(16, 16 + 65536).toString('base64'),
-                    writeHeat: frame.slice(16 + 65536, 16 + 65536 * 2).toString('base64'),
-                    ulaHeat: frame.slice(16 + 65536 * 2, 16 + 65536 * 3).toString('base64')
-                });
-            }
-        }
-    });
-
-    sock.on('error', (err) => {
-        vizLog('Connection error: ' + err.message);
-        if (heatmapPanel) {
-            heatmapPanel.webview.postMessage({ type: 'error', text: 'Connection failed: ' + err.message });
-        }
-    });
-
-    sock.on('close', () => {
-        vizLog('Disconnected from heatmap server');
-        heatmapSocket = null;
-        if (heatmapPanel) {
-            heatmapPanel.webview.postMessage({ type: 'status', text: 'Disconnected' });
-        }
-    });
-}
-
-function heatmapDisconnect() {
-    if (heatmapSocket) {
-        heatmapSocket.destroy();
-        heatmapSocket = null;
-    }
-    heatmapRxBuf = Buffer.alloc(0);
 }
 
 function heatmapPanelHtml() {
@@ -1159,9 +1288,8 @@ body {
     margin: 0;
     background: var(--vscode-editor-background);
 }
-canvas { display: block; image-rendering: pixelated; border: 1px solid #404040; box-sizing: border-box; }
-.top-row { display: flex; gap: 2px; }
-.top-row canvas { flex: 1; height: 20px; }
+canvas { display: block; image-rendering: pixelated; border: 1px solid #404040; box-sizing: border-box; width: 100%; }
+.page-canvas { height: 14px; }
 #status {
     color: var(--vscode-descriptionForeground, #888);
     font-size: 0.85em;
@@ -1208,18 +1336,15 @@ canvas { display: block; image-rendering: pixelated; border: 1px solid #404040; 
     <span><span class="swatch" style="background:#0ff"></span> R+U</span>
     <span><span class="swatch" style="background:#f0f"></span> W+U</span>
 </div>
-<div class="label-row">
-    <span>ZP</span><span>Stack</span><span>Page2</span><span>I/O</span>
-</div>
-<div class="top-row">
-    <canvas id="zpCanvas" width="64" height="4"></canvas>
-    <canvas id="stackCanvas" width="64" height="4"></canvas>
-    <canvas id="page2Canvas" width="64" height="4"></canvas>
-    <canvas id="ioCanvas" width="64" height="4"></canvas>
-</div>
-<div class="label-row">
-    <span>$0400</span><span style="text-align:right">$BFFF</span>
-</div>
+<div class="label-row"><span>$0000 Zero Page</span><span>$00FF</span></div>
+<canvas id="zpCanvas" class="page-canvas" width="256" height="1"></canvas>
+<div class="label-row"><span>$0100 Stack</span><span>$01FF</span></div>
+<canvas id="stackCanvas" class="page-canvas" width="256" height="1"></canvas>
+<div class="label-row"><span>$0200 Page 2</span><span>$02FF</span></div>
+<canvas id="page2Canvas" class="page-canvas" width="256" height="1"></canvas>
+<div class="label-row"><span>$0300 I/O</span><span>$03FF</span></div>
+<canvas id="ioCanvas" class="page-canvas" width="256" height="1"></canvas>
+<div class="label-row"><span>$0400</span><span>$BFFF</span></div>
 <canvas id="mainCanvas" width="256" height="188"></canvas>
 <div class="label-row" id="romLabel">
     <span>$C000</span><span id="romLabelRight">ROM $FFFF</span>
@@ -1234,7 +1359,7 @@ const topCanvases = [
     document.getElementById('ioCanvas')
 ];
 const topCtxs = topCanvases.map(c => c.getContext('2d'));
-const topImgs = topCtxs.map(ctx => ctx.createImageData(64, 4));
+const topImgs = topCtxs.map(ctx => ctx.createImageData(256, 1));
 const mainCanvas = document.getElementById('mainCanvas');
 const bottomCanvas = document.getElementById('bottomCanvas');
 const mainCtx = mainCanvas.getContext('2d');
@@ -1244,10 +1369,8 @@ const errorDiv = document.getElementById('error');
 const status = document.getElementById('status');
 const romLabelRight = document.getElementById('romLabelRight');
 
-mainCanvas.style.width = '100%';
 mainCanvas.style.height = 'auto';
 mainCanvas.style.aspectRatio = '256 / 188';
-bottomCanvas.style.width = '100%';
 bottomCanvas.style.height = 'auto';
 bottomCanvas.style.aspectRatio = '256 / 64';
 
@@ -1270,15 +1393,13 @@ function renderFrame(msg) {
     for (let block = 0; block < 4; block++) {
         const baseAddr = block * 256;
         const img = topImgs[block];
-        for (let row = 0; row < 4; row++) {
-            for (let col = 0; col < 64; col++) {
-                const addr = baseAddr + row * 64 + col;
-                const px = (row * 64 + col) * 4;
-                img.data[px]     = writeHeat[addr];
-                img.data[px + 1] = readHeat[addr];
-                img.data[px + 2] = ulaHeat[addr];
-                img.data[px + 3] = 255;
-            }
+        for (let i = 0; i < 256; i++) {
+            const addr = baseAddr + i;
+            const px = i * 4;
+            img.data[px]     = writeHeat[addr];
+            img.data[px + 1] = readHeat[addr];
+            img.data[px + 2] = ulaHeat[addr];
+            img.data[px + 3] = 255;
         }
         topCtxs[block].putImageData(img, 0, 0);
     }
@@ -1321,10 +1442,9 @@ function addrFromMouse(canvas, e, baseAddr, width, height) {
 function addrFromTopMouse(blockIndex, e) {
     const canvas = topCanvases[blockIndex];
     const rect = canvas.getBoundingClientRect();
-    const x = Math.floor((e.clientX - rect.left) / rect.width * 64);
-    const y = Math.floor((e.clientY - rect.top) / rect.height * 4);
-    if (x < 0 || x >= 64 || y < 0 || y >= 4) return -1;
-    return blockIndex * 256 + y * 64 + x;
+    const x = Math.floor((e.clientX - rect.left) / rect.width * 256);
+    if (x < 0 || x >= 256) return -1;
+    return blockIndex * 256 + x;
 }
 
 function showAddr(addr) {
@@ -1345,6 +1465,587 @@ bottomCanvas.addEventListener('mousemove', e => showAddr(addrFromMouse(bottomCan
 
 window.addEventListener('message', e => {
     if (e.data.type === 'heatmapFrame') renderFrame(e.data);
+    if (e.data.type === 'status') { status.textContent = e.data.text; errorDiv.style.display = 'none'; }
+    if (e.data.type === 'error') { errorDiv.textContent = e.data.text; errorDiv.style.display = 'block'; }
+});
+</script>
+</body></html>`;
+}
+
+// ----------------------------------------------------------------
+// Screen View Panel (editor tab — Oric screen with overlays)
+// ----------------------------------------------------------------
+
+function createScreenPanel() {
+    if (screenPanel) {
+        screenPanel.reveal();
+        return screenPanel;
+    }
+
+    const panel = vscode.window.createWebviewPanel(
+        'oricScreenView',
+        'Oric Screen View',
+        vscode.ViewColumn.Beside,
+        { enableScripts: true, retainContextWhenHidden: true }
+    );
+
+    panel.onDidDispose(() => {
+        screenPanel = null;
+        vizUnregisterConsumer(screenConsumer);
+    });
+
+    screenPanel = panel;
+    panel.webview.html = screenPanelHtml();
+
+    const fs = require('fs');
+    const path = require('path');
+
+    panel.webview.onDidReceiveMessage(msg => {
+        if (msg.type === 'saveImage' && msg.dataUrl) {
+            // Find workspace folder for screenshot subfolder
+            let baseDir = null;
+            if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
+                baseDir = vscode.workspace.workspaceFolders[0].uri.fsPath;
+            }
+            if (!baseDir) {
+                vscode.window.showErrorMessage('No workspace folder open — cannot save screenshot.');
+                return;
+            }
+            const ssDir = path.join(baseDir, 'screenshots');
+            if (!fs.existsSync(ssDir)) fs.mkdirSync(ssDir, { recursive: true });
+
+            const now = new Date();
+            const ts = now.getFullYear().toString()
+                + (now.getMonth() + 1).toString().padStart(2, '0')
+                + now.getDate().toString().padStart(2, '0')
+                + '_' + now.getHours().toString().padStart(2, '0')
+                + now.getMinutes().toString().padStart(2, '0')
+                + now.getSeconds().toString().padStart(2, '0');
+            const filePath = path.join(ssDir, 'oric_' + ts + '.png');
+
+            const base64 = msg.dataUrl.replace(/^data:image\/png;base64,/, '');
+            fs.writeFileSync(filePath, Buffer.from(base64, 'base64'));
+            vscode.window.showInformationMessage('Screenshot saved: ' + path.basename(filePath));
+        } else if (msg.type === 'copyImage' && msg.dataUrl) {
+            // Write to temp file, then use PowerShell to copy to clipboard
+            const os = require('os');
+            const tmpFile = path.join(os.tmpdir(), 'oric_clipboard.png');
+            const base64 = msg.dataUrl.replace(/^data:image\/png;base64,/, '');
+            fs.writeFileSync(tmpFile, Buffer.from(base64, 'base64'));
+
+            const { exec } = require('child_process');
+            const psCmd = `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::SetImage([System.Drawing.Image]::FromFile('${tmpFile.replace(/\\/g, '\\\\')}'))`;
+            exec('powershell -NoProfile -Command "' + psCmd + '"', (err) => {
+                if (err) {
+                    vscode.window.showErrorMessage('Clipboard copy failed: ' + err.message);
+                } else {
+                    vscode.window.showInformationMessage('Screenshot copied to clipboard');
+                }
+                try { fs.unlinkSync(tmpFile); } catch (_) {}
+            });
+        }
+    });
+
+    vizRegisterConsumer(screenConsumer);
+
+    return panel;
+}
+
+function screenPanelHtml() {
+    return `<!DOCTYPE html>
+<html><head><style>
+body {
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: var(--vscode-editor-font-size, 13px);
+    color: var(--vscode-foreground);
+    padding: 8px 12px;
+    margin: 0;
+    background: var(--vscode-editor-background);
+    user-select: none;
+}
+#status {
+    color: var(--vscode-descriptionForeground, #888);
+    font-size: 0.85em;
+    margin: 2px 0;
+    white-space: nowrap;
+}
+#error {
+    color: var(--vscode-errorForeground, #f44);
+    font-size: 0.85em;
+    margin: 2px 0;
+    display: none;
+}
+.controls {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    margin: 6px 0;
+    font-size: 0.9em;
+}
+.controls label { cursor: pointer; display: flex; align-items: center; gap: 4px; }
+.controls input[type="checkbox"] { cursor: pointer; }
+.controls button {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    border: none;
+    padding: 2px 8px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: inherit;
+}
+.controls button:hover { background: var(--vscode-button-hoverBackground); }
+.screen-wrap {
+    position: relative;
+    display: inline-block;
+    width: 100%;
+    max-width: 720px;
+    border: 1px solid #404040;
+    cursor: none;
+}
+#screenCanvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    image-rendering: pixelated;
+}
+#overlayCanvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+}
+.inspector {
+    display: flex;
+    gap: 16px;
+    margin-top: 8px;
+    align-items: flex-start;
+    min-height: 130px;
+}
+#zoomCanvas {
+    border: 1px solid #404040;
+    image-rendering: pixelated;
+    flex-shrink: 0;
+}
+.info {
+    font-size: 0.9em;
+    line-height: 1.6;
+}
+.info .label { color: var(--vscode-debugTokenExpression-name, #9cdcfe); }
+.info .value { color: var(--vscode-debugTokenExpression-number, #b5cea8); }
+.info .dim { color: var(--vscode-descriptionForeground, #888); }
+.swatch {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 1px solid #555;
+    vertical-align: middle;
+    margin-left: 4px;
+}
+</style></head><body>
+<div id="status">Waiting for connection...</div>
+<div id="error"></div>
+<div class="controls">
+    <label><input type="checkbox" id="colGrid"> Columns (6px)</label>
+    <label><input type="checkbox" id="rowGrid"> Rows (8px)</label>
+    <select id="gridColor" title="Grid color">
+        <option value="128,0,0">Dark Red</option>
+        <option value="0,128,0">Dark Green</option>
+        <option value="0,0,128">Dark Blue</option>
+        <option value="128,128,0">Dark Yellow</option>
+        <option value="128,0,128">Dark Magenta</option>
+        <option value="0,128,128">Dark Cyan</option>
+        <option value="128,128,128" selected>Gray</option>
+        <option value="255,128,0">Orange</option>
+    </select>
+    <span style="flex:1"></span>
+    <button id="btnSave" title="Save screenshot to project">Save PNG</button>
+    <button id="btnCopy" title="Copy to clipboard">Copy</button>
+</div>
+<div class="screen-wrap" id="screenWrap">
+    <canvas id="screenCanvas" width="240" height="224"></canvas>
+    <canvas id="overlayCanvas" width="240" height="224"></canvas>
+</div>
+<div class="controls">
+    <label>Zoom <select id="zoomFactor">
+        <option value="2">2x</option>
+        <option value="4">4x</option>
+        <option value="6" selected>6x</option>
+        <option value="8">8x</option>
+        <option value="12">12x</option>
+    </select></label>
+    <label>Context <select id="zoomRegion">
+        <option value="10">10px</option>
+        <option value="20" selected>20px</option>
+        <option value="30">30px</option>
+        <option value="40">40px</option>
+    </select></label>
+</div>
+<div class="inspector">
+    <canvas id="zoomCanvas" width="120" height="120"></canvas>
+    <div class="info" id="infoPanel">
+        <div class="dim">Hover over the screen to inspect</div>
+    </div>
+</div>
+<script>
+const vscode = acquireVsCodeApi();
+const screenCanvas = document.getElementById('screenCanvas');
+const overlayCanvas = document.getElementById('overlayCanvas');
+const zoomCanvas = document.getElementById('zoomCanvas');
+const screenCtx = screenCanvas.getContext('2d');
+const overlayCtx = overlayCanvas.getContext('2d');
+const zoomCtx = zoomCanvas.getContext('2d');
+const status = document.getElementById('status');
+const errorDiv = document.getElementById('error');
+const infoPanel = document.getElementById('infoPanel');
+const colGridCb = document.getElementById('colGrid');
+const rowGridCb = document.getElementById('rowGrid');
+const gridColorSel = document.getElementById('gridColor');
+const screenWrap = document.getElementById('screenWrap');
+const zoomFactorSel = document.getElementById('zoomFactor');
+const zoomRegionSel = document.getElementById('zoomRegion');
+
+// --- Settings persistence ---
+function saveSettings() {
+    vscode.setState({
+        colGrid: colGridCb.checked,
+        rowGrid: rowGridCb.checked,
+        gridColor: gridColorSel.value,
+        zoomFactor: zoomFactorSel.value,
+        zoomRegion: zoomRegionSel.value
+    });
+}
+{
+    const s = vscode.getState();
+    if (s) {
+        colGridCb.checked = !!s.colGrid;
+        rowGridCb.checked = !!s.rowGrid;
+        if (s.gridColor) gridColorSel.value = s.gridColor;
+        if (s.zoomFactor) zoomFactorSel.value = s.zoomFactor;
+        if (s.zoomRegion) zoomRegionSel.value = s.zoomRegion;
+    }
+}
+
+const PALETTE = [
+    [0,0,0], [255,0,0], [0,255,0], [255,255,0],
+    [0,0,255], [255,0,255], [0,255,255], [255,255,255]
+];
+const COLOR_NAMES = ['Black','Red','Green','Yellow','Blue','Magenta','Cyan','White'];
+
+const screenImg = screenCtx.createImageData(240, 224);
+
+// Current frame state for inspector lookups
+let curScrBuf = null;     // Uint8Array 240*224
+let curVidRamMain = null;  // Uint8Array 8000
+let curVidRamBottom = null; // Uint8Array 120
+let curVidMode = 0;
+let curVidAddr = 0;
+let curVidbases = [0, 0, 0, 0];
+let curFrameCounter = 0;
+
+// Last hover position for refreshing zoom on new frames
+let hoverPx = -1, hoverPy = -1;
+
+function b64decode(str) {
+    const bin = atob(str);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return arr;
+}
+
+function renderScreen(msg) {
+    errorDiv.style.display = 'none';
+    curScrBuf = b64decode(msg.scrBuf);
+    curVidRamMain = b64decode(msg.vidRamMain);
+    curVidRamBottom = b64decode(msg.vidRamBottom);
+    curVidMode = msg.vidMode;
+    curVidAddr = msg.vidAddr;
+    curVidbases = msg.vidbases;
+    curFrameCounter = msg.frameCounter;
+
+    for (let i = 0; i < 240 * 224; i++) {
+        const c = curScrBuf[i] & 7;
+        const px = i * 4;
+        screenImg.data[px]     = PALETTE[c][0];
+        screenImg.data[px + 1] = PALETTE[c][1];
+        screenImg.data[px + 2] = PALETTE[c][2];
+        screenImg.data[px + 3] = 255;
+    }
+    screenCtx.putImageData(screenImg, 0, 0);
+
+    status.textContent = 'Frame ' + msg.frameCounter +
+        ' | ' + ((msg.vidMode & 4) ? 'HIRES' : 'TEXT') +
+        ' | Vid $' + msg.vidAddr.toString(16).toUpperCase().padStart(4, '0');
+
+    // Refresh inspector if mouse is hovering
+    if (hoverPx >= 0) updateInspector(hoverPx, hoverPy);
+}
+
+// --- Overlay grid (drawn at display resolution for crisp 1px lines) ---
+
+function resizeOverlay() {
+    const rect = screenCanvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.round(rect.width * dpr);
+    const h = Math.round(rect.height * dpr);
+    if (overlayCanvas.width !== w || overlayCanvas.height !== h) {
+        overlayCanvas.width = w;
+        overlayCanvas.height = h;
+    }
+    drawOverlay();
+}
+
+function getGridColor(alpha) {
+    return 'rgba(' + gridColorSel.value + ',' + alpha + ')';
+}
+
+function drawOverlay() {
+    const w = overlayCanvas.width;
+    const h = overlayCanvas.height;
+    const sx = w / 240;
+    const sy = h / 224;
+    const color = getGridColor(0.5);
+    overlayCtx.clearRect(0, 0, w, h);
+    overlayCtx.strokeStyle = color;
+    overlayCtx.lineWidth = 1;
+    if (colGridCb.checked) {
+        for (let col = 6; col < 240; col += 6) {
+            const dx = Math.round(col * sx) + 0.5;
+            overlayCtx.beginPath();
+            overlayCtx.moveTo(dx, 0);
+            overlayCtx.lineTo(dx, h);
+            overlayCtx.stroke();
+        }
+    }
+    if (rowGridCb.checked) {
+        for (let row = 8; row < 224; row += 8) {
+            const dy = Math.round(row * sy) + 0.5;
+            overlayCtx.beginPath();
+            overlayCtx.moveTo(0, dy);
+            overlayCtx.lineTo(w, dy);
+            overlayCtx.stroke();
+        }
+    }
+    // Crosshair at hover position (black-white-black for visibility on any background)
+    if (hoverPx >= 0) {
+        const cx = Math.round((hoverPx + 0.5) * sx);
+        const cy = Math.round((hoverPy + 0.5) * sy);
+        const lines = [
+            { offset: -1, color: 'rgba(0,0,0,0.6)' },
+            { offset:  0, color: 'rgba(255,255,255,0.8)' },
+            { offset:  1, color: 'rgba(0,0,0,0.6)' }
+        ];
+        overlayCtx.lineWidth = 1;
+        for (const l of lines) {
+            overlayCtx.strokeStyle = l.color;
+            overlayCtx.beginPath();
+            overlayCtx.moveTo(cx + l.offset + 0.5, 0);
+            overlayCtx.lineTo(cx + l.offset + 0.5, h);
+            overlayCtx.stroke();
+            overlayCtx.beginPath();
+            overlayCtx.moveTo(0, cy + l.offset + 0.5);
+            overlayCtx.lineTo(w, cy + l.offset + 0.5);
+            overlayCtx.stroke();
+        }
+    }
+}
+
+const resizeObs = new ResizeObserver(() => resizeOverlay());
+resizeObs.observe(screenCanvas);
+
+colGridCb.addEventListener('change', () => { saveSettings(); drawOverlay(); });
+rowGridCb.addEventListener('change', () => { saveSettings(); drawOverlay(); });
+gridColorSel.addEventListener('change', () => { saveSettings(); drawOverlay(); if (hoverPx >= 0) updateInspector(hoverPx, hoverPy); });
+
+// --- Inspector ---
+
+function hex4(v) { return '$' + (v & 0xFFFF).toString(16).toUpperCase().padStart(4, '0'); }
+function hex2(v) { return '$' + (v & 0xFF).toString(16).toUpperCase().padStart(2, '0'); }
+function bin8(v) { return '%' + (v & 0xFF).toString(2).padStart(8, '0'); }
+
+function computeScreenAddress(x, y) {
+    const col = Math.floor(x / 6);
+    if (y < 200) {
+        if (curVidMode & 4) {
+            return { addr: curVidAddr + y * 40 + col, mode: 'HIRES', bitPos: 5 - (x % 6) };
+        } else {
+            return { addr: curVidAddr + Math.floor(y / 8) * 40 + col, mode: 'TEXT' };
+        }
+    } else {
+        return { addr: curVidbases[2] + Math.floor(y / 8) * 40 + col, mode: 'TEXT (status)' };
+    }
+}
+
+function computeAltAddress(x, y) {
+    const col = Math.floor(x / 6);
+    if (y < 200) {
+        if (curVidMode & 4) {
+            // Currently HIRES, show alternate TEXT address
+            return { addr: curVidAddr + Math.floor(y / 8) * 40 + col, mode: 'TEXT' };
+        } else {
+            // Currently TEXT, show alternate HIRES address
+            return { addr: curVidAddr + y * 40 + col, mode: 'HIRES', bitPos: 5 - (x % 6) };
+        }
+    }
+    return null;
+}
+
+function lookupByte(addr) {
+    // Try main vidram area first
+    const mainOff = addr - curVidAddr;
+    if (mainOff >= 0 && mainOff < 8000 && curVidRamMain) {
+        return curVidRamMain[mainOff];
+    }
+    // Try bottom rows area
+    const bottomOff = addr - curVidbases[2];
+    if (bottomOff >= 0 && bottomOff < 120 && curVidRamBottom) {
+        return curVidRamBottom[bottomOff];
+    }
+    return null;
+}
+
+function updateInspector(px, py) {
+    if (!curScrBuf) return;
+
+    const zf = parseInt(zoomFactorSel.value) || 6;   // zoom factor (pixels per Oric pixel)
+    const region = parseInt(zoomRegionSel.value) || 20; // region size in Oric pixels
+    const zoomR = Math.floor(region / 2);
+    const canvasSize = region * zf;
+
+    // Resize zoom canvas if needed
+    if (zoomCanvas.width !== canvasSize || zoomCanvas.height !== canvasSize) {
+        zoomCanvas.width = canvasSize;
+        zoomCanvas.height = canvasSize;
+    }
+
+    zoomCtx.clearRect(0, 0, canvasSize, canvasSize);
+    for (let dy = -zoomR; dy < zoomR; dy++) {
+        for (let dx = -zoomR; dx < zoomR; dx++) {
+            const sx = px + dx, sy = py + dy;
+            let r = 0, g = 0, b = 0;
+            if (sx >= 0 && sx < 240 && sy >= 0 && sy < 224) {
+                const c = curScrBuf[sy * 240 + sx] & 7;
+                r = PALETTE[c][0]; g = PALETTE[c][1]; b = PALETTE[c][2];
+            }
+            zoomCtx.fillStyle = 'rgb(' + r + ',' + g + ',' + b + ')';
+            zoomCtx.fillRect((dx + zoomR) * zf, (dy + zoomR) * zf, zf, zf);
+        }
+    }
+
+    // Grid lines in zoom view
+    const gridColor = getGridColor(0.4);
+    zoomCtx.strokeStyle = gridColor;
+    zoomCtx.lineWidth = 1;
+    if (colGridCb.checked) {
+        const leftOric = px - zoomR;
+        const firstCol = Math.ceil(leftOric / 6) * 6;
+        for (let cx = firstCol; cx < leftOric + region; cx += 6) {
+            const zx = (cx - leftOric) * zf + 0.5;
+            zoomCtx.beginPath();
+            zoomCtx.moveTo(zx, 0);
+            zoomCtx.lineTo(zx, canvasSize);
+            zoomCtx.stroke();
+        }
+    }
+    if (rowGridCb.checked) {
+        const topOric = py - zoomR;
+        const firstRow = Math.ceil(topOric / 8) * 8;
+        for (let ry = firstRow; ry < topOric + region; ry += 8) {
+            const zy = (ry - topOric) * zf + 0.5;
+            zoomCtx.beginPath();
+            zoomCtx.moveTo(0, zy);
+            zoomCtx.lineTo(canvasSize, zy);
+            zoomCtx.stroke();
+        }
+    }
+
+    // Center pixel highlight (black-white-black, outside the pixel so color stays visible)
+    const px0 = zoomR * zf;
+    zoomCtx.lineWidth = 1;
+    zoomCtx.strokeStyle = 'rgba(0,0,0,0.7)';
+    zoomCtx.strokeRect(px0 - 1.5, px0 - 1.5, zf + 2, zf + 2);
+    zoomCtx.strokeStyle = 'rgba(255,255,255,0.9)';
+    zoomCtx.strokeRect(px0 - 0.5, px0 - 0.5, zf, zf);
+    zoomCtx.strokeStyle = 'rgba(0,0,0,0.7)';
+    zoomCtx.strokeRect(px0 + 0.5, px0 + 0.5, zf - 2, zf - 2);
+
+    // Info text
+    const col = Math.floor(px / 6);
+    const row = Math.floor(py / 8);
+    const colorIdx = curScrBuf[py * 240 + px] & 7;
+    const pri = computeScreenAddress(px, py);
+    const alt = computeAltAddress(px, py);
+    const priB = lookupByte(pri.addr);
+
+    let html = '<div><span class="label">Pixel</span> <span class="value">(' + px + ', ' + py + ')</span>';
+    html += '  <span class="label">Col</span> <span class="value">' + col + '</span>';
+    html += '  <span class="label">Row</span> <span class="value">' + row + '</span></div>';
+
+    // Primary address
+    html += '<div><span class="label">' + pri.mode + '</span> <span class="value">' + hex4(pri.addr) + '</span>';
+    if (priB !== null) {
+        html += ' = <span class="value">' + hex2(priB) + '  ' + bin8(priB) + '</span>';
+        if (pri.bitPos !== undefined) {
+            html += '  <span class="dim">bit ' + pri.bitPos + '</span>';
+        }
+    }
+    html += '</div>';
+
+    // Alternate address (dimmed)
+    if (alt) {
+        const altB = lookupByte(alt.addr);
+        html += '<div class="dim">if ' + alt.mode + ' ' + hex4(alt.addr);
+        if (altB !== null) {
+            html += ' = ' + hex2(altB) + '  ' + bin8(altB);
+            if (alt.bitPos !== undefined) html += '  bit ' + alt.bitPos;
+        }
+        html += '</div>';
+    }
+
+    // Color
+    const rgb = PALETTE[colorIdx];
+    html += '<div><span class="label">Color</span> <span class="value">' + COLOR_NAMES[colorIdx] + ' (' + colorIdx + ')</span>';
+    html += '<span class="swatch" style="background:rgb(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ')"></span></div>';
+
+    infoPanel.innerHTML = html;
+}
+
+// Mouse tracking on the screen canvas wrapper
+screenWrap.addEventListener('mousemove', (e) => {
+    const rect = screenCanvas.getBoundingClientRect();
+    const px = Math.floor((e.clientX - rect.left) / rect.width * 240);
+    const py = Math.floor((e.clientY - rect.top) / rect.height * 224);
+    if (px >= 0 && px < 240 && py >= 0 && py < 224) {
+        hoverPx = px; hoverPy = py;
+        updateInspector(px, py);
+        drawOverlay();
+    }
+});
+
+screenWrap.addEventListener('mouseleave', () => {
+    hoverPx = -1; hoverPy = -1;
+    infoPanel.innerHTML = '<div class="dim">Hover over the screen to inspect</div>';
+    zoomCtx.clearRect(0, 0, zoomCanvas.width, zoomCanvas.height);
+    drawOverlay();
+});
+
+// Zoom controls: refresh inspector on change
+zoomFactorSel.addEventListener('change', () => { saveSettings(); if (hoverPx >= 0) updateInspector(hoverPx, hoverPy); });
+zoomRegionSel.addEventListener('change', () => { saveSettings(); if (hoverPx >= 0) updateInspector(hoverPx, hoverPy); });
+
+// --- Save / Copy buttons ---
+document.getElementById('btnSave').addEventListener('click', () => {
+    if (!curScrBuf) return;
+    vscode.postMessage({ type: 'saveImage', dataUrl: screenCanvas.toDataURL('image/png') });
+});
+document.getElementById('btnCopy').addEventListener('click', () => {
+    if (!curScrBuf) return;
+    vscode.postMessage({ type: 'copyImage', dataUrl: screenCanvas.toDataURL('image/png') });
+});
+
+window.addEventListener('message', e => {
+    if (e.data.type === 'screenFrame') renderScreen(e.data);
     if (e.data.type === 'status') { status.textContent = e.data.text; errorDiv.style.display = 'none'; }
     if (e.data.type === 'error') { errorDiv.textContent = e.data.text; errorDiv.style.display = 'block'; }
 });
@@ -1518,6 +2219,7 @@ function activate(context) {
         vscode.window.registerWebviewViewProvider('oricPeripherals', periphProvider),
         vscode.commands.registerCommand('oric-debug.openMemoryView', () => createMemoryPanel(context)),
         vscode.commands.registerCommand('oric-debug.openHeatmap', () => createHeatmapPanel()),
+        vscode.commands.registerCommand('oric-debug.openScreenView', () => createScreenPanel()),
         vscode.commands.registerCommand('oric-debug.skipInstruction', () => {
             const session = vscode.debug.activeDebugSession;
             if (session && session.type === 'oric-debug') {
@@ -1555,12 +2257,97 @@ function activate(context) {
         vscode.commands.registerCommand('osdk.6502Reference', () => create6502ReferencePanel())
     );
 
+    // --- Webview serializers: restore panels after VS Code reload ---
+    vscode.window.registerWebviewPanelSerializer('oricHeatmap', {
+        async deserializeWebviewPanel(panel) {
+            heatmapPanel = panel;
+            panel.webview.options = { enableScripts: true, retainContextWhenHidden: true };
+            panel.webview.html = heatmapPanelHtml();
+            panel.onDidDispose(() => { heatmapPanel = null; vizUnregisterConsumer(heatmapConsumer); });
+            vizRegisterConsumer(heatmapConsumer);
+        }
+    });
+    vscode.window.registerWebviewPanelSerializer('oricScreenView', {
+        async deserializeWebviewPanel(panel) {
+            screenPanel = panel;
+            panel.webview.options = { enableScripts: true, retainContextWhenHidden: true };
+            panel.webview.html = screenPanelHtml();
+            panel.onDidDispose(() => { screenPanel = null; vizUnregisterConsumer(screenConsumer); });
+
+            const fs = require('fs');
+            const path = require('path');
+            panel.webview.onDidReceiveMessage(msg => {
+                if (msg.type === 'saveImage' && msg.dataUrl) {
+                    let baseDir = null;
+                    if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
+                        baseDir = vscode.workspace.workspaceFolders[0].uri.fsPath;
+                    }
+                    if (!baseDir) { vscode.window.showErrorMessage('No workspace folder open.'); return; }
+                    const ssDir = path.join(baseDir, 'screenshots');
+                    if (!fs.existsSync(ssDir)) fs.mkdirSync(ssDir, { recursive: true });
+                    const now = new Date();
+                    const ts = now.getFullYear().toString()
+                        + (now.getMonth()+1).toString().padStart(2,'0')
+                        + now.getDate().toString().padStart(2,'0')
+                        + '_' + now.getHours().toString().padStart(2,'0')
+                        + now.getMinutes().toString().padStart(2,'0')
+                        + now.getSeconds().toString().padStart(2,'0');
+                    const filePath = path.join(ssDir, 'oric_' + ts + '.png');
+                    const base64 = msg.dataUrl.replace(/^data:image\/png;base64,/, '');
+                    fs.writeFileSync(filePath, Buffer.from(base64, 'base64'));
+                    vscode.window.showInformationMessage('Screenshot saved: ' + path.basename(filePath));
+                } else if (msg.type === 'copyImage' && msg.dataUrl) {
+                    const os = require('os');
+                    const tmpFile = path.join(os.tmpdir(), 'oric_clipboard.png');
+                    const base64 = msg.dataUrl.replace(/^data:image\/png;base64,/, '');
+                    fs.writeFileSync(tmpFile, Buffer.from(base64, 'base64'));
+                    const { exec } = require('child_process');
+                    const psCmd = `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::SetImage([System.Drawing.Image]::FromFile('${tmpFile.replace(/\\/g, '\\\\')}'))`;
+                    exec('powershell -NoProfile -Command "' + psCmd + '"', (err) => {
+                        if (err) vscode.window.showErrorMessage('Clipboard copy failed: ' + err.message);
+                        else vscode.window.showInformationMessage('Screenshot copied to clipboard');
+                        try { fs.unlinkSync(tmpFile); } catch (_) {}
+                    });
+                }
+            });
+
+            vizRegisterConsumer(screenConsumer);
+        }
+    });
+
     function refreshAll() {
         const session = vscode.debug.activeDebugSession;
         regsProvider.refresh(session);
         zpProvider.refresh(session);
         periphProvider.refresh(session);
         refreshMemoryPanels(session);
+    }
+
+    // Auto-navigate: VS Code doesn't always switch back from a virtual
+    // disassembly tab to a real source file when the frame changes.
+    // This handler ensures we open the source file when it's available.
+    let pendingNavigate = false;
+
+    async function autoNavigateFromFrame(topFrame) {
+        try {
+            if (topFrame.source && topFrame.source.path && topFrame.line > 0) {
+                const uri = vscode.Uri.file(topFrame.source.path);
+                const line = topFrame.line - 1; // 0-based
+                const doc = await vscode.workspace.openTextDocument(uri);
+                const editor = await vscode.window.showTextDocument(doc, {
+                    preview: true,
+                    preserveFocus: false,
+                    viewColumn: vscode.ViewColumn.One
+                });
+                const range = new vscode.Range(line, 0, line, 0);
+                editor.selection = new vscode.Selection(range.start, range.start);
+                editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+            }
+            // No-source case: the debug adapter now provides a virtual
+            // disassembly source, so VS Code opens it automatically.
+        } catch (_) {
+            // Silently ignore — don't break the debug experience
+        }
     }
 
     context.subscriptions.push(
@@ -1570,6 +2357,17 @@ function activate(context) {
                     onDidSendMessage(msg) {
                         if (msg.type === 'event' && msg.event === 'stopped') {
                             setTimeout(() => refreshAll(), 50);
+                            pendingNavigate = true;
+                        }
+                        // Intercept VS Code's own stackTrace response — the UI
+                        // now has frame data, so opening disassembly will work.
+                        if (pendingNavigate && msg.type === 'response' && msg.command === 'stackTrace' && msg.success) {
+                            const frames = msg.body && msg.body.stackFrames;
+                            if (frames && frames.length > 0) {
+                                pendingNavigate = false;
+                                // Small delay to let VS Code finish updating its call stack UI
+                                setTimeout(() => autoNavigateFromFrame(frames[0]), 50);
+                            }
                         }
                         // Handle cycle annotation events from the debug adapter
                         if (msg.type === 'event' && msg.event === 'cycleAnnotation' && msg.body) {
@@ -1598,23 +2396,23 @@ function activate(context) {
                 const gdbPort = config.port || 6502;
                 vizLog('Debug session started — GDB on ' + gdbHost + ':' + gdbPort);
                 setTimeout(() => refreshAll(), 500);
-                // Auto-connect heatmap if panel is open
-                if (heatmapPanel) {
-                    heatmapConnect(gdbHost, gdbPort + 1);
+                // Auto-connect viz stream if any consumer panels are open
+                if (vizConsumers.size > 0) {
+                    vizConnect(gdbHost, gdbPort + 1);
                 }
             }
         }),
         vscode.debug.onDidTerminateDebugSession(() => {
             vizLog('Debug session terminated');
             refreshAll();
-            heatmapDisconnect();
+            vizDisconnect();
             clearCycleAnnotations();
         })
     );
 }
 
 function deactivate() {
-    heatmapDisconnect();
+    vizDisconnect();
     vizOutputChannel = null;
 }
 
