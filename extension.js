@@ -1186,6 +1186,14 @@ function vizUnregisterConsumer(consumer) {
     }
 }
 
+// Send raw bytes up the viz_stream socket (VS Code -> emulator uplink).
+// Used for keyboard/input injection from the Screen View.
+function vizSendInput(bytes) {
+    if (vizSocket && !vizSocket.destroyed) {
+        try { vizSocket.write(Buffer.from(bytes)); } catch (_) {}
+    }
+}
+
 // ----------------------------------------------------------------
 // Heatmap consumer
 // ----------------------------------------------------------------
@@ -1660,6 +1668,12 @@ function createScreenPanel() {
                 }
                 try { fs.unlinkSync(tmpFile); } catch (_) {}
             });
+        } else if (msg.type === 'oricKey') {
+            // Keyboard input from the Screen View -> Oric keyboard matrix.
+            // Uplink frame: [0x01 KEY][len 2][keyid][down]
+            vizSendInput([0x01, 0x02, msg.id & 0xff, msg.down ? 1 : 0]);
+        } else if (msg.type === 'oricKeyReleaseAll') {
+            vizSendInput([0x02, 0x00]); // RELEASE_ALL
         }
     });
 
@@ -2186,9 +2200,69 @@ window.addEventListener('message', e => {
     if (e.data.type === 'status') { status.textContent = e.data.text; errorDiv.style.display = 'none'; }
     if (e.data.type === 'error') { errorDiv.textContent = e.data.text; errorDiv.style.display = 'block'; }
 });
+
+// --- Keyboard input -> Oric (Phase 1) ---
+// While the Screen View is focused, capture keys and forward them to the
+// extension, which writes them up the viz_stream socket to the emulator.
+(function(){
+    const held = new Set();
+    const badge = document.createElement('div');
+    badge.style.cssText = 'position:fixed;top:4px;right:6px;font:11px monospace;'
+        + 'padding:2px 7px;border-radius:3px;background:rgba(0,0,0,0.55);'
+        + 'color:#888;pointer-events:none;z-index:99;';
+    badge.textContent = 'click to control the Oric';
+    document.body.appendChild(badge);
+    function setFocused(f){
+        badge.textContent = f ? '⌨ input → Oric' : 'click to control the Oric';
+        badge.style.color = f ? '#8f8' : '#888';
+    }
+    window.addEventListener('focus', function(){ setFocused(true); });
+    window.addEventListener('blur', function(){ setFocused(false); releaseAll(); });
+    function isUiControl(){
+        const t = document.activeElement;
+        return t && /^(BUTTON|SELECT|INPUT|TEXTAREA)$/.test(t.tagName);
+    }
+    function mapKey(e){
+        switch(e.code){
+            case 'ArrowUp': return 0x80; case 'ArrowDown': return 0x81;
+            case 'ArrowLeft': return 0x82; case 'ArrowRight': return 0x83;
+            case 'Enter': case 'NumpadEnter': return 0x84;
+            case 'Escape': return 0x85; case 'Space': return 0x86;
+            case 'Backspace': return 0x87;
+            case 'ShiftLeft': case 'ShiftRight': return 0x88;
+            case 'ControlLeft': case 'ControlRight': return 0x89;
+            case 'Tab': return 0x8b;
+        }
+        if (e.key && e.key.length === 1){ const c = e.key.charCodeAt(0); if (c >= 0x20 && c < 0x7f) return c; }
+        return null;
+    }
+    function releaseAll(){ held.clear(); vscode.postMessage({ type: 'oricKeyReleaseAll' }); }
+    window.addEventListener('keydown', function(e){
+        if (isUiControl()) return;
+        const id = mapKey(e); if (id == null) return;
+        e.preventDefault();
+        if (e.repeat) return;
+        held.add(id);
+        vscode.postMessage({ type: 'oricKey', id: id, down: true });
+    });
+    window.addEventListener('keyup', function(e){
+        if (isUiControl()) return;
+        const id = mapKey(e); if (id == null) return;
+        e.preventDefault();
+        held.delete(id);
+        vscode.postMessage({ type: 'oricKey', id: id, down: false });
+    });
+})();
 </script>
 </body></html>`;
 }
+
+// ----------------------------------------------------------------
+// Oric Disassembly Panel (custom webview, persists across reloads)
+// ----------------------------------------------------------------
+
+let disasmPanel = null;
+let disasmCenterAddr = null;
 
 // ----------------------------------------------------------------
 // Oric Symbols Panel (searchable/sortable symbol browser)
@@ -2214,9 +2288,16 @@ async function scanDefines() {
                 const m = lines[i].match(/^\s*#\s*define\s+([A-Za-z_]\w*)\s+(.+?)\s*$/);
                 if (!m) continue;
                 const name = m[1];
-                const rawValue = m[2];
+                let rawValue = m[2];
                 // Skip macro-style defines with parentheses (parameterized macros)
                 if (name.includes('(') || rawValue.startsWith('\\')) continue;
+                // Strip trailing comments (// or ;) and capture as tooltip
+                let comment = null;
+                const cmtMatch = rawValue.match(/^(.*?)\s+(?:\/\/|;)\s*(.*)$/);
+                if (cmtMatch) {
+                    rawValue = cmtMatch[1].trimEnd();
+                    comment = cmtMatch[2].trim() || null;
+                }
                 // Try to resolve numeric value
                 let numValue = null;
                 const hexM = rawValue.match(/^\$([0-9a-fA-F]{1,4})$/);
@@ -2227,7 +2308,7 @@ async function scanDefines() {
                 else if (binM) numValue = parseInt(binM[1], 2);
                 // Don't overwrite — first definition wins (matches preprocessor behavior)
                 if (!defineCache.has(name)) {
-                    defineCache.set(name, { value: rawValue, numValue, file: uri.fsPath, line: i + 1 });
+                    defineCache.set(name, { value: rawValue, numValue, comment, file: uri.fsPath, line: i + 1 });
                 }
             }
         } catch (_) { /* skip unreadable files */ }
@@ -2290,11 +2371,12 @@ function buildDefineEntries() {
         // Skip defines that shadow a runtime symbol (symbol takes priority)
         if (symbolCache.has(name)) continue;
         entries.push({
-            name, aliases: [], addr: def.numValue !== null ? def.numValue : -1,
+            name, aliases: [], addr: -1,
             size: 0, value: [], group: 'define',
             source: { file: def.file, line: def.line },
             nameSources: { [name]: { file: def.file, line: def.line } },
-            defineValue: def.value
+            defineValue: def.value,
+            defineComment: def.comment || null
         });
     }
     return entries;
@@ -2310,25 +2392,258 @@ function refreshSymbolsPanel(session) {
         symbolCache.clear();
         return;
     }
+    // Only fetch symbol values from memory when the symbols panel is visible
+    // or when the cache hasn't been populated yet (needed for hover provider).
+    // This avoids dozens of GDB memory reads on every single step.
+    const panelVisible = symbolsPanel && symbolsPanel.visible;
+    if (!panelVisible && symbolCache.size > 0) return;
     session.customRequest('readAllSymbols').then(resp => {
         if (resp && resp.symbols) {
             // Update symbol cache (primary name + aliases all point to same entry)
-            symbolCache.clear();
+            // Note: we overwrite entries instead of clearing first, so the cache
+            // is never empty between reads (which would defeat the guard above).
+            const newKeys = new Set();
             for (const s of resp.symbols) {
                 const entry = { addr: s.addr, size: s.size, value: s.value, group: s.group,
                                 source: s.source, aliases: s.aliases, nameSources: s.nameSources };
                 symbolCache.set(s.name, entry);
+                newKeys.add(s.name);
                 if (s.aliases) {
-                    for (const alias of s.aliases) symbolCache.set(alias, entry);
+                    for (const alias of s.aliases) { symbolCache.set(alias, entry); newKeys.add(alias); }
                 }
             }
-            if (symbolsPanel) {
+            // Remove stale entries that no longer exist in the symbol table
+            for (const key of symbolCache.keys()) {
+                if (!newKeys.has(key)) symbolCache.delete(key);
+            }
+            if (panelVisible) {
                 // Merge runtime symbols with defines
                 const combined = [...resp.symbols, ...buildDefineEntries()];
                 symbolsPanel.webview.postMessage({ type: 'symbols', data: combined });
             }
         }
     }).catch(() => {});
+}
+
+// ----------------------------------------------------------------
+// Oric Disassembly Panel — create / refresh / HTML
+// ----------------------------------------------------------------
+
+function createDisasmPanel() {
+    if (disasmPanel) { disasmPanel.reveal(); return; }
+    disasmPanel = vscode.window.createWebviewPanel(
+        'oricDisassembly', 'Oric Disassembly',
+        vscode.ViewColumn.Two,
+        { enableScripts: true, retainContextWhenHidden: true }
+    );
+    disasmPanel.webview.html = disasmPanelHtml();
+    disasmPanel.onDidDispose(() => { disasmPanel = null; });
+    setupDisasmMessageHandler(disasmPanel);
+
+    const session = vscode.debug.activeDebugSession;
+    if (session && session.type === 'oric-debug') refreshDisasmPanel(session);
+}
+
+function setupDisasmMessageHandler(panel) {
+    panel.webview.onDidReceiveMessage(msg => {
+        const session = vscode.debug.activeDebugSession;
+        if (msg.type === 'gotoAddress') {
+            const addr = parseInt(msg.address, 16);
+            if (!isNaN(addr)) {
+                disasmCenterAddr = addr & 0xFFFF;
+                if (session && session.type === 'oric-debug') refreshDisasmPanel(session);
+            }
+        } else if (msg.type === 'followPc') {
+            disasmCenterAddr = null;
+            if (session && session.type === 'oric-debug') refreshDisasmPanel(session);
+        } else if (msg.type === 'toggleBreakpoint' && typeof msg.address === 'number') {
+            if (session && session.type === 'oric-debug') {
+                session.customRequest('toggleInstructionBreakpoint', { address: msg.address }).then(resp => {
+                    refreshDisasmPanel(session);
+                }).catch(() => {});
+            }
+        }
+    });
+}
+
+function refreshDisasmPanel(session) {
+    if (!disasmPanel) return;
+    if (!session || session.type !== 'oric-debug') {
+        disasmPanel.webview.postMessage({ type: 'disasm', data: null });
+        return;
+    }
+    session.customRequest('disassembleRange', {
+        address: disasmCenterAddr, count: 64, before: 24
+    }).then(resp => {
+        if (disasmPanel) disasmPanel.webview.postMessage({ type: 'disasm', data: resp });
+    }).catch(() => {});
+}
+
+function disasmPanelHtml() {
+    return `<!DOCTYPE html>
+<html><head><style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: var(--vscode-editor-font-size, 13px);
+    color: var(--vscode-foreground);
+    background: var(--vscode-editor-background);
+    padding: 0;
+}
+.toolbar {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--vscode-editor-background);
+    padding: 6px 8px;
+    display: flex; gap: 8px; align-items: center;
+    border-bottom: 1px solid var(--vscode-widget-border, #444);
+}
+.toolbar input {
+    background: var(--vscode-input-background, #3c3c3c);
+    color: var(--vscode-input-foreground, #ccc);
+    border: 1px solid var(--vscode-input-border, #555);
+    padding: 3px 6px;
+    font-family: inherit; font-size: inherit;
+    width: 80px;
+}
+.toolbar button {
+    background: var(--vscode-button-background, #0e639c);
+    color: var(--vscode-button-foreground, #fff);
+    border: none; padding: 3px 10px; cursor: pointer;
+    font-family: inherit; font-size: inherit;
+}
+.toolbar button:hover { opacity: 0.85; }
+.toolbar .status {
+    color: var(--vscode-descriptionForeground, #888);
+    font-size: 0.9em; margin-left: auto;
+}
+table { width: 100%; border-collapse: collapse; user-select: none; table-layout: fixed; }
+tr { height: 20px; }
+tr.pc-row { background: var(--vscode-editor-selectionBackground, rgba(38,79,120,0.5)); }
+tr.label-row td { border-top: 1px solid var(--vscode-widget-border, #333); padding-top: 6px; }
+td { padding: 0 4px; white-space: nowrap; vertical-align: middle; }
+td.gutter {
+    width: 20px; text-align: center; cursor: pointer;
+    color: var(--vscode-editorGutter-foldingControlForeground, #888);
+    user-select: none; position: relative;
+}
+td.gutter .bp-dot {
+    display: inline-block; width: 12px; height: 12px; border-radius: 50%;
+    pointer-events: none;
+}
+td.gutter .bp-dot.set { background: #e51400; }
+td.gutter .bp-dot.unset { border: 1.5px solid var(--vscode-editorGutter-foldingControlForeground, #666); }
+td.addr { color: var(--vscode-descriptionForeground, #888); width: 50px; }
+td.bytes { color: var(--vscode-descriptionForeground, #666); width: 75px; }
+td.label-col { color: var(--vscode-symbolIcon-functionForeground, #75beff); font-weight: bold; width: 140px; overflow: hidden; text-overflow: ellipsis; }
+td.mnemonic { color: var(--vscode-symbolIcon-keywordForeground, #c586c0); font-weight: bold; width: 36px; }
+td.operand { color: var(--vscode-foreground); }
+td.pc-arrow { width: 18px; color: var(--vscode-debugIcon-startForeground, #89d185); font-weight: bold; }
+.no-session { padding: 20px; color: var(--vscode-descriptionForeground, #888); text-align: center; }
+</style></head><body>
+<div class="toolbar">
+    <span style="color:var(--vscode-descriptionForeground,#888)">Go to:</span>
+    <input type="text" id="gotoInput" placeholder="$XXXX" spellcheck="false">
+    <button id="gotoBtn">Go</button>
+    <button id="followBtn">Follow PC</button>
+    <span class="status" id="statusText"></span>
+</div>
+<div id="content"><div class="no-session">No debug session active</div></div>
+<script>
+const vscode = acquireVsCodeApi();
+let lastData = null;
+
+// Use mousedown + event delegation for breakpoint gutter clicks.
+// In VS Code webviews the first 'click' after focus acquisition is often
+// swallowed; mousedown fires reliably on every press including the first.
+document.getElementById('content').addEventListener('mousedown', e => {
+    const td = e.target.closest('td.gutter');
+    if (!td) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const addr = parseInt(td.dataset.addr);
+    if (!isNaN(addr)) vscode.postMessage({ type: 'toggleBreakpoint', address: addr });
+});
+
+document.getElementById('gotoBtn').addEventListener('click', doGoto);
+document.getElementById('gotoInput').addEventListener('keydown', e => { if (e.key === 'Enter') doGoto(); });
+document.getElementById('followBtn').addEventListener('click', () => vscode.postMessage({ type: 'followPc' }));
+
+function doGoto() {
+    let v = document.getElementById('gotoInput').value.trim().replace(/^\\$/, '');
+    if (/^[0-9a-fA-F]{1,4}$/.test(v)) {
+        vscode.postMessage({ type: 'gotoAddress', address: v });
+    }
+}
+
+window.addEventListener('message', e => {
+    if (e.data.type === 'disasm') {
+        lastData = e.data.data;
+        render();
+    }
+});
+
+function render() {
+    const el = document.getElementById('content');
+    if (!lastData || !lastData.instructions || lastData.instructions.length === 0) {
+        el.innerHTML = '<div class="no-session">No debug session active</div>';
+        document.getElementById('statusText').textContent = '';
+        return;
+    }
+    const { instructions, pc, breakpoints } = lastData;
+    const bpSet = new Set(breakpoints || []);
+    const h2 = v => v.toString(16).toUpperCase().padStart(2, '0');
+    const h4 = v => v.toString(16).toUpperCase().padStart(4, '0');
+
+    let html = '<table>';
+    let pcRowId = null;
+    for (const ins of instructions) {
+        const isPc = ins.address === pc;
+        const hasLabel = ins.label && ins.label.length > 0;
+        const hasBp = bpSet.has(ins.address);
+        const cls = [];
+        if (isPc) cls.push('pc-row');
+        if (hasLabel) cls.push('label-row');
+        const rowId = 'r' + ins.address;
+        if (isPc) pcRowId = rowId;
+
+        const bytesStr = ins.bytes.map(b => h2(b)).join(' ');
+        const bpCls = hasBp ? 'bp-dot set' : 'bp-dot unset';
+
+        html += '<tr id="' + rowId + '"' + (cls.length ? ' class="' + cls.join(' ') + '"' : '') + '>';
+        html += '<td class="pc-arrow">' + (isPc ? '\\u25B6' : '') + '</td>';
+        html += '<td class="gutter" data-addr="' + ins.address + '"><span class="' + bpCls + '"></span></td>';
+        html += '<td class="addr">$' + h4(ins.address) + '</td>';
+        html += '<td class="bytes">' + bytesStr + '</td>';
+        html += '<td class="label-col">' + (hasLabel ? ins.label : '') + '</td>';
+        html += '<td class="mnemonic">' + ins.mnemonic + '</td>';
+        html += '<td class="operand">' + escHtml(ins.operand) + '</td>';
+        html += '</tr>';
+    }
+    html += '</table>';
+    el.innerHTML = html;
+
+    // Scroll PC row into view
+    if (pcRowId) {
+        const row = document.getElementById(pcRowId);
+        if (row) row.scrollIntoView({ block: 'center', behavior: 'auto' });
+    }
+
+    document.getElementById('statusText').textContent = 'PC: $' + h4(pc);
+}
+
+function escHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// Restore state after webview becomes visible again
+const saved = vscode.getState();
+if (saved && saved.lastData) { lastData = saved.lastData; render(); }
+
+// Persist state on updates
+const origRender = render;
+render = function() { origRender(); if (lastData) vscode.setState({ lastData }); };
+</script>
+</body></html>`;
 }
 
 function symbolsPanelHtml() {
@@ -2349,13 +2664,40 @@ body {
     display: flex; gap: 8px; align-items: center;
     border-bottom: 1px solid var(--vscode-widget-border, #444);
 }
-.toolbar input {
-    flex: 1; min-width: 100px;
+.search-wrap {
+    flex: 1; min-width: 100px; position: relative;
+}
+.search-wrap input {
+    width: 100%;
     background: var(--vscode-input-background, #3c3c3c);
     color: var(--vscode-input-foreground, #ccc);
     border: 1px solid var(--vscode-input-border, #555);
-    padding: 3px 6px;
+    padding: 3px 24px 3px 6px;
     font-family: inherit; font-size: inherit;
+}
+.search-wrap .clear-btn {
+    position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
+    background: none; border: none; color: var(--vscode-descriptionForeground, #888);
+    cursor: pointer; font-size: 14px; line-height: 1; padding: 2px 4px;
+    display: none;
+}
+.search-wrap .clear-btn:hover { color: var(--vscode-foreground); }
+.search-wrap input:not(:placeholder-shown) ~ .clear-btn { display: block; }
+.search-wrap .mru-list {
+    position: absolute; top: 100%; left: 0; right: 0; z-index: 20;
+    background: var(--vscode-dropdown-background, #3c3c3c);
+    border: 1px solid var(--vscode-dropdown-border, #555);
+    max-height: 160px; overflow-y: auto;
+    display: none;
+}
+.search-wrap .mru-list.open { display: block; }
+.search-wrap .mru-item {
+    padding: 3px 8px; cursor: pointer; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+    color: var(--vscode-dropdown-foreground, #ccc);
+}
+.search-wrap .mru-item:hover {
+    background: var(--vscode-list-hoverBackground, #2a2d2e);
 }
 .toolbar select {
     background: var(--vscode-dropdown-background, #3c3c3c);
@@ -2407,7 +2749,11 @@ tr:nth-child(even) td {
 .sym-link:hover { text-decoration: underline; }
 </style></head><body>
 <div class="toolbar">
-    <input type="text" id="search" placeholder="Search symbols..." />
+    <div class="search-wrap">
+        <input type="text" id="search" placeholder="Search name or value..." autocomplete="off" />
+        <button class="clear-btn" id="clearBtn" title="Clear">\u00D7</button>
+        <div class="mru-list" id="mruList"></div>
+    </div>
     <select id="groupFilter">
         <option value="all">All</option>
         <option value="zp">Zero Page</option>
@@ -2444,17 +2790,23 @@ const countEl = document.getElementById('count');
 const nodata = document.getElementById('nodata');
 const headers = document.querySelectorAll('th[data-col]');
 
+const clearBtn = document.getElementById('clearBtn');
+const mruListEl = document.getElementById('mruList');
+
 let allSymbols = null;
 let prevValues = {};   // name -> value string for change detection
 let sortCol = 'addr';
 let sortAsc = true;
 let filterText = '';
 let filterGroup = 'all';
+let mruItems = [];     // most-recently-used search terms
+const MRU_MAX = 10;
 
 function h(v, w) { return '$' + v.toString(16).toUpperCase().padStart(w, '0'); }
 
 function fmtValue(sym) {
     if (sym.defineValue !== undefined) return sym.defineValue;
+    if (sym.typeInfo) return sym.typeInfo.type;
     const v = sym.value;
     if (!v || v.length === 0) return '?';
     if (v.length === 1) return h(v[0], 2) + ' (' + v[0] + ')';
@@ -2491,7 +2843,9 @@ function render() {
     if (filterText) {
         const ft = filterText.toLowerCase();
         list = list.filter(s => s.name.toLowerCase().includes(ft) ||
-            (s.aliases && s.aliases.some(a => a.toLowerCase().includes(ft))));
+            (s.aliases && s.aliases.some(a => a.toLowerCase().includes(ft))) ||
+            fmtValue(s).toLowerCase().includes(ft) ||
+            (s.addr >= 0 && h(s.addr, 4).toLowerCase().includes(ft)));
     }
 
     list.sort((a, b) => {
@@ -2541,14 +2895,53 @@ function render() {
             + '<td class="name">' + nameHtml + '</td>'
             + '<td class="addr">' + (s.addr >= 0 ? h(s.addr, 4) : '\u2014') + '</td>'
             + '<td class="sz">' + (s.size > 0 ? s.size : '\u2014') + '</td>'
-            + '<td class="val' + mod + '">' + fmtValue(s) + '</td>'
+            + '<td class="val' + mod + '"' + (s.defineComment ? ' title="' + s.defineComment.replace(/"/g, '&quot;') + '"' : '') + '>' + fmtValue(s) + '</td>'
             + '<td class="grp">' + groupLabel(s.group) + '</td>'
             + '</tr>';
     }
     tbody.innerHTML = html;
 }
 
-searchEl.addEventListener('input', () => { filterText = searchEl.value; render(); });
+// --- MRU helpers ---
+function mruAdd(term) {
+    term = term.trim();
+    if (!term) return;
+    mruItems = mruItems.filter(t => t !== term);
+    mruItems.unshift(term);
+    if (mruItems.length > MRU_MAX) mruItems.length = MRU_MAX;
+}
+function mruRender() {
+    if (mruItems.length === 0) { mruListEl.classList.remove('open'); return; }
+    mruListEl.innerHTML = mruItems.map(t =>
+        '<div class="mru-item">' + t.replace(/</g, '&lt;') + '</div>'
+    ).join('');
+    mruListEl.classList.add('open');
+}
+function mruClose() { mruListEl.classList.remove('open'); }
+mruListEl.addEventListener('mousedown', e => {
+    const item = e.target.closest('.mru-item');
+    if (item) {
+        searchEl.value = item.textContent;
+        filterText = searchEl.value;
+        mruClose();
+        render();
+    }
+});
+
+// --- Search input ---
+searchEl.addEventListener('input', () => { filterText = searchEl.value; mruClose(); render(); });
+searchEl.addEventListener('focus', () => { if (!searchEl.value && mruItems.length) mruRender(); });
+searchEl.addEventListener('blur', () => { setTimeout(mruClose, 150); });
+searchEl.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { searchEl.value = ''; filterText = ''; mruClose(); render(); }
+    if (e.key === 'Enter' && filterText.trim()) { mruAdd(filterText); mruClose(); }
+    if (e.key === 'ArrowDown' && !searchEl.value && mruItems.length) { mruRender(); }
+});
+clearBtn.addEventListener('click', () => {
+    if (searchEl.value.trim()) mruAdd(searchEl.value);
+    searchEl.value = ''; filterText = ''; mruClose(); render(); searchEl.focus();
+});
+
 groupEl.addEventListener('change', () => { filterGroup = groupEl.value; render(); });
 
 headers.forEach(th => {
@@ -2971,6 +3364,25 @@ function activate(context) {
         vscode.commands.registerCommand('osdk.xaReference', () => createXaReferencePanel()),
         vscode.commands.registerCommand('osdk.6502Reference', () => create6502ReferencePanel()),
         vscode.commands.registerCommand('oric-debug.openSymbols', () => createSymbolsPanel(context)),
+        vscode.commands.registerCommand('oric-debug.openDisassembly', () => createDisasmPanel()),
+        vscode.commands.registerCommand('oric-debug.stepOverInstruction', async () => {
+            const session = vscode.debug.activeDebugSession;
+            if (!session || session.type !== 'oric-debug') return;
+            try {
+                const threads = await session.customRequest('threads');
+                const threadId = (threads.threads && threads.threads[0]) ? threads.threads[0].id : 1;
+                await session.customRequest('next', { threadId, granularity: 'instruction' });
+            } catch (_) {}
+        }),
+        vscode.commands.registerCommand('oric-debug.stepIntoInstruction', async () => {
+            const session = vscode.debug.activeDebugSession;
+            if (!session || session.type !== 'oric-debug') return;
+            try {
+                const threads = await session.customRequest('threads');
+                const threadId = (threads.threads && threads.threads[0]) ? threads.threads[0].id : 1;
+                await session.customRequest('stepIn', { threadId, granularity: 'instruction' });
+            } catch (_) {}
+        }),
         vscode.commands.registerCommand('oric-debug.showCurrentLocation', async () => {
             const session = vscode.debug.activeDebugSession;
             if (!session || session.type !== 'oric-debug') return;
@@ -2982,6 +3394,19 @@ function activate(context) {
                     autoNavigateFromFrame(stack.stackFrames[0]);
                 }
             } catch (_) {}
+        }),
+
+        vscode.commands.registerCommand('oric-debug.turboRunToCursor', async () => {
+            const session = vscode.debug.activeDebugSession;
+            if (!session || session.type !== 'oric-debug') return;
+            const ed = vscode.window.activeTextEditor;
+            const args = {};
+            if (ed) { args.file = ed.document.uri.fsPath; args.line = ed.selection.active.line + 1; }
+            try {
+                await session.customRequest('turboRun', args);
+            } catch (e) {
+                vscode.window.showErrorMessage('Turbo Run failed: ' + (e && e.message ? e.message : e));
+            }
         })
     );
 
@@ -3036,6 +3461,10 @@ function activate(context) {
                         else vscode.window.showInformationMessage('Screenshot copied to clipboard');
                         try { fs.unlinkSync(tmpFile); } catch (_) {}
                     });
+                } else if (msg.type === 'oricKey') {
+                    vizSendInput([0x01, 0x02, msg.id & 0xff, msg.down ? 1 : 0]);
+                } else if (msg.type === 'oricKeyReleaseAll') {
+                    vizSendInput([0x02, 0x00]);
                 }
             });
 
@@ -3067,13 +3496,32 @@ function activate(context) {
             });
         }
     });
+    vscode.window.registerWebviewPanelSerializer('oricDisassembly', {
+        async deserializeWebviewPanel(panel) {
+            disasmPanel = panel;
+            panel.webview.options = { enableScripts: true, retainContextWhenHidden: true };
+            panel.webview.html = disasmPanelHtml();
+            panel.onDidDispose(() => { disasmPanel = null; });
+            setupDisasmMessageHandler(panel);
+            const session = vscode.debug.activeDebugSession;
+            if (session && session.type === 'oric-debug') refreshDisasmPanel(session);
+        }
+    });
+
+    function isDisasmFocused() {
+        return disasmPanel && disasmPanel.active;
+    }
 
     function refreshAll() {
         const session = vscode.debug.activeDebugSession;
+        const lightMode = isDisasmFocused(); // instruction-stepping: skip heavy refreshes
         regsProvider.refresh(session);
-        periphProvider.refresh(session);
-        refreshMemoryPanels(session);
-        refreshSymbolsPanel(session);
+        refreshDisasmPanel(session);
+        if (!lightMode) {
+            periphProvider.refresh(session);
+            refreshMemoryPanels(session);
+            refreshSymbolsPanel(session);
+        }
         refreshInstructionAnnotation(session);
     }
 
@@ -3081,9 +3529,17 @@ function activate(context) {
     // disassembly tab to a real source file when the frame changes.
     // This handler ensures we open the source file when it's available.
     let pendingNavigate = false;
+    let disassemblyAutoOpened = false; // auto-open disassembly view once per session
 
     async function autoNavigateFromFrame(topFrame) {
         try {
+            // Don't steal focus from the disassembly view or VS Code's built-in one.
+            // When either is focused, activeTextEditor is undefined (webview) or we
+            // check our own panel. Skipping navigation keeps focus there so subsequent
+            // F10 presses still send granularity=instruction.
+            if (!vscode.window.activeTextEditor) return;
+            if (isDisasmFocused()) return;
+
             if (topFrame.source && topFrame.source.path && topFrame.line > 0) {
                 const uri = vscode.Uri.file(topFrame.source.path);
                 const line = topFrame.line - 1; // 0-based
@@ -3111,7 +3567,13 @@ function activate(context) {
                     onDidSendMessage(msg) {
                         if (msg.type === 'event' && msg.event === 'stopped') {
                             setTimeout(() => refreshAll(), 50);
-                            pendingNavigate = true;
+                            // Skip source-file navigation when the disassembly panel is focused
+                            if (!isDisasmFocused()) pendingNavigate = true;
+                            // Auto-open custom disassembly panel on first stop of session
+                            if (!disassemblyAutoOpened) {
+                                disassemblyAutoOpened = true;
+                                setTimeout(() => createDisasmPanel(), 200);
+                            }
                         }
                         // Intercept VS Code's own stackTrace response — the UI
                         // now has frame data, so opening disassembly will work.
@@ -3149,6 +3611,8 @@ function activate(context) {
                 const gdbHost = config.host || 'localhost';
                 const gdbPort = config.port || 6502;
                 vizLog('Debug session started — GDB on ' + gdbHost + ':' + gdbPort);
+                disassemblyAutoOpened = false;
+                disasmCenterAddr = null;
                 scanDefines(); // Rescan defines (build may have regenerated headers)
                 setTimeout(() => refreshAll(), 500);
                 // Auto-connect viz stream if any consumer panels are open
@@ -3166,6 +3630,7 @@ function activate(context) {
             lastPcAddr = -1;
             clearHeatmapHighlight();
             symbolCache.clear();
+            disasmCenterAddr = null;
         })
     );
 }

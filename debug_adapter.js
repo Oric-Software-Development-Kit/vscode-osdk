@@ -146,7 +146,8 @@ function onGdbData(data) {
         // ACK
         if (sock) sock.write('+');
 
-        logVerbose('[GDB] ← ' + payload.substring(0, 40));
+        if (payload.length <= 80) logVerbose('[GDB] ← ' + payload.substring(0, 60));
+        else logVerbose('[GDB] ← (' + payload.length + ' chars)');
         // Route the packet: if we're waiting for a command response,
         // deliver it — UNLESS it's an unsolicited stop notification
         // (T05/S05) while we're waiting for a non-'?' response.
@@ -236,6 +237,12 @@ let bpId       = 1;
 let bps        = new Map();   // id -> { id, addr, name } (function breakpoints)
 let ibps       = new Map();   // id -> { id, addr }       (instruction breakpoints)
 let zpSymbols  = [];          // [{addr, name, size}] sorted by address
+let typeDefs   = new Map();   // structName -> { size, fields: [{name, type, offset, size}] }
+let varTypes   = new Map();   // asmName -> { type: 'score_entry[24]', base: 'score_entry', count: 24|1, totalSize: 528 }
+let localDefs  = new Map();   // funcAsmName -> [{cname, base:'fp'|'ap', offset, type, baseType, count, size}]
+let varRefs    = new Map();   // variablesReference id -> { addr, typeName, count, offset? }
+let nextVarRef = 100;         // next available variablesReference id (1-5 reserved for scopes)
+let displayHex = true;        // true = hex primary, false = decimal primary
 let configDone = false;
 let pendingStop = null;       // deferred stopped event body
 let srcBps     = new Map();   // file -> [{id, addr}] (source breakpoints per file)
@@ -243,6 +250,11 @@ let dataBps    = new Map();   // id -> { addr, accessType, gdbType } (data break
 let gotoTargetMap = new Map(); // targetId -> address (for goto/setNextStatement)
 let lastCycleAnnotation = null; // { pc, cycles } from last step-over
 let launchedProcess = null;     // child_process handle if we launched Oricutron
+let sourceLineCache = {};       // filePath -> string[] (lazy-loaded source, 0-based)
+let tempStepBp = -1;           // address of temp breakpoint for source-level stepping (-1 = none)
+let continueAfterStep = false; // true when single-stepping past a BP before continuing (F5)
+let turboWarpActive = false;   // true while a "Turbo Run" is warping toward a stop
+let turboPrevWarp = false;     // warp state to restore when the turbo run stops
 
 // ----------------------------------------------------------------
 // Build staleness check (pure Node.js, cross-platform)
@@ -324,6 +336,12 @@ function loadSymbols(file) {
     symSource.clear();
     lineTable = [];
     zpSymbols = [];
+    typeDefs.clear();
+    varTypes.clear();
+    localDefs.clear();
+    evalFailCache.clear();
+    varRefs.clear();
+    nextVarRef = 100;
     try {
         const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
         let isV2 = false;
@@ -335,6 +353,7 @@ function loadSymbols(file) {
             if (trimmed === '#SYM V2')  { isV2 = true; section = 'sym'; continue; }
             if (trimmed === '#FILES')   { section = 'files'; fileIndex = []; continue; }
             if (trimmed === '#LINES')   { section = 'lines'; continue; }
+            if (trimmed === '#TYPES')   { section = 'types'; continue; }
 
             if (section === 'files') {
                 // Format: "index filepath"
@@ -353,6 +372,63 @@ function loadSymbols(file) {
                         file: fileIndex[fi] || ('file#' + fi),
                         line: parseInt(lm[3], 10)
                     });
+                }
+                continue;
+            }
+
+            if (section === 'types') {
+                // Format: "struct <name> <size> <field>:<type>:<offset>:<size> ..."
+                //     or: "var <asm_name> <type_string> <totalSize>"
+                const sm = trimmed.match(/^struct\s+(\S+)\s+(\d+)\s+(.+)$/);
+                if (sm) {
+                    const name = sm[1];
+                    const size = parseInt(sm[2], 10);
+                    const fields = [];
+                    for (const ft of sm[3].split(/\s+/)) {
+                        const parts = ft.split(':');
+                        if (parts.length >= 4) {
+                            fields.push({
+                                name: parts[0],
+                                type: parts[1],
+                                offset: parseInt(parts[2], 10),
+                                size: parseInt(parts[3], 10)
+                            });
+                        }
+                    }
+                    typeDefs.set(name, { size, fields });
+                    continue;
+                }
+                const vm = trimmed.match(/^var\s+(\S+)\s+(\S+)\s+(\d+)$/);
+                if (vm) {
+                    const asmName = vm[1];
+                    const typeStr = vm[2];    // e.g. "score_entry[24]" or "int"
+                    const totalSize = parseInt(vm[3], 10);
+                    const am = typeStr.match(/^(.+)\[(\d+)\]$/);
+                    if (am) {
+                        varTypes.set(asmName, { type: typeStr, base: am[1], count: parseInt(am[2], 10), totalSize });
+                    } else {
+                        varTypes.set(asmName, { type: typeStr, base: typeStr, count: 1, totalSize });
+                    }
+                    continue;
+                }
+                // Format: "local <func> <cname> <base> <offset> <type> <size>"
+                const lm = trimmed.match(/^local\s+(\S+)\s+(\S+)\s+(fp|ap)\s+(\d+)\s+(\S+)\s+(\d+)$/);
+                if (lm) {
+                    const func = lm[1];
+                    const cname = lm[2];
+                    const base = lm[3];
+                    const offset = parseInt(lm[4], 10);
+                    const typeStr = lm[5];
+                    const size = parseInt(lm[6], 10);
+                    const am = typeStr.match(/^(.+)\[(\d+)\]$/);
+                    const entry = {
+                        cname, base, offset, type: typeStr, size,
+                        baseType: am ? am[1] : typeStr,
+                        count: am ? parseInt(am[2], 10) : 1
+                    };
+                    if (!localDefs.has(func)) localDefs.set(func, []);
+                    localDefs.get(func).push(entry);
+                    continue;
                 }
                 continue;
             }
@@ -400,9 +476,100 @@ function loadSymbols(file) {
             const size = Math.min(next - zpAddrs[i].addr, 2); // 1 or 2 bytes
             zpSymbols.push({ addr: zpAddrs[i].addr, name: zpAddrs[i].name, size: size });
         }
-        log('Loaded ' + symbols.size + ' symbols, ' + lineTable.length + ' line entries from ' + file);
+        // Resolve symbols that reference build artifacts (linked.s) by scanning
+        // the actual source/library files for their original definitions.
+        resolveLibrarySources(fileIndex);
+
+        log('Loaded ' + symbols.size + ' symbols, ' + lineTable.length + ' line entries, ' +
+            typeDefs.size + ' types, ' + varTypes.size + ' typed vars, ' +
+            localDefs.size + ' funcs with locals from ' + file);
     } catch (e) {
         log('Could not load symbols: ' + e.message);
+    }
+}
+
+// Scan source and library files to find the original definition of symbols
+// whose V2 source info points to a build artifact like linked.s.
+function resolveLibrarySources(fileIndex) {
+    // Collect symbol names that need resolution: those pointing to build
+    // artifacts or with no source info at all.
+    const needsResolve = new Map(); // name -> address
+    for (const [name, addr] of symbols) {
+        const src = symSource.get(name);
+        if (!src || isBuildArtifact(src.file)) {
+            needsResolve.set(name, addr);
+        }
+    }
+    if (needsResolve.size === 0) return;
+
+    // Gather files to scan:
+    // 1. Files from #FILES section (includes library includes)
+    // 2. Source files in the workspace
+    // 3. OSDK library files (derived from emulator path)
+    const filesToScan = new Set();
+
+    // From #FILES (skip build artifacts)
+    if (fileIndex) {
+        for (const f of fileIndex) {
+            if (f && !isBuildArtifact(f)) filesToScan.add(f);
+        }
+    }
+
+    // Workspace sources
+    const wsDir = config.sourceRoot || config.workspaceFolder;
+    if (wsDir) {
+        try {
+            const wsFiles = readdirRecursive(wsDir);
+            for (const f of wsFiles) {
+                if (/\.(s|asm|inc|h)$/i.test(f)) filesToScan.add(f);
+            }
+        } catch (_) {}
+    }
+
+    // OSDK library: derive from emulator path (e.g. .../Oricutron/Oricutron.exe → .../lib/)
+    if (config.emulatorPath) {
+        const osdkRoot = path.dirname(path.dirname(config.emulatorPath));
+        const libDir = path.join(osdkRoot, 'lib');
+        try {
+            const libFiles = readdirRecursive(libDir);
+            for (const f of libFiles) {
+                if (/\.(s|asm|inc|h)$/i.test(f)) filesToScan.add(f);
+            }
+        } catch (_) {}
+    }
+
+    if (filesToScan.size === 0) return;
+
+    // Scan each file for symbol definitions
+    for (const filePath of filesToScan) {
+        if (needsResolve.size === 0) break;
+        let content;
+        try { content = fs.readFileSync(filePath, 'utf8'); }
+        catch (_) { continue; }
+        const lines = content.split(/\r?\n/);
+        for (let i = 0; i < lines.length; i++) {
+            // Match label at start of line: symbolname at column 0 followed by
+            // whitespace, colon, =, or a directive (.dsb, .byt, .word, etc.)
+            const m = lines[i].match(/^([A-Za-z_][A-Za-z0-9_]*)\s*(?:[:\s=.]|$)/);
+            if (!m) continue;
+            const sym = m[1];
+            if (!needsResolve.has(sym)) continue;
+
+            const src = { file: filePath, line: i + 1 };
+            symSource.set(sym, src);
+            const addr = needsResolve.get(sym);
+            if (typeof addr === 'number') {
+                const existing = addrSource.get(addr);
+                if (!existing || isBuildArtifact(existing.file)) {
+                    addrSource.set(addr, src);
+                }
+            }
+            needsResolve.delete(sym);
+            if (needsResolve.size === 0) return;
+        }
+    }
+    if (needsResolve.size > 0) {
+        logVerbose(needsResolve.size + ' symbols still unresolved after library scan');
     }
 }
 
@@ -456,6 +623,27 @@ function parseStopRegs(payload) {
 function onStopReply(payload) {
     running = false;
     regs = parseStopRegs(payload);
+    varRefs.clear();
+    nextVarRef = 100;
+    clearGdbReadCache();
+
+    // Handle continue-past-breakpoint FIRST: single step completed, now issue continue.
+    // Must come before tempStepBp cleanup — when both are set (F10 on a line with BP),
+    // we need to continue first and clean up the temp BP on the NEXT stop.
+    if (continueAfterStep) {
+        continueAfterStep = false;
+        running = true;
+        gdbWrite('c');
+        return; // don't emit stopped event — real stop will come through later
+    }
+
+    // Clean up temp breakpoint from source-level stepping (F10/F11)
+    if (tempStepBp >= 0) {
+        const addr = tempStepBp;
+        tempStepBp = -1;
+        gdbCmd('z0,' + addr.toString(16) + ',1'); // remove temp BP asynchronously
+    }
+
     const sig = parseInt(payload.substring(1, 3), 16);
 
     // Parse extended stop-reply fields
@@ -493,19 +681,40 @@ function onStopReply(payload) {
         };
     }
 
+    onStopReply_emit(watchAddr);
+}
+
+// Emit the stopped event — used by onStopReply and by source-level stepping
+function onStopReply_emit(watchAddr) {
+    // Turbo Run reached a stop — restore the prior warp state
+    if (turboWarpActive) {
+        turboWarpActive = false;
+        if (!turboPrevWarp) gdbCmd('qOricWarp,0');
+    }
     // Determine stop reason
-    let reason = sig === 5 ? 'step' : 'pause';
+    let reason = 'step';
     let hitIds;
 
-    if (watchAddr !== null) {
+    if (watchAddr !== null && watchAddr !== undefined) {
         reason = 'data breakpoint';
-    } else if (sig === 5 && regs && regs.pc !== undefined) {
+    } else if (regs && regs.pc !== undefined) {
+        // Check function breakpoints
         for (const [id, bp] of bps) {
             if (bp.addr === regs.pc) { reason = 'breakpoint'; hitIds = [id]; break; }
         }
+        // Check instruction breakpoints
         if (!hitIds) {
             for (const [id, bp] of ibps) {
                 if (bp.addr === regs.pc) { reason = 'breakpoint'; hitIds = [id]; break; }
+            }
+        }
+        // Check source breakpoints
+        if (!hitIds) {
+            for (const [, arr] of srcBps) {
+                for (const bp of arr) {
+                    if (bp.addr === regs.pc) { reason = 'breakpoint'; hitIds = [bp.id]; break; }
+                }
+                if (hitIds) break;
             }
         }
     }
@@ -604,6 +813,20 @@ function isPlausibleMapping(symAddr, targetAddr) {
     return offset <= 1024;
 }
 
+// Lazy-load source file, return line string (1-based) or null.
+function getSourceLine(filePath, line) {
+    if (!sourceLineCache[filePath]) {
+        try {
+            sourceLineCache[filePath] = fs.readFileSync(filePath, 'utf8').split(/\r?\n/);
+        } catch (e) {
+            sourceLineCache[filePath] = [];
+        }
+    }
+    const lines = sourceLineCache[filePath];
+    if (line >= 1 && line <= lines.length) return lines[line - 1];
+    return null;
+}
+
 function sourceFor(addr) {
     // Binary search the line table for largest address <= addr
     if (lineTable.length > 0) {
@@ -625,6 +848,201 @@ function sourceFor(addr) {
     }
     if (bestSrc && !isPlausibleMapping(bestAddr, addr)) return null;
     return bestSrc;
+}
+
+// Find the function containing `pc` by looking for the largest symbol address <= pc
+// that appears as a key in localDefs. Returns the function's asm name or null.
+function currentFunction(pc) {
+    let bestName = null;
+    let bestAddr = -1;
+    for (const [funcName] of localDefs) {
+        const addr = symbols.get(funcName);
+        if (typeof addr === 'number' && addr <= pc && addr > bestAddr) {
+            bestAddr = addr;
+            bestName = funcName;
+        }
+    }
+    return bestName;
+}
+
+// Per-stop GDB read cache — prevents duplicate memory reads within the same stop cycle.
+// Cleared each time we receive a stop notification (T05/S05).
+let gdbReadCache = new Map();
+
+// qOricEval failure cache — symbols that returned E02 (not found) are cached
+// so we don't re-query Oricutron for the same expression on every step.
+// Cleared when symbols are reloaded.
+let evalFailCache = new Set();
+
+function clearGdbReadCache() {
+    gdbReadCache.clear();
+}
+
+// Read memory from the emulator. Returns a Uint8Array of `len` bytes starting at `addr`.
+async function readMem(addr, len) {
+    if (len <= 0) return new Uint8Array(0);
+    const cacheKey = addr + ':' + len;
+    const cached = gdbReadCache.get(cacheKey);
+    if (cached) return cached;
+    const hexLen = len.toString(16);
+    const hexAddr = addr.toString(16);
+    const reply = await gdbCmd('m' + hexAddr + ',' + hexLen);
+    if (!reply || reply[0] === 'E') return new Uint8Array(len); // zeros on error
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len && i * 2 + 1 < reply.length; i++) {
+        bytes[i] = parseInt(reply.substring(i * 2, i * 2 + 2), 16);
+    }
+    gdbReadCache.set(cacheKey, bytes);
+    return bytes;
+}
+
+// Format a scalar value from raw bytes for display
+function formatScalar(typeName, mem, offset, size) {
+    const t = typeName.toLowerCase();
+    const isSigned = (t === 'char' || t === 'schar' || t === 'int' || t === 'short' || t === 'sint' || t === 'sshort');
+    let valStr;
+    if (size === 1) {
+        const v = mem[offset] || 0;
+        const sv = (isSigned && v > 127) ? v - 256 : v;
+        const hex = '$' + v.toString(16).toUpperCase().padStart(2, '0');
+        const dec = isSigned ? String(sv) : String(v);
+        const ch = (t === 'char' || t === 'schar' || t === 'uchar') && (v >= 32 && v < 127) ? " '" + String.fromCharCode(v) + "'" : '';
+        valStr = displayHex ? hex + ' (' + dec + ')' + ch : dec + ' (' + hex + ')' + ch;
+    } else if (size === 2) {
+        const lo = mem[offset] || 0;
+        const hi = mem[offset + 1] || 0;
+        const w = lo | (hi << 8);
+        const sv = (isSigned && w > 32767) ? w - 65536 : w;
+        const hex = '$' + w.toString(16).toUpperCase().padStart(4, '0');
+        const dec = isSigned ? String(sv) : String(w);
+        valStr = displayHex ? hex + ' (' + dec + ')' : dec + ' (' + hex + ')';
+    } else {
+        // Larger types: show raw hex bytes
+        let hex = '';
+        for (let i = 0; i < size && (offset + i) < mem.length; i++) {
+            hex += (mem[offset + i] || 0).toString(16).toUpperCase().padStart(2, '0') + ' ';
+        }
+        valStr = hex.trim();
+    }
+    return valStr;
+}
+
+// Format a char/uchar byte array as a quoted ASCII string preview.
+// Non-printable bytes shown as dots.  Returns null if all zeros (empty).
+function formatCharArray(mem, offset, len) {
+    let allZero = true;
+    let str = '';
+    for (let i = 0; i < len && (offset + i) < mem.length; i++) {
+        const b = mem[offset + i] || 0;
+        if (b !== 0) allZero = false;
+        if (b === 0) break;           // null terminator — stop
+        str += (b >= 32 && b < 127) ? String.fromCharCode(b) : '.';
+    }
+    if (allZero) return '""';
+    return '"' + str + '"';
+}
+
+// Check whether a type name is a char/uchar scalar (for string preview)
+function isCharType(typeName) {
+    const t = typeName.toLowerCase();
+    return t === 'char' || t === 'uchar' || t === 'schar' || t === 'unsigned char' || t === 'signed char';
+}
+
+// Show a brief preview of a struct's first few fields
+function formatStructPreview(def, mem, offset) {
+    const parts = [];
+    for (let i = 0; i < Math.min(def.fields.length, 3); i++) {
+        const f = def.fields[i];
+        if (f.size <= 2 && !f.type.match(/\[/)) {
+            const val = formatScalar(f.type, mem, offset + f.offset, f.size);
+            parts.push(f.name + '=' + val.split(' ')[0]); // just the hex part
+        }
+    }
+    return parts.length > 0 ? '{' + parts.join(', ') + '}' : '{...}';
+}
+
+// Exact-match lookup in lineTable: returns {file, line} only if the address
+// has an entry at that precise address.  Used by readAllSymbols for symbol
+// browser — unlike sourceFor(), this never returns a fuzzy/nearby match.
+function exactLineSource(addr) {
+    if (lineTable.length === 0) return null;
+    let lo = 0, hi = lineTable.length - 1;
+    while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (lineTable[mid].addr === addr) return lineTable[mid];
+        if (lineTable[mid].addr < addr) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return null;
+}
+
+// Check if a file path looks like a build artifact (linked.s, etc.)
+function isBuildArtifact(filePath) {
+    const base = path.basename(filePath).toLowerCase();
+    return base === 'linked.s' || base === 'linked.asm';
+}
+
+// addrSource lookup that skips build artifacts
+function nonArtifactSource(addr) {
+    const src = addrSource.get(addr);
+    if (src && !isBuildArtifact(src.file)) return src;
+    return null;
+}
+
+// Find the address of the next different source line in the line table.
+// lineTable is sorted by addr. Find entries for the same file with a
+// different line number whose addr > pc. Returns -1 if not found.
+function findNextSourceLineAddr(pc, file, line) {
+    // Binary search for first entry with addr > pc
+    let lo = 0, hi = lineTable.length - 1, startIdx = lineTable.length;
+    while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (lineTable[mid].addr <= pc) { lo = mid + 1; }
+        else { startIdx = mid; hi = mid - 1; }
+    }
+    // Scan forward for the first entry with a different line in the same file
+    for (let i = startIdx; i < lineTable.length; i++) {
+        const e = lineTable[i];
+        if (e.file === file && e.line !== line) return e.addr;
+        // If we hit a different file, stop looking
+        if (e.file !== file) break;
+    }
+    return -1;
+}
+
+// Check if any user-set breakpoint already exists at this address
+function isBreakpointAt(addr) {
+    for (const [, bp] of bps)  { if (bp.addr === addr) return true; }
+    for (const [, bp] of ibps) { if (bp.addr === addr) return true; }
+    for (const [, arr] of srcBps) { for (const bp of arr) { if (bp.addr === addr) return true; } }
+    return false;
+}
+
+// Resolve a source file+line to an address using the #LINES table.
+// Prefers the next executable line at/after reqLine, else the nearest before.
+function resolveSrcLineAddr(file, reqLine) {
+    const norm = path.resolve(file).toLowerCase();
+    let afterAddr = -1, afterLine = Infinity;
+    let beforeAddr = -1, beforeLine = -1;
+    for (const entry of lineTable) {
+        if (path.resolve(entry.file).toLowerCase() !== norm) continue;
+        if (entry.line >= reqLine && entry.line < afterLine) { afterLine = entry.line; afterAddr = entry.addr; }
+        if (entry.line <= reqLine && entry.line > beforeLine) { beforeLine = entry.line; beforeAddr = entry.addr; }
+    }
+    return afterAddr >= 0 ? afterAddr : beforeAddr;
+}
+
+// Arm a Turbo Run: optional one-shot breakpoint at addr, then enable warp,
+// remembering the prior warp state so onStopReply_emit can restore it.
+async function armTurbo(addr) {
+    if (addr >= 0 && !isBreakpointAt(addr)) {
+        await gdbCmd('Z0,' + addr.toString(16) + ',1');
+        tempStepBp = addr;
+    }
+    const prev = await gdbCmd('qOricWarp');
+    turboPrevWarp = (prev === '1');
+    await gdbCmd('qOricWarp,1');
+    turboWarpActive = true;
 }
 
 // Resolve address to nearest symbol label
@@ -651,15 +1069,10 @@ async function buildCallStack() {
     const stackSize = 0xFF - sp;
     if (stackSize < 2) return [];
 
-    // Read stack bytes — single GDB command
+    // Read stack bytes — uses readMem (which has per-stop dedup cache)
     const stackAddr = 0x0100 + sp + 1;
     const readSize = Math.min(stackSize, 64);
-    const reply = await gdbCmd('m' + stackAddr.toString(16) + ',' + readSize.toString(16));
-    if (!reply || reply[0] === 'E') return [];
-
-    const stk = [];
-    for (let i = 0; i < reply.length; i += 2)
-        stk.push(parseInt(reply.substring(i, i + 2), 16));
+    const stk = await readMem(stackAddr, readSize);
 
     // Collect all candidate JSR addresses for bulk verification
     const candidates = [];
@@ -679,15 +1092,10 @@ async function buildCallStack() {
     const maxAddr = Math.max(...candidates.map(c => c.jsrAddr));
     const rangeSize = maxAddr - minAddr + 1;
 
-    let verifyMap = null;
+    let verifyMem = null;
     if (rangeSize <= 4096) {
-        // Reasonable range — read in one shot
-        const vReply = await gdbCmd('m' + minAddr.toString(16) + ',' + rangeSize.toString(16));
-        if (vReply && vReply[0] !== 'E') {
-            verifyMap = new Map();
-            for (let i = 0; i < vReply.length; i += 2)
-                verifyMap.set(minAddr + i / 2, parseInt(vReply.substring(i, i + 2), 16));
-        }
+        // Reasonable range — read in one shot (uses readMem for dedup cache)
+        verifyMem = await readMem(minAddr, rangeSize);
     }
 
     // Greedy scan using bulk-fetched verification data
@@ -700,8 +1108,8 @@ async function buildCallStack() {
         const jsrAddr = (retAddr - 3) & 0xFFFF;
 
         if (retAddr > 0x01FF && retAddr < 0xFFF0) {
-            const opcode = verifyMap ? verifyMap.get(jsrAddr) : undefined;
-            if (opcode === 0x20 || !verifyMap) {
+            const opcode = verifyMem ? verifyMem[jsrAddr - minAddr] : undefined;
+            if (opcode === 0x20 || !verifyMem) {
                 frames.push(retAddr);
                 pos += 2;
                 continue;
@@ -773,12 +1181,32 @@ async function buildDisasmCache(centerAddr) {
     const ei = Math.min(insts.length, pivotIdx + DISASM_CONTEXT + 1);
     const window = insts.slice(si, ei);
 
-    // Build content and address→line map
+    // Build content and address→line map, interleaving C source context
     const lines = [];
     const lineForAddr = new Map();
     let lineNum = 1; // 1-based
+    let lastCContext = null; // track current C source context
     for (const inst of window) {
         const ah = inst.addr.toString(16).toUpperCase().padStart(4, '0');
+        // Check for C source context change (from line table)
+        const srcInfo = sourceFor(inst.addr);
+        if (srcInfo && /\.[cC]$/i.test(srcInfo.file)) {
+            const cKey = srcInfo.file + ':' + srcInfo.line;
+            if (cKey !== lastCContext) {
+                lastCContext = cKey;
+                const resolvedPath = path.isAbsolute(srcInfo.file) ? srcInfo.file
+                    : config.sourceRoot ? path.resolve(config.sourceRoot, srcInfo.file)
+                    : config.workspaceFolder ? path.resolve(config.workspaceFolder, srcInfo.file)
+                    : srcInfo.file;
+                const cText = getSourceLine(resolvedPath, srcInfo.line);
+                const cLabel = path.basename(srcInfo.file) + ':' + srcInfo.line;
+                const comment = cText != null
+                    ? '; --- ' + cLabel + ': ' + cText.trim() + ' ---'
+                    : '; --- ' + cLabel + ' ---';
+                lines.push(comment);
+                lineNum++;
+            }
+        }
         if (inst.sym) { lines.push(inst.sym + ':'); lineNum++; }
         lineForAddr.set(inst.addr, lineNum);
         lines.push(ah + '  ' + inst.bytes.padEnd(9) + ' ' + inst.text);
@@ -800,9 +1228,12 @@ async function buildDisasmCache(centerAddr) {
 // DAP request dispatcher
 // ----------------------------------------------------------------
 
+// DAP commands that are sent automatically by VS Code on every stop — suppress from verbose log
+const dapQuietCmds = new Set(['threads', 'scopes', 'variables', 'stackTrace']);
+
 function handleDap(msg) {
     if (msg.type !== 'request') return;
-    logVerbose('[DAP] ← ' + msg.command);
+    if (!dapQuietCmds.has(msg.command)) logVerbose('[DAP] ← ' + msg.command);
     const h = handlers[msg.command];
     if (h) {
         Promise.resolve(h(msg)).catch(e => {
@@ -995,6 +1426,18 @@ const handlers = {
         configDone = true;
         respond(req);
 
+        // Turbo Run To on launch: warp through startup to a target symbol
+        if (config.turboRunTo) {
+            const taddr = symbols.has(config.turboRunTo) ? symbols.get(config.turboRunTo) : -1;
+            if (taddr >= 0) {
+                log('configurationDone: turbo run to ' + config.turboRunTo + ' ($' + taddr.toString(16) + ')');
+                pendingStop = null;
+                armTurbo(taddr).then(() => whenGdbIdle(() => { running = true; gdbWrite('c'); }));
+                return;
+            }
+            log('configurationDone: turboRunTo "' + config.turboRunTo + '" not in symbols; normal start');
+        }
+
         function doContinue() {
             log('Free-run: sending GDB continue');
             running = true;
@@ -1155,7 +1598,15 @@ const handlers = {
         }
 
         // Frame 0: current PC
-        const stackFrames = [makeFrame(0, pc)];
+        const topFrame = makeFrame(0, pc);
+        // If the top frame only has a virtual disassembly source (no real file),
+        // strip it so VS Code doesn't auto-open a "Disassembly" text tab.
+        // The custom Oric Disassembly webview panel handles this instead.
+        if (topFrame.source && topFrame.source.sourceReference && !topFrame.source.path) {
+            delete topFrame.source;
+            topFrame.line = 0;
+        }
+        const stackFrames = [topFrame];
 
         // Walk the hardware stack to find JSR return addresses
         const returnAddrs = await buildCallStack();
@@ -1178,6 +1629,12 @@ const handlers = {
         ];
         if (zpSymbols.length > 0) {
             scopes.push({ name: 'Zero Page', variablesReference: 3, expensive: false });
+        }
+        if (varTypes.size > 0) {
+            scopes.push({ name: 'Globals', variablesReference: 4, expensive: true });
+        }
+        if (localDefs.size > 0) {
+            scopes.push({ name: 'Locals', variablesReference: 5, expensive: true });
         }
         respond(req, { scopes: scopes });
     },
@@ -1232,6 +1689,170 @@ const handlers = {
                     val = '$' + zp[a].toString(16).toUpperCase().padStart(2, '0') + ' (' + zp[a] + ')';
                 }
                 vars.push({ name: hAddr + ' ' + s.name, value: val, variablesReference: 0 });
+            }
+            respond(req, { variables: vars });
+        } else if (ref === 4) {
+            // Globals — typed variables from #TYPES section
+            const vars = [];
+            for (const [asmName, vt] of varTypes) {
+                const addr = symbols.get(asmName);
+                if (typeof addr !== 'number') continue;
+                const hAddr = '$' + addr.toString(16).toUpperCase().padStart(4, '0');
+                const def = typeDefs.get(vt.base);
+                // Expandable if it's a known struct or an array
+                if (def || vt.count > 1) {
+                    const childRef = nextVarRef++;
+                    varRefs.set(childRef, { addr, typeName: vt.base, count: vt.count, totalSize: vt.totalSize });
+                    // For char/uchar array globals, show inline string preview
+                    let gVal = vt.type + '  @ ' + hAddr;
+                    if (vt.count > 1 && isCharType(vt.base)) {
+                        const mem = await readMem(addr, vt.totalSize);
+                        const strPreview = formatCharArray(mem, 0, vt.count);
+                        gVal = strPreview + '  ' + vt.type + '  @ ' + hAddr;
+                    }
+                    vars.push({
+                        name: asmName,
+                        value: gVal,
+                        variablesReference: childRef
+                    });
+                } else {
+                    // Scalar — read and display inline
+                    const mem = await readMem(addr, vt.totalSize);
+                    vars.push({
+                        name: asmName,
+                        value: formatScalar(vt.base, mem, 0, vt.totalSize) + '  ' + vt.type + '  @ ' + hAddr,
+                        variablesReference: 0
+                    });
+                }
+            }
+            respond(req, { variables: vars });
+        } else if (ref === 5) {
+            // Locals — variables local to the current function
+            const vars = [];
+            if (regs) {
+                const func = currentFunction(regs.pc);
+                const locals = func ? localDefs.get(func) : null;
+                if (locals && locals.length > 0) {
+                    // Read fp and ap ZP pointers
+                    const fpAddr = symbols.get('fp');
+                    const apAddr = symbols.get('ap');
+                    let fpVal = 0, apVal = 0;
+                    if (typeof fpAddr === 'number') {
+                        const m = await readMem(fpAddr, 2);
+                        fpVal = m[0] | (m[1] << 8);
+                    }
+                    if (typeof apAddr === 'number') {
+                        const m = await readMem(apAddr, 2);
+                        apVal = m[0] | (m[1] << 8);
+                    }
+                    for (const loc of locals) {
+                        const baseVal = loc.base === 'ap' ? apVal : fpVal;
+                        const addr = (baseVal + loc.offset) & 0xFFFF;
+                        const hAddr = '$' + addr.toString(16).toUpperCase().padStart(4, '0');
+                        const def = typeDefs.get(loc.baseType);
+                        if (def || loc.count > 1) {
+                            const childRef = nextVarRef++;
+                            varRefs.set(childRef, { addr, typeName: loc.baseType, count: loc.count, totalSize: loc.size });
+                            let lVal = loc.type + '  @ ' + hAddr;
+                            if (loc.count > 1 && isCharType(loc.baseType)) {
+                                const mem = await readMem(addr, loc.size);
+                                const strPreview = formatCharArray(mem, 0, loc.count);
+                                lVal = strPreview + '  ' + loc.type + '  @ ' + hAddr;
+                            }
+                            vars.push({
+                                name: loc.cname,
+                                value: lVal,
+                                variablesReference: childRef
+                            });
+                        } else {
+                            const mem = await readMem(addr, loc.size);
+                            vars.push({
+                                name: loc.cname,
+                                value: formatScalar(loc.type, mem, 0, loc.size) + '  ' + loc.type + '  @ ' + hAddr,
+                                variablesReference: 0
+                            });
+                        }
+                    }
+                }
+            }
+            respond(req, { variables: vars });
+        } else if (varRefs.has(ref)) {
+            // Expand a typed variable (struct fields or array elements)
+            const info = varRefs.get(ref);
+            const def = typeDefs.get(info.typeName);
+            const vars = [];
+
+            if (info.count > 1 && def) {
+                // Array of structs — show indexed elements
+                const totalBytes = info.count * def.size;
+                const mem = await readMem(info.addr + (info.offset || 0), totalBytes);
+                for (let i = 0; i < info.count; i++) {
+                    const elemAddr = info.addr + (info.offset || 0) + i * def.size;
+                    const hAddr = '$' + elemAddr.toString(16).toUpperCase().padStart(4, '0');
+                    const childRef = nextVarRef++;
+                    varRefs.set(childRef, { addr: info.addr, typeName: info.typeName, count: 1, offset: (info.offset || 0) + i * def.size });
+                    // Show first field as preview
+                    const preview = formatStructPreview(def, mem, i * def.size);
+                    vars.push({
+                        name: '[' + i + ']',
+                        value: preview + '  @ ' + hAddr,
+                        variablesReference: childRef
+                    });
+                }
+            } else if (info.count > 1) {
+                // Array of scalars
+                const elemSize = Math.max(1, Math.floor((info.totalSize || info.count) / info.count));
+                const totalBytes = info.count * elemSize;
+                const mem = await readMem(info.addr + (info.offset || 0), totalBytes);
+                // For char/uchar arrays, show a string preview as first entry
+                if (isCharType(info.typeName) && elemSize === 1) {
+                    const preview = formatCharArray(mem, 0, info.count);
+                    vars.push({ name: '[string]', value: preview, variablesReference: 0 });
+                }
+                for (let i = 0; i < info.count; i++) {
+                    const elemAddr = info.addr + (info.offset || 0) + i * elemSize;
+                    const hAddr = '$' + elemAddr.toString(16).toUpperCase().padStart(4, '0');
+                    vars.push({
+                        name: '[' + i + ']',
+                        value: formatScalar(info.typeName, mem, i * elemSize, elemSize) + '  @ ' + hAddr,
+                        variablesReference: 0
+                    });
+                }
+            } else if (def) {
+                // Single struct — show fields
+                const mem = await readMem(info.addr + (info.offset || 0), def.size);
+                for (const f of def.fields) {
+                    const fieldAddr = info.addr + (info.offset || 0) + f.offset;
+                    const hAddr = '$' + fieldAddr.toString(16).toUpperCase().padStart(4, '0');
+                    const fDef = typeDefs.get(f.type.replace(/\[\d+\]$/, ''));
+                    const am = f.type.match(/^(.+)\[(\d+)\]$/);
+                    if (fDef || am) {
+                        // Nested struct or array field — expandable
+                        const childRef = nextVarRef++;
+                        const baseName = am ? am[1] : f.type;
+                        const cnt = am ? parseInt(am[2], 10) : 1;
+                        varRefs.set(childRef, { addr: info.addr, typeName: baseName, count: cnt, offset: (info.offset || 0) + f.offset });
+                        // For char/uchar array fields, show inline string preview
+                        let fVal = f.type + '  @ ' + hAddr;
+                        if (am && isCharType(am[1]) && f.size > 0) {
+                            const strPreview = formatCharArray(mem, f.offset, f.size);
+                            fVal = strPreview + '  ' + f.type + '  @ ' + hAddr;
+                        }
+                        vars.push({
+                            name: f.name,
+                            value: fVal,
+                            variablesReference: childRef
+                        });
+                    } else {
+                        vars.push({
+                            name: f.name,
+                            value: formatScalar(f.type, mem, f.offset, f.size) + '  ' + f.type + '  @ ' + hAddr,
+                            variablesReference: 0
+                        });
+                    }
+                }
+            } else {
+                respond(req, { variables: [] }); return;
             }
             respond(req, { variables: vars });
         } else {
@@ -1350,7 +1971,25 @@ const handlers = {
 
     // -- Execution control ----------------------------------------
 
-    continue(req) {
+    async continue(req) {
+        // If PC is sitting on a breakpoint, single-step past it first,
+        // then continue via the continueAfterStep flag in onStopReply
+        if (regs && regs.pc !== undefined) {
+            const pc = regs.pc;
+            let onBp = false;
+            for (const [, bp] of bps)    { if (bp.addr === pc) { onBp = true; break; } }
+            if (!onBp) for (const [, bp] of ibps)   { if (bp.addr === pc) { onBp = true; break; } }
+            if (!onBp) for (const [, arr] of srcBps) { for (const bp of arr) { if (bp.addr === pc) { onBp = true; break; } } if (onBp) break; }
+            if (onBp) {
+                continueAfterStep = true;
+                regs = null;
+                respond(req, { allThreadsContinued: true });
+                running = true;
+                gdbWrite('s'); // step past BP; onStopReply will issue 'c'
+                evt('continued', { threadId: 1, allThreadsContinued: true });
+                return;
+            }
+        }
         regs = null;
         respond(req, { allThreadsContinued: true });
         running = true;
@@ -1358,14 +1997,63 @@ const handlers = {
         evt('continued', { threadId: 1, allThreadsContinued: true });
     },
 
-    next(req) {
+    async next(req) {
+        const granularity = (req.arguments && req.arguments.granularity) || 'statement';
+        logVerbose('next: granularity=' + granularity);
+        const src = regs ? sourceFor(regs.pc) : null;
+        // Source-level step-over: set temp breakpoint on next C line, then continue
+        if (granularity === 'statement' && src && /\.[cC]$/i.test(src.file)) {
+            const nextAddr = findNextSourceLineAddr(regs.pc, src.file, src.line);
+            if (nextAddr >= 0) {
+                const alreadySet = isBreakpointAt(nextAddr);
+                if (!alreadySet) await gdbCmd('Z0,' + nextAddr.toString(16) + ',1');
+                tempStepBp = alreadySet ? -1 : nextAddr;
+                // If PC is on a breakpoint, step past it first (onStopReply will 'c')
+                const onBp = isBreakpointAt(regs.pc);
+                regs = null;
+                respond(req);
+                running = true;
+                if (onBp) {
+                    continueAfterStep = true;
+                    gdbWrite('s'); // step past BP; onStopReply issues 'c'
+                } else {
+                    gdbWrite('c');
+                }
+                evt('continued', { threadId: 1, allThreadsContinued: true });
+                return;
+            }
+            // Fallback: no next line found, do normal step-over
+        }
         regs = null;
         respond(req);
         running = true;
         gdbWrite('N');
     },
 
-    stepIn(req) {
+    async stepIn(req) {
+        const granularity = (req.arguments && req.arguments.granularity) || 'statement';
+        const src = regs ? sourceFor(regs.pc) : null;
+        // Source-level step-in: same as next for C lines (we don't have C-level call info)
+        if (granularity === 'statement' && src && /\.[cC]$/i.test(src.file)) {
+            const nextAddr = findNextSourceLineAddr(regs.pc, src.file, src.line);
+            if (nextAddr >= 0) {
+                const alreadySet = isBreakpointAt(nextAddr);
+                if (!alreadySet) await gdbCmd('Z0,' + nextAddr.toString(16) + ',1');
+                tempStepBp = alreadySet ? -1 : nextAddr;
+                const onBp = isBreakpointAt(regs.pc);
+                regs = null;
+                respond(req);
+                running = true;
+                if (onBp) {
+                    continueAfterStep = true;
+                    gdbWrite('s');
+                } else {
+                    gdbWrite('c');
+                }
+                evt('continued', { threadId: 1, allThreadsContinued: true });
+                return;
+            }
+        }
         regs = null;
         respond(req);
         running = true;
@@ -1604,6 +2292,18 @@ const handlers = {
                 };
                 const sym = addrSym.get(a);
                 if (sym) instr.symbol = sym;
+                // Attach source location for C files only — VS Code's built-in
+                // disassembly view interleaves source from location/line, which is
+                // redundant for assembly (the disassembly IS the assembly source).
+                const instrSrc = sourceFor(a);
+                if (instrSrc && /\.[cC]$/i.test(instrSrc.file)) {
+                    const fp = path.isAbsolute(instrSrc.file) ? instrSrc.file
+                        : config.sourceRoot ? path.resolve(config.sourceRoot, instrSrc.file)
+                        : config.workspaceFolder ? path.resolve(config.workspaceFolder, instrSrc.file)
+                        : instrSrc.file;
+                    instr.location = { name: path.basename(fp), path: fp };
+                    instr.line = instrSrc.line;
+                }
                 all.push(instr);
                 off += sz;
             } else {
@@ -1777,13 +2477,42 @@ const handlers = {
             return;
         }
 
-        // Try as bare symbol name
-        const a = symbols.get(expr);
+        // Try as bare symbol name (also try with _ prefix for C variables)
+        let symName = expr;
+        let a = symbols.get(symName);
+        if (a === undefined && !symName.startsWith('_')) {
+            symName = '_' + expr;
+            a = symbols.get(symName);
+        }
         if (a !== undefined) {
-            respond(req, {
-                result: '$' + a.toString(16).toUpperCase().padStart(4, '0'),
-                variablesReference: 0
-            });
+            const vt = varTypes.get(symName);
+            if (vt) {
+                const def = typeDefs.get(vt.base);
+                if (def || vt.count > 1) {
+                    const childRef = nextVarRef++;
+                    varRefs.set(childRef, { addr: a, typeName: vt.base, count: vt.count, totalSize: vt.totalSize });
+                    respond(req, {
+                        result: vt.type + '  @ $' + a.toString(16).toUpperCase().padStart(4, '0'),
+                        variablesReference: childRef
+                    });
+                } else {
+                    const mem = await readMem(a, vt.totalSize);
+                    respond(req, {
+                        result: formatScalar(vt.base, mem, 0, vt.totalSize) + '  ' + vt.type + '  @ $' + a.toString(16).toUpperCase().padStart(4, '0'),
+                        variablesReference: 0
+                    });
+                }
+            } else {
+                // No type info — read 1 or 2 bytes based on ZP vs RAM
+                const size = a <= 0xFF ? 2 : 2;
+                const mem = await readMem(a, size);
+                const w = mem[0] | (mem[1] << 8);
+                respond(req, {
+                    result: '$' + w.toString(16).toUpperCase().padStart(4, '0') + ' (' + w + ')  @ $' + a.toString(16).toUpperCase().padStart(4, '0'),
+                    variablesReference: 0,
+                    memoryReference: '0x' + a.toString(16)
+                });
+            }
             return;
         }
 
@@ -1805,8 +2534,9 @@ const handlers = {
             return;
         }
 
-        // Try qOricEval as fallback for watch expressions
-        {
+        // Try qOricEval as fallback for watch expressions.
+        // Skip expressions known to fail (cached from previous E02 responses).
+        if (!evalFailCache.has(expr)) {
             const hexExpr = Buffer.from(expr, 'utf8').toString('hex');
             const evalReply = await gdbCmd('qOricEval,' + hexExpr);
             if (evalReply && evalReply.startsWith('V')) {
@@ -1818,11 +2548,21 @@ const handlers = {
                 });
                 return;
             }
+            // Cache the failure so we don't re-query on every step
+            evalFailCache.add(expr);
+        }
+
+        // Display format toggle: hex / dec
+        if (expr === 'hex' || expr === 'dec') {
+            displayHex = (expr === 'hex');
+            respond(req, { result: 'Display format: ' + (displayHex ? 'hexadecimal' : 'decimal'), variablesReference: 0 });
+            evt('stopped', { reason: 'pause', threadId: 1, allThreadsStopped: true });
+            return;
         }
 
         // Help
         respond(req, {}, false,
-            'Commands: A/X/Y/SP/PC (read) | A=$xx (write) | skip | goto $ADDR | goto SYMBOL | x $ADDR [LEN] | w $ADDR $VAL | sym NAME | ! <mon cmd> | <symbol>');
+            'Commands: A/X/Y/SP/PC (read) | A=$xx (write) | skip | goto $ADDR | goto SYMBOL | x $ADDR [LEN] | w $ADDR $VAL | sym NAME | hex | dec | ! <mon cmd> | <symbol>');
     },
 
     // -- Custom requests (called from extension.js) -------------------
@@ -1915,6 +2655,20 @@ const handlers = {
         respond(req, { warp: newState });
     },
 
+    // -- Turbo Run Until (custom request) -----------------------------
+    // Run at warp speed to a target (symbol, file+line, or addr), or just
+    // warp-continue to the next breakpoint; warp is restored when we stop.
+    async turboRun(req) {
+        const a = (req && req.arguments) || {};
+        let addr = -1;
+        if (typeof a.addr === 'number') addr = a.addr & 0xffff;
+        else if (a.symbol && symbols.has(a.symbol)) addr = symbols.get(a.symbol);
+        else if (a.file && typeof a.line === 'number') addr = resolveSrcLineAddr(a.file, a.line);
+        if ((a.symbol || a.file) && addr < 0) { respond(req, {}, false, 'Turbo target not found'); return; }
+        await armTurbo(addr);
+        return handlers.continue(req); // responds + issues continue (handles PC-on-BP)
+    },
+
     // -- Reset cycle counter (custom request) -------------------------
 
     async resetCycles(req) {
@@ -1965,17 +2719,33 @@ const handlers = {
             if (endPage !== page) pages.add(endPage);
         }
 
-        // Batch-read each page
-        const mem = new Map(); // page -> Uint8Array(256)
+        // Group contiguous pages into ranges for batch reading
         const pageArr = Array.from(pages).sort((a, b) => a - b);
-        for (const page of pageArr) {
-            const baseAddr = page << 8;
-            const reply = await gdbCmd('m' + baseAddr.toString(16) + ',100');
+        const ranges = [];
+        for (let i = 0; i < pageArr.length; ) {
+            const start = pageArr[i];
+            let end = start;
+            while (i + 1 < pageArr.length && pageArr[i + 1] === end + 1 && end - start < 31) {
+                end = pageArr[++i];
+            }
+            ranges.push({ start, count: end - start + 1 });
+            i++;
+        }
+
+        // Batch-read each contiguous range (one GDB read per range instead of per page)
+        const mem = new Map(); // page -> Uint8Array(256)
+        for (const range of ranges) {
+            const baseAddr = range.start << 8;
+            const byteLen = Math.min(range.count * 256, 0x10000 - baseAddr);
+            const reply = await gdbCmd('m' + baseAddr.toString(16) + ',' + byteLen.toString(16));
             if (reply && reply[0] !== 'E') {
-                const bytes = new Uint8Array(256);
-                for (let i = 0; i < reply.length && i < 512; i += 2)
-                    bytes[i >> 1] = parseInt(reply.substring(i, i + 2), 16);
-                mem.set(page, bytes);
+                for (let p = 0; p < range.count; p++) {
+                    const pageData = new Uint8Array(256);
+                    const hexOff = p * 512;
+                    for (let i = 0; i < 512 && hexOff + i < reply.length; i += 2)
+                        pageData[i >> 1] = parseInt(reply.substring(hexOff + i, hexOff + i + 2), 16);
+                    mem.set(range.start + p, pageData);
+                }
             }
         }
 
@@ -2012,17 +2782,33 @@ const handlers = {
             } else {
                 s.names.sort((a, b) => a.length - b.length);
             }
-            // Build per-name source locations
+            // Build per-name source locations.
+            // Use exact lineTable match (from #LINES) first — it points to real
+            // source files.  Fall back to symSource (V2 per-symbol info) only if
+            // it doesn't reference a build artifact like linked.s.
+            // sourceFor() is NOT used here because its fuzzy nearest-address
+            // matching produces garbage for ZP/data symbols that have no code.
             const nameSources = {};
             for (const n of s.names) {
-                const ns = symSource.get(n);
-                if (ns) nameSources[n] = { file: ns.file, line: ns.line };
+                const addr = symbols.get(n);
+                const lt = (typeof addr === 'number') ? exactLineSource(addr) : null;
+                if (lt) {
+                    nameSources[n] = { file: lt.file, line: lt.line };
+                } else {
+                    const ns = symSource.get(n);
+                    if (ns && !isBuildArtifact(ns.file)) {
+                        nameSources[n] = { file: ns.file, line: ns.line };
+                    }
+                }
             }
-            const src = addrSource.get(s.addr);
+            const src = exactLineSource(s.addr) || nonArtifactSource(s.addr);
+            const vt = varTypes.get(s.names[0]);
             result.push({ name: s.names[0], aliases: s.names.slice(1),
-                          addr: s.addr, size: s.size, value, group: s.group,
+                          addr: s.addr, size: vt ? vt.totalSize : s.size, value, group: s.group,
                           source: src ? { file: src.file, line: src.line } : null,
-                          nameSources });
+                          nameSources,
+                          typeInfo: vt ? { type: vt.type, base: vt.base, count: vt.count,
+                                          fields: typeDefs.has(vt.base) ? typeDefs.get(vt.base).fields : null } : null });
         }
 
         respond(req, { symbols: result });
@@ -2101,12 +2887,11 @@ const handlers = {
     async resolveInstruction(req) {
         if (!regs) { respond(req, { annotation: '', pc: 0 }); return; }
         const pc = regs.pc;
-        // Read 3 bytes at PC
-        const raw = await gdbCmd('m' + pc.toString(16) + ',3');
-        if (!raw || raw[0] === 'E') { respond(req, { annotation: '', pc }); return; }
-        const opcode = parseInt(raw.substring(0, 2), 16);
-        const lo = raw.length >= 4 ? parseInt(raw.substring(2, 4), 16) : 0;
-        const hi = raw.length >= 6 ? parseInt(raw.substring(4, 6), 16) : 0;
+        // Read 3 bytes at PC (uses readMem for per-stop dedup cache)
+        const pcBytes = await readMem(pc, 3);
+        const opcode = pcBytes[0];
+        const lo = pcBytes[1];
+        const hi = pcBytes[2];
         const op = OPS[opcode];
         if (!op) { respond(req, { annotation: '', pc }); return; }
         const mne = op.substring(0, 3);
@@ -2116,16 +2901,15 @@ const handlers = {
         const h4 = v => (v & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
         const sym = addr => addrSym.get(addr);
 
-        // Helper to read 1 byte from memory
+        // Helper to read 1 byte from memory (uses readMem for dedup cache)
         async function readByte(addr) {
-            const r = await gdbCmd('m' + (addr & 0xFFFF).toString(16) + ',1');
-            return (r && r[0] !== 'E') ? parseInt(r.substring(0, 2), 16) : 0;
+            const m = await readMem(addr & 0xFFFF, 1);
+            return m[0];
         }
         // Helper to read 2 bytes (little-endian word) from memory
         async function readWord(addr) {
-            const r = await gdbCmd('m' + (addr & 0xFFFF).toString(16) + ',2');
-            if (!r || r[0] === 'E') return 0;
-            return parseInt(r.substring(0, 2), 16) | (parseInt(r.substring(2, 4), 16) << 8);
+            const m = await readMem(addr & 0xFFFF, 2);
+            return m[0] | (m[1] << 8);
         }
 
         let annotation = '';
@@ -2237,6 +3021,126 @@ const handlers = {
             file: src ? src.file : null,
             line: src ? src.line : 0
         });
+    },
+
+    // -- Disassemble a range of memory (custom request) ---------------
+
+    async disassembleRange(req) {
+        const args = req.arguments || {};
+        const pc = regs ? regs.pc : 0;
+        const count = args.count || 64;
+        const before = args.before || 24;
+
+        // Determine center address
+        let center = (typeof args.address === 'number') ? args.address : pc;
+
+        // We need to read enough bytes before the center to decode `before` instructions.
+        // Worst case: 3 bytes per 6502 instruction, so read 3*before bytes before center.
+        const preBytes = before * 3;
+        const startAddr = Math.max(0, center - preBytes);
+        const totalBytes = Math.min(preBytes + count * 3, 0x10000 - startAddr);
+
+        const reply = await gdbCmd('m' + startAddr.toString(16) + ',' + totalBytes.toString(16));
+        if (!reply || reply[0] === 'E') {
+            respond(req, { instructions: [], pc, breakpoints: [] });
+            return;
+        }
+
+        // Parse hex into byte array
+        const mem = new Uint8Array(totalBytes);
+        for (let i = 0; i < reply.length && i / 2 < totalBytes; i += 2)
+            mem[i / 2] = parseInt(reply.substring(i, i + 2), 16);
+
+        // Disassemble all bytes from startAddr
+        const allInsns = [];
+        let addr = startAddr;
+        while (addr < startAddr + totalBytes) {
+            const off = addr - startAddr;
+            const opcode = mem[off];
+            const entry = OPS[opcode];
+            if (!entry) {
+                // Illegal opcode — emit as data byte
+                allInsns.push({ address: addr, bytes: [opcode], mnemonic: '???', operand: '$' + opcode.toString(16).toUpperCase().padStart(2, '0'), label: addrSym.get(addr) || null });
+                addr++;
+                continue;
+            }
+            const mnem = entry.substring(0, 3);
+            const mode = entry[3];
+            const size = opSize(mode);
+            if (off + size > totalBytes) break; // not enough bytes
+            const lo = size > 1 ? mem[off + 1] : 0;
+            const hi = size > 2 ? mem[off + 2] : 0;
+            const bytesArr = [];
+            for (let b = 0; b < size; b++) bytesArr.push(mem[off + b]);
+            const operand = fmtOp(mode, lo, hi, addr, addrSym);
+            allInsns.push({ address: addr, bytes: bytesArr, mnemonic: mnem, operand, label: addrSym.get(addr) || null });
+            addr += size;
+        }
+
+        // Find the instruction at or closest-before center
+        let centerIdx = 0;
+        for (let i = 0; i < allInsns.length; i++) {
+            if (allInsns[i].address <= center) centerIdx = i;
+            else break;
+        }
+
+        // Extract window: `before` instructions before center, then enough to fill `count`
+        const windowStart = Math.max(0, centerIdx - before);
+        const windowEnd = Math.min(allInsns.length, windowStart + count);
+        const instructions = allInsns.slice(windowStart, windowEnd);
+
+        // Collect all breakpoint addresses
+        const bpAddrs = [];
+        for (const [, bp] of bps) bpAddrs.push(bp.addr);
+        for (const [, bp] of ibps) bpAddrs.push(bp.addr);
+        for (const [, fileBps] of srcBps) {
+            for (const bp of fileBps) bpAddrs.push(bp.addr);
+        }
+
+        respond(req, { instructions, pc, breakpoints: bpAddrs });
+    },
+
+    // -- Toggle instruction breakpoint (custom request) ---------------
+
+    async toggleInstructionBreakpoint(req) {
+        const args = req.arguments || {};
+        const addr = args.address;
+        if (typeof addr !== 'number') {
+            respond(req, { set: false, address: 0 }, false, 'address required');
+            return;
+        }
+
+        // Check if there's already an instruction breakpoint at this address
+        let existingId = null;
+        for (const [id, bp] of ibps) {
+            if (bp.addr === addr) { existingId = id; break; }
+        }
+
+        if (existingId !== null) {
+            // Remove it
+            await gdbCmd('z0,' + addr.toString(16) + ',1');
+            ibps.delete(existingId);
+            // Notify VS Code so the breakpoints view stays in sync
+            sendDap({ type: 'event', event: 'breakpoint', body: {
+                reason: 'removed', breakpoint: { id: existingId, verified: false }
+            }});
+            respond(req, { set: false, address: addr });
+        } else {
+            // Set it
+            const r = await gdbCmd('Z0,' + addr.toString(16) + ',1');
+            const ok = r === 'OK';
+            if (ok) {
+                const id = bpId++;
+                ibps.set(id, { id, addr });
+                sendDap({ type: 'event', event: 'breakpoint', body: {
+                    reason: 'new', breakpoint: {
+                        id, verified: true,
+                        instructionReference: '0x' + addr.toString(16).padStart(4, '0')
+                    }
+                }});
+            }
+            respond(req, { set: ok, address: addr });
+        }
     },
 
     // -- Get last cycle annotation (custom request) -------------------

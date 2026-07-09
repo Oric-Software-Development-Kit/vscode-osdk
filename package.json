@@ -37,7 +37,8 @@
         "onCommand:oric-debug.showCurrentLocation",
         "onWebviewPanel:oricHeatmap",
         "onWebviewPanel:oricScreenView",
-        "onWebviewPanel:oricSymbols"
+        "onWebviewPanel:oricSymbols",
+        "onWebviewPanel:oricDisassembly"
     ],
     "main": "./extension.js",
     "configurationDefaults": {
@@ -127,9 +128,26 @@
                 "title": "Oric: Symbol Browser"
             },
             {
+                "command": "oric-debug.openDisassembly",
+                "title": "Oric: Disassembly View"
+            },
+            {
+                "command": "oric-debug.stepOverInstruction",
+                "title": "Oric: Step Over (Instruction)"
+            },
+            {
+                "command": "oric-debug.stepIntoInstruction",
+                "title": "Oric: Step Into (Instruction)"
+            },
+            {
                 "command": "oric-debug.showCurrentLocation",
                 "title": "Oric: Show Current Location",
                 "icon": "$(debug-stackframe)"
+            },
+            {
+                "command": "oric-debug.turboRunToCursor",
+                "title": "Oric: Turbo Run to Cursor",
+                "icon": "$(run-all)"
             },
             {
                 "command": "osdk.xaReference",
@@ -160,6 +178,16 @@
                 "command": "oric-debug.showCurrentLocation",
                 "key": "ctrl+alt+home",
                 "when": "debugType == 'oric-debug' && debugState == 'stopped'"
+            },
+            {
+                "command": "oric-debug.stepOverInstruction",
+                "key": "f10",
+                "when": "activeWebviewPanelId == 'oricDisassembly' && debugType == 'oric-debug' && debugState == 'stopped'"
+            },
+            {
+                "command": "oric-debug.stepIntoInstruction",
+                "key": "f11",
+                "when": "activeWebviewPanelId == 'oricDisassembly' && debugType == 'oric-debug' && debugState == 'stopped'"
             }
         ],
         "menus": {
@@ -178,6 +206,10 @@
                 },
                 {
                     "command": "oric-debug.showCurrentLocation",
+                    "when": "debugType == 'oric-debug' && debugState == 'stopped'"
+                },
+                {
+                    "command": "oric-debug.turboRunToCursor",
                     "when": "debugType == 'oric-debug' && debugState == 'stopped'"
                 }
             ]
@@ -262,6 +294,10 @@
                                 "type": "number",
                                 "description": "Debug log verbosity: 0=errors, 1=normal, 2=verbose",
                                 "default": 1
+                            },
+                            "turboRunTo": {
+                                "type": "string",
+                                "description": "Symbol to warp (max-speed) fast-forward to on launch, e.g. a game or module entry label"
                             },
                             "build": {
                                 "type": "object",
