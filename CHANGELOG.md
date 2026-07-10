@@ -2,6 +2,14 @@
 
 ## 0.0.4
 
+### Transparent Module-Load Breakpoint Arming
+- A hidden write-watchpoint on `_osdk_dbg_module` detects overlay module switches during free-run and arms the incoming module's breakpoints *before* its code runs — so a breakpoint set in a not-yet-loaded overlay fires the first time that overlay loads
+- The watchpoint stop is handled invisibly (single-step to commit the write, then resume), so a routine that merely touches the flag never surfaces as a stop
+- Module state is write-driven and trust-gated: at cold boot the byte is uninitialized RAM, so the extension shows "Module: (none)" and doesn't believe the value until an actual write is observed (or when attaching to a running program). No overlay is presumed active until one truly loads
+
+### Warp Speed Indicator
+- The debug toolbar warp button now reflects the current speed: `$(watch)` at normal speed, `$(rocket)` in warp
+
 ### Multi-Module Symbols (overlay support)
 - Symbol files with `#MODULE <id> <name>` sections load into per-module buckets; resident symbols compose with the active module
 - Active module auto-switches from the resident `_osdk_dbg_module` byte on each stop; status bar shows "Module: <name>" (click to override)

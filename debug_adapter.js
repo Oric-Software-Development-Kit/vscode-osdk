@@ -100,6 +100,8 @@ function gdbConnect(host, port) {
         const s = net.createConnection({ host: host, port: port }, () => {
             sock = s;
             armedAddrs.clear(); // fresh session: the stub holds no breakpoints yet
+            moduleWatchAddr = -1;
+            moduleWatchPending = false;
             resolve();
         });
         s.setEncoding('latin1');
@@ -249,6 +251,10 @@ let pendingStop = null;       // deferred stopped event body
 let srcBps     = new Map();   // file -> [{id, addr}] (source breakpoints per file)
 let dataBps    = new Map();   // id -> { addr, accessType, gdbType } (data breakpoints)
 let armedAddrs = new Map();   // addr -> refcount of execution breakpoints armed in the stub
+let moduleWatchAddr = -1;     // addr of the hidden _osdk_dbg_module write-watch (-1 = none); arms overlays on load
+let moduleWatchPending = false; // true between the module-watch stop and the dobp=FALSE step that commits the write
+let moduleByteTrusted = false; // false until we KNOW _osdk_dbg_module is meaningful (a write was observed, or we attached to a running program). At cold boot the byte is uninitialized RAM — its value must not be believed.
+let resumeMode = 'run';       // 'run' | 'step' — how execution was last resumed (for transparent module switches)
 let gotoTargetMap = new Map(); // targetId -> address (for goto/setNextStatement)
 let lastCycleAnnotation = null; // { pc, cycles } from last step-over
 let launchedProcess = null;     // child_process handle if we launched Oricutron
@@ -414,6 +420,17 @@ function listModules() {
 async function checkModuleSwitch() {
     if (moduleNames.size === 0) return;
     if (pendingResolve) return; // a command is already in flight; skip to avoid queueing behind it
+    // At cold boot the module byte is uninitialized RAM (could read as any value,
+    // including a valid id like 0). Don't believe it until a write has been observed
+    // (moduleWatchPending path) or we attached to an already-running program. Until
+    // then, show "(none)" — no overlay is loaded yet.
+    if (!moduleByteTrusted) {
+        if (!moduleReported) {
+            evt('oricActiveModule', { id: null, name: '(none)' });
+            moduleReported = true;
+        }
+        return;
+    }
     const addr = symbols.get('_osdk_dbg_module');
     if (addr === undefined) return;
     const bytes = await readMem(addr & 0xffff, 1);
@@ -424,12 +441,14 @@ async function checkModuleSwitch() {
         log('Active module -> ' + moduleNames.get(val) + ' (id ' + val + ')');
         evt('oricActiveModule', { id: val, name: moduleNames.get(val) });
         moduleReported = true;
-    } else if (!moduleReported && activeModuleId !== null) {
-        // First stop of the session: the running module matches the default, so
-        // no switch fired — but the UI has never been told what's active. Surface
-        // it once so the status bar shows the current module from the start.
-        log('Active module = ' + moduleNames.get(activeModuleId) + ' (id ' + activeModuleId + ')');
-        evt('oricActiveModule', { id: activeModuleId, name: moduleNames.get(activeModuleId) });
+    } else if (!moduleReported) {
+        // First stop of the session: no switch fired, but the UI has never been
+        // told the state. Surface it once — including "(none)" when no overlay is
+        // loaded yet (byte still $ff) — so the status bar reflects reality from the
+        // start rather than staying blank.
+        const name = activeModuleId !== null ? moduleNames.get(activeModuleId) : '(none)';
+        log('Active module = ' + name + (activeModuleId !== null ? ' (id ' + activeModuleId + ')' : ''));
+        evt('oricActiveModule', { id: activeModuleId, name: name });
         moduleReported = true;
     }
 }
@@ -581,16 +600,20 @@ function loadSymbols(file) {
             for (const f of fset) fileToModule.set(path.resolve(f).toLowerCase(), key);
         }
 
-        // Default active module: config override, else lowest id, else none (single-module).
+        // Default active module: config override, else NONE (resident-only). On boot
+        // no overlay is loaded yet, so we don't presume any module is active — the
+        // resident _osdk_dbg_module byte (default $ff) drives the switch when a module
+        // actually loads and stamps its id. This keeps overlay breakpoints gray and
+        // symbol resolution resident-only until an overlay is really in memory.
         let defaultId = null;
-        if (moduleNames.size > 0) {
-            defaultId = Math.min(...moduleNames.keys());
-            if (typeof config.activeModule === 'number' && moduleNames.has(config.activeModule)) defaultId = config.activeModule;
+        if (moduleNames.size > 0 &&
+            typeof config.activeModule === 'number' && moduleNames.has(config.activeModule)) {
+            defaultId = config.activeModule;
         }
         applyActiveModule(defaultId);
 
         const modNote = moduleNames.size > 0
-            ? (' [' + moduleNames.size + ' modules, active=' + (moduleNames.get(activeModuleId) || '?') + ']') : '';
+            ? (' [' + moduleNames.size + ' modules, active=' + (activeModuleId !== null ? moduleNames.get(activeModuleId) : '(none)') + ']') : '';
         log('Loaded ' + symbols.size + ' symbols, ' + lineTable.length + ' line entries, ' +
             typeDefs.size + ' types, ' + varTypes.size + ' typed vars, ' +
             localDefs.size + ' funcs with locals from ' + file + modNote);
@@ -738,6 +761,24 @@ async function onStopReply(payload) {
     nextVarRef = 100;
     clearGdbReadCache();
 
+    // Module-load watch, phase 2: the dobp=FALSE single step we issued in phase 1
+    // has now COMMITTED the write to _osdk_dbg_module, so the byte holds the NEW id.
+    // Arm the incoming module and resume — still transparently.
+    if (moduleWatchPending) {
+        moduleWatchPending = false;
+        moduleByteTrusted = true; // a real write to the byte just committed — it's meaningful now
+        if (moduleNames.size > 0) await checkModuleSwitch(); // reads new id, arms its bps
+        if (resumeMode === 'run') {
+            running = true;
+            regs = null;
+            gdbWrite('c'); // resume free-run transparently — no 'stopped' event
+            return;
+        }
+        // A step resume that crossed a module load: emit a safe stop after arming.
+        onStopReply_emit(null);
+        return;
+    }
+
     // Handle continue-past-breakpoint FIRST: single step completed, now issue continue.
     // Must come before tempStepBp cleanup — when both are set (F10 on a line with BP),
     // we need to continue first and clean up the temp BP on the NEXT stop.
@@ -746,14 +787,6 @@ async function onStopReply(payload) {
         running = true;
         gdbWrite('c');
         return; // don't emit stopped event — real stop will come through later
-    }
-
-    // Clean up temp breakpoint from source-level stepping (F10/F11).
-    // Ref-counted: if a real breakpoint shares this address it survives.
-    if (tempStepBp >= 0) {
-        const addr = tempStepBp;
-        tempStepBp = -1;
-        disarmAddr(addr); // release temp BP asynchronously
     }
 
     const sig = parseInt(payload.substring(1, 3), 16);
@@ -776,6 +809,32 @@ async function onStopReply(payload) {
             watchAddr = parseInt(p.substring(7), 16);
             watchType = 'access';
         }
+    }
+
+    // Module-load watch, phase 1: an instruction is ABOUT to write _osdk_dbg_module
+    // (the watchpoint stops before the write commits). We can't read the new id yet,
+    // and a plain continue would re-run this same write and re-trigger forever. So
+    // single-step it: 's' uses dobp=FALSE, which both steps off the watchpoint and
+    // commits the write without re-triggering. Phase 2 (above) then reads the new id,
+    // arms the incoming module, and resumes — the whole handoff is invisible, so a
+    // JSR through a routine that touches the flag never surfaces. Also covers the
+    // benign boot-time writes (loader relocation stamping the $ff sentinel): those
+    // step through and checkModuleSwitch simply finds no valid module.
+    // Handled BEFORE temp-BP cleanup so a Turbo Run's cursor breakpoint survives.
+    if (watchType === 'write' && moduleWatchAddr >= 0 && watchAddr === moduleWatchAddr) {
+        moduleWatchPending = true;
+        running = true;
+        regs = null;
+        gdbWrite('s'); // dobp=FALSE step: commits the write, no re-trigger
+        return;
+    }
+
+    // Clean up temp breakpoint from source-level stepping (F10/F11).
+    // Ref-counted: if a real breakpoint shares this address it survives.
+    if (tempStepBp >= 0) {
+        const addr = tempStepBp;
+        tempStepBp = -1;
+        disarmAddr(addr); // release temp BP asynchronously
     }
 
     // Handle cycle annotation from step-over
@@ -802,6 +861,29 @@ async function onStopReply(payload) {
     await reconcileMonitorBreakpoints();
 
     onStopReply_emit(watchAddr);
+}
+
+// Arm a hidden write-watchpoint on the resident _osdk_dbg_module byte. When an
+// overlay module switches during free-run it stamps this byte first (SET_MODULE is
+// emitted at each module's entry), so the watch gives us a brief stop to arm the
+// incoming module's breakpoints BEFORE its code runs — then we resume transparently
+// (see onStopReply). Without it, an overlay's breakpoints would only arm at the next
+// unrelated stop and the CPU would run straight past them on first load.
+// Internal/hidden: tracked only in moduleWatchAddr, never surfaced to VS Code or
+// stored in dataBps, so the user can't delete it by accident. Multi-module only.
+async function armModuleWatch() {
+    moduleWatchAddr = -1;
+    if (moduleNames.size === 0) { log('Module-load watch: skipped — no #MODULE sections'); return; }
+    const addr = symbols.get('_osdk_dbg_module');
+    if (addr === undefined) { log('Module-load watch: skipped — _osdk_dbg_module symbol not found'); return; }
+    const a = addr & 0xffff;
+    const r = await gdbCmd('Z2,' + a.toString(16) + ',1'); // Z2 = write watchpoint
+    if (r === 'OK') {
+        moduleWatchAddr = a;
+        log('Module-load watch armed on _osdk_dbg_module ($' + a.toString(16) + ')');
+    } else {
+        log('Module-load watch FAILED to arm at $' + a.toString(16) + ' — stub reply: ' + r);
+    }
 }
 
 // Reconcile the stub's live execution-breakpoint table (shared between the GDB
@@ -1202,6 +1284,7 @@ function resolveSrcLineAddr(file, reqLine) {
 // Arm a Turbo Run: optional one-shot breakpoint at addr, then enable warp,
 // remembering the prior warp state so onStopReply_emit can restore it.
 async function armTurbo(addr) {
+    resumeMode = 'run';
     if (addr >= 0) {
         // Ref-counted: safe even if a real breakpoint already sits here — cleanup
         // decrements without removing the user's breakpoint.
@@ -1449,6 +1532,7 @@ const handlers = {
 
     async attach(req) {
         config = req.arguments || {};
+        moduleByteTrusted = true; // attaching to a running program — the module byte is already valid
         if (config.logLevel !== undefined) logLevel = config.logLevel;
         const host = config.host || 'localhost';
         const port = config.port || 6502;
@@ -1490,6 +1574,7 @@ const handlers = {
 
     async launch(req) {
         config = req.arguments || {};
+        moduleByteTrusted = false; // fresh boot — don't believe the module byte until the loader stamps it
         if (config.logLevel !== undefined) logLevel = config.logLevel;
         const port = config.port || 6502;
 
@@ -1594,6 +1679,11 @@ const handlers = {
     configurationDone(req) {
         configDone = true;
         respond(req);
+
+        // Arm the hidden module-load watch before any free-run so overlay switches
+        // are caught from the very first run. Queued ahead of the continue below
+        // (whenGdbIdle waits for the Z2 to complete first).
+        armModuleWatch();
 
         // Turbo Run To on launch: warp through startup to a target symbol
         if (config.turboRunTo) {
@@ -2141,6 +2231,7 @@ const handlers = {
     // -- Execution control ----------------------------------------
 
     async continue(req) {
+        resumeMode = 'run';
         // If PC is sitting on a breakpoint, single-step past it first,
         // then continue via the continueAfterStep flag in onStopReply
         if (regs && regs.pc !== undefined) {
@@ -2163,6 +2254,7 @@ const handlers = {
     },
 
     async next(req) {
+        resumeMode = 'step';
         const granularity = (req.arguments && req.arguments.granularity) || 'statement';
         logVerbose('next: granularity=' + granularity);
         const src = regs ? sourceFor(regs.pc) : null;
@@ -2195,6 +2287,7 @@ const handlers = {
     },
 
     async stepIn(req) {
+        resumeMode = 'step';
         const granularity = (req.arguments && req.arguments.granularity) || 'statement';
         const src = regs ? sourceFor(regs.pc) : null;
         // Source-level step-in: same as next for C lines (we don't have C-level call info)
@@ -2224,6 +2317,7 @@ const handlers = {
     },
 
     stepOut(req) {
+        resumeMode = 'step';
         regs = null;
         respond(req);
         running = true;

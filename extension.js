@@ -2540,6 +2540,22 @@ function syncMonitorBreakpoints(body) {
     if (toRemove.length) vscode.debug.removeBreakpoints(toRemove);
 }
 
+// Toggle warp/turbo speed and reflect the new state in the context key
+// `oric-debug.warp`, which swaps the toolbar icon ($(watch) normal ↔ $(rocket)
+// warp) so the current speed is always visible at a glance.
+function doToggleWarp() {
+    const session = vscode.debug.activeDebugSession;
+    if (!session || session.type !== 'oric-debug') return;
+    session.customRequest('toggleWarp').then(resp => {
+        if (resp) {
+            vscode.commands.executeCommand('setContext', 'oric-debug.warp', !!resp.warp);
+            vscode.window.setStatusBarMessage(resp.warp ? 'Warp: ON' : 'Warp: OFF', 3000);
+        }
+    }).catch(e => {
+        vscode.window.showErrorMessage('Warp toggle failed: ' + e.message);
+    });
+}
+
 function refreshDisasmPanel(session) {
     if (!disasmPanel) return;
     if (!session || session.type !== 'oric-debug') {
@@ -3413,20 +3429,9 @@ function activate(context) {
                 });
             }
         }),
-        vscode.commands.registerCommand('oric-debug.toggleWarp', () => {
-            const session = vscode.debug.activeDebugSession;
-            if (session && session.type === 'oric-debug') {
-                session.customRequest('toggleWarp').then(resp => {
-                    if (resp) {
-                        vscode.window.setStatusBarMessage(
-                            resp.warp ? 'Warp: ON' : 'Warp: OFF', 3000
-                        );
-                    }
-                }).catch(e => {
-                    vscode.window.showErrorMessage('Warp toggle failed: ' + e.message);
-                });
-            }
-        }),
+        vscode.commands.registerCommand('oric-debug.toggleWarp', () => doToggleWarp()),
+        vscode.commands.registerCommand('oric-debug.warpOn', () => doToggleWarp()),
+        vscode.commands.registerCommand('oric-debug.warpOff', () => doToggleWarp()),
         vscode.commands.registerCommand('oric-debug.resetCycleCounter', () => {
             const session = vscode.debug.activeDebugSession;
             if (session && session.type === 'oric-debug') {
@@ -3744,6 +3749,7 @@ function activate(context) {
                 vizLog('Debug session started — GDB on ' + gdbHost + ':' + gdbPort);
                 disassemblyAutoOpened = false;
                 disasmCenterAddr = null;
+                vscode.commands.executeCommand('setContext', 'oric-debug.warp', false); // session starts at normal speed
                 scanDefines(); // Rescan defines (build may have regenerated headers)
                 setTimeout(() => refreshAll(), 500);
                 // Auto-connect viz stream if any consumer panels are open
@@ -3754,6 +3760,7 @@ function activate(context) {
         }),
         vscode.debug.onDidTerminateDebugSession(() => {
             vizLog('Debug session terminated');
+            vscode.commands.executeCommand('setContext', 'oric-debug.warp', false);
             refreshAll();
             vizDisconnect();
             clearCycleAnnotations();

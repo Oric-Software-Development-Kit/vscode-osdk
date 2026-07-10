@@ -115,6 +115,16 @@
                 "icon": "$(rocket)"
             },
             {
+                "command": "oric-debug.warpOn",
+                "title": "Oric: Enable Warp Speed",
+                "icon": "$(watch)"
+            },
+            {
+                "command": "oric-debug.warpOff",
+                "title": "Oric: Disable Warp Speed",
+                "icon": "$(rocket)"
+            },
+            {
                 "command": "oric-debug.resetCycleCounter",
                 "title": "Oric: Reset Cycle Counter",
                 "icon": "$(history)"
@@ -201,8 +211,12 @@
                     "when": "debugType == 'oric-debug' && debugState == 'stopped'"
                 },
                 {
-                    "command": "oric-debug.toggleWarp",
-                    "when": "debugType == 'oric-debug'"
+                    "command": "oric-debug.warpOn",
+                    "when": "debugType == 'oric-debug' && !oric-debug.warp"
+                },
+                {
+                    "command": "oric-debug.warpOff",
+                    "when": "debugType == 'oric-debug' && oric-debug.warp"
                 },
                 {
                     "command": "oric-debug.resetCycleCounter",
