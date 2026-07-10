@@ -150,6 +150,10 @@
                 "icon": "$(run-all)"
             },
             {
+                "command": "oric-debug.selectModule",
+                "title": "Oric: Active Module"
+            },
+            {
                 "command": "osdk.xaReference",
                 "title": "OSDK: XA Quick Reference"
             },

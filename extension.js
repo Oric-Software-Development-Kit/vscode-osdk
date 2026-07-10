@@ -2458,12 +2458,86 @@ function setupDisasmMessageHandler(panel) {
             if (session && session.type === 'oric-debug') refreshDisasmPanel(session);
         } else if (msg.type === 'toggleBreakpoint' && typeof msg.address === 'number') {
             if (session && session.type === 'oric-debug') {
-                session.customRequest('toggleInstructionBreakpoint', { address: msg.address }).then(resp => {
-                    refreshDisasmPanel(session);
-                }).catch(() => {});
+                // The disassembly view is a thin view over VS Code's breakpoint
+                // model: a gutter click mutates the model, and onDidChangeBreakpoints
+                // refreshes the dots. This keeps it in sync with the source gutter,
+                // the Breakpoints panel, and Oricutron.
+                toggleBreakpointViaModel(session, msg.address);
             }
         }
     });
+}
+
+// Toggle a breakpoint at `address` by mutating VS Code's breakpoint model (the
+// single source of truth). Prefers a SourceBreakpoint when the address maps to a
+// source line; falls back to an InstructionBreakpoint otherwise.
+async function toggleBreakpointViaModel(session, address) {
+    let loc = null;
+    try {
+        const r = await session.customRequest('locationForAddress', { address });
+        loc = r && r.location;
+    } catch (e) { /* fall through to instruction breakpoint */ }
+
+    if (loc && loc.file && loc.line > 0) {
+        const uri = vscode.Uri.file(loc.file);
+        const line0 = loc.line - 1;
+        const existing = vscode.debug.breakpoints.find(bp =>
+            bp instanceof vscode.SourceBreakpoint &&
+            bp.location.uri.fsPath.toLowerCase() === uri.fsPath.toLowerCase() &&
+            bp.location.range.start.line === line0);
+        if (existing) vscode.debug.removeBreakpoints([existing]);
+        else vscode.debug.addBreakpoints([new vscode.SourceBreakpoint(
+            new vscode.Location(uri, new vscode.Position(line0, 0)))]);
+    } else {
+        const addr16 = address & 0xFFFF;
+        const ref = '0x' + addr16.toString(16).padStart(4, '0');
+        const existing = vscode.debug.breakpoints.find(bp =>
+            bp instanceof vscode.InstructionBreakpoint &&
+            parseInt(bp.instructionReference, 16) === addr16);
+        if (existing) vscode.debug.removeBreakpoints([existing]);
+        else vscode.debug.addBreakpoints([new vscode.InstructionBreakpoint(ref)]);
+    }
+}
+
+// Apply monitor-side breakpoint edits (from the adapter's reconciliation) to VS
+// Code's model. Adds are idempotent; removes drop the matching source/instruction
+// breakpoint. This makes Oricutron's monitor a peer of the other breakpoint views.
+function syncMonitorBreakpoints(body) {
+    const sameSource = (bp, file, line0) =>
+        bp instanceof vscode.SourceBreakpoint &&
+        bp.location.uri.fsPath.toLowerCase() === vscode.Uri.file(file).fsPath.toLowerCase() &&
+        bp.location.range.start.line === line0;
+    const sameInstr = (bp, addr16) =>
+        bp instanceof vscode.InstructionBreakpoint &&
+        parseInt(bp.instructionReference, 16) === addr16;
+
+    const toAdd = [];
+    for (const b of (body.added || [])) {
+        if (b.file && b.line > 0) {
+            const line0 = b.line - 1;
+            if (!vscode.debug.breakpoints.some(bp => sameSource(bp, b.file, line0)))
+                toAdd.push(new vscode.SourceBreakpoint(
+                    new vscode.Location(vscode.Uri.file(b.file), new vscode.Position(line0, 0))));
+        } else {
+            const addr16 = b.address & 0xFFFF;
+            const ref = '0x' + addr16.toString(16).padStart(4, '0');
+            if (!vscode.debug.breakpoints.some(bp => sameInstr(bp, addr16)))
+                toAdd.push(new vscode.InstructionBreakpoint(ref));
+        }
+    }
+
+    const toRemove = [];
+    for (const b of (body.removed || [])) {
+        const addr16 = b.address & 0xFFFF;
+        const line0 = (b.file && b.line > 0) ? b.line - 1 : -1;
+        for (const bp of vscode.debug.breakpoints) {
+            if (line0 >= 0 && sameSource(bp, b.file, line0)) toRemove.push(bp);
+            else if (sameInstr(bp, addr16)) toRemove.push(bp);
+        }
+    }
+
+    if (toAdd.length) vscode.debug.addBreakpoints(toAdd);
+    if (toRemove.length) vscode.debug.removeBreakpoints(toRemove);
 }
 
 function refreshDisasmPanel(session) {
@@ -2531,6 +2605,7 @@ td.gutter .bp-dot {
     pointer-events: none;
 }
 td.gutter .bp-dot.set { background: #e51400; }
+td.gutter .bp-dot.pending { border: 1.5px solid #e51400; background: transparent; }
 td.gutter .bp-dot.unset { border: 1.5px solid var(--vscode-editorGutter-foldingControlForeground, #666); }
 td.addr { color: var(--vscode-descriptionForeground, #888); width: 50px; }
 td.bytes { color: var(--vscode-descriptionForeground, #666); width: 75px; }
@@ -2589,8 +2664,9 @@ function render() {
         document.getElementById('statusText').textContent = '';
         return;
     }
-    const { instructions, pc, breakpoints } = lastData;
+    const { instructions, pc, breakpoints, pendingBreakpoints } = lastData;
     const bpSet = new Set(breakpoints || []);
+    const pendingSet = new Set(pendingBreakpoints || []);
     const h2 = v => v.toString(16).toUpperCase().padStart(2, '0');
     const h4 = v => v.toString(16).toUpperCase().padStart(4, '0');
 
@@ -2600,6 +2676,7 @@ function render() {
         const isPc = ins.address === pc;
         const hasLabel = ins.label && ins.label.length > 0;
         const hasBp = bpSet.has(ins.address);
+        const isPending = !hasBp && pendingSet.has(ins.address);
         const cls = [];
         if (isPc) cls.push('pc-row');
         if (hasLabel) cls.push('label-row');
@@ -2607,7 +2684,7 @@ function render() {
         if (isPc) pcRowId = rowId;
 
         const bytesStr = ins.bytes.map(b => h2(b)).join(' ');
-        const bpCls = hasBp ? 'bp-dot set' : 'bp-dot unset';
+        const bpCls = hasBp ? 'bp-dot set' : (isPending ? 'bp-dot pending' : 'bp-dot unset');
 
         html += '<tr id="' + rowId + '"' + (cls.length ? ' class="' + cls.join(' ') + '"' : '') + '>';
         html += '<td class="pc-arrow">' + (isPc ? '\\u25B6' : '') + '</td>';
@@ -3407,6 +3484,27 @@ function activate(context) {
             } catch (e) {
                 vscode.window.showErrorMessage('Turbo Run failed: ' + (e && e.message ? e.message : e));
             }
+        }),
+
+        vscode.commands.registerCommand('oric-debug.selectModule', async () => {
+            const session = vscode.debug.activeDebugSession;
+            if (!session || session.type !== 'oric-debug') return;
+            try {
+                const r = await session.customRequest('getModules');
+                if (!r || !r.modules || r.modules.length === 0) {
+                    vscode.window.showInformationMessage('This project uses a single symbol module.');
+                    return;
+                }
+                const pick = await vscode.window.showQuickPick(
+                    r.modules.map(m => ({ label: (m.active ? '$(check) ' : '$(circle-outline) ') + m.name, id: m.id })),
+                    { placeHolder: 'Select the active Oric module (which overlay’s symbols to use)' });
+                if (pick) {
+                    const resp = await session.customRequest('setActiveModule', { id: pick.id });
+                    if (resp && resp.name) vscode.window.setStatusBarMessage('Oric module: ' + resp.name, 4000);
+                }
+            } catch (e) {
+                vscode.window.showErrorMessage('Module select failed: ' + (e && e.message ? e.message : e));
+            }
         })
     );
 
@@ -3560,6 +3658,20 @@ function activate(context) {
         }
     }
 
+    const moduleStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
+    moduleStatusBar.command = 'oric-debug.selectModule';
+    moduleStatusBar.tooltip = 'Active Oric symbol module — click to change';
+    context.subscriptions.push(moduleStatusBar);
+    context.subscriptions.push(vscode.debug.onDidTerminateDebugSession(() => moduleStatusBar.hide()));
+
+    // Keep the disassembly view's breakpoint dots in sync with VS Code's model —
+    // whether a breakpoint changed via the source gutter, the Breakpoints panel,
+    // the disasm gutter, or (via inbound promotion) Oricutron itself.
+    context.subscriptions.push(vscode.debug.onDidChangeBreakpoints(() => {
+        const session = vscode.debug.activeDebugSession;
+        if (session && session.type === 'oric-debug') refreshDisasmPanel(session);
+    }));
+
     context.subscriptions.push(
         vscode.debug.registerDebugAdapterTrackerFactory('oric-debug', {
             createDebugAdapterTracker(session) {
@@ -3574,6 +3686,15 @@ function activate(context) {
                                 disassemblyAutoOpened = true;
                                 setTimeout(() => createDisasmPanel(), 200);
                             }
+                        }
+                        // Refresh disasm dots once the adapter has actually applied a
+                        // breakpoint change (its maps are updated at response time —
+                        // onDidChangeBreakpoints fires earlier, before the round-trip).
+                        if (msg.type === 'response' && msg.success &&
+                            (msg.command === 'setBreakpoints' ||
+                             msg.command === 'setInstructionBreakpoints' ||
+                             msg.command === 'setFunctionBreakpoints')) {
+                            refreshDisasmPanel(session);
                         }
                         // Intercept VS Code's own stackTrace response — the UI
                         // now has frame data, so opening disassembly will work.
@@ -3600,6 +3721,16 @@ function activate(context) {
                                 });
                                 applyCycleDecorations();
                             }
+                        }
+                        // Breakpoints set/cleared by hand in Oricutron's monitor —
+                        // sync them into VS Code's model (Oricutron is just another view).
+                        if (msg.type === 'event' && msg.event === 'oricMonitorBreakpoints' && msg.body) {
+                            syncMonitorBreakpoints(msg.body);
+                        }
+                        // Active symbol module changed (auto-switch or manual) — reflect in status bar
+                        if (msg.type === 'event' && msg.event === 'oricActiveModule' && msg.body) {
+                            moduleStatusBar.text = '$(layers) Module: ' + msg.body.name;
+                            moduleStatusBar.show();
                         }
                     }
                 };

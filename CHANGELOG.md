@@ -2,6 +2,18 @@
 
 ## 0.0.4
 
+### Multi-Module Symbols (overlay support)
+- Symbol files with `#MODULE <id> <name>` sections load into per-module buckets; resident symbols compose with the active module
+- Active module auto-switches from the resident `_osdk_dbg_module` byte on each stop; status bar shows "Module: <name>" (click to override)
+- Breakpoints resolve against their file's owning module and arm in the stub only while that module is active (or resident); they re-arm on module switch
+- Inactive-overlay breakpoints show as unverified (gray) with an explanatory message, and go verified (red) when their module loads
+
+### Breakpoint Consistency Across Views
+- VS Code's breakpoint model is the single source of truth; the source gutter, Breakpoints panel, disassembly view, and Oricutron's monitor are all views over it
+- Disassembly gutter clicks now create real VS Code breakpoints (source or instruction), so they replicate to every other view; armed = solid dot, pending = hollow ring
+- Breakpoints set or cleared by hand in Oricutron's monitor sync into VS Code (via the stub's `qOricBreakpoints` query, reconciled on each stop)
+- One stub breakpoint per address, ref-counted across source/function/instruction/temp breakpoints — no more duplicate or ghost breakpoints; a stop reports every breakpoint at the PC
+
 ### Symbol Browser
 - New "Oric: Symbol Browser" webview panel listing all runtime symbols and `#define` constants
 - Alias merging: symbols at the same address are grouped into a single row, master definition listed first

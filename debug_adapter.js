@@ -99,6 +99,7 @@ function gdbConnect(host, port) {
     return new Promise((resolve, reject) => {
         const s = net.createConnection({ host: host, port: port }, () => {
             sock = s;
+            armedAddrs.clear(); // fresh session: the stub holds no breakpoints yet
             resolve();
         });
         s.setEncoding('latin1');
@@ -247,6 +248,7 @@ let configDone = false;
 let pendingStop = null;       // deferred stopped event body
 let srcBps     = new Map();   // file -> [{id, addr}] (source breakpoints per file)
 let dataBps    = new Map();   // id -> { addr, accessType, gdbType } (data breakpoints)
+let armedAddrs = new Map();   // addr -> refcount of execution breakpoints armed in the stub
 let gotoTargetMap = new Map(); // targetId -> address (for goto/setNextStatement)
 let lastCycleAnnotation = null; // { pc, cycles } from last step-over
 let launchedProcess = null;     // child_process handle if we launched Oricutron
@@ -329,27 +331,163 @@ function runBuild(command, cwd) {
 // Symbol file loader  (format: "HHHH symbol_name" per line)
 // ----------------------------------------------------------------
 
+// ---- Multi-module symbol support ----
+// Symbols parse into per-module "buckets" (key 'R' = resident, or a numeric
+// module id from #MODULE markers). applyActiveModule() composes resident + one
+// active module into the global maps the rest of the adapter uses. A symbol file
+// with no #MODULE markers yields a single resident bucket => behaves exactly as
+// a single-module file did before this refactor.
+let moduleBuckets  = new Map();  // key ('R' | id) -> bucket
+let moduleNames    = new Map();  // id(number) -> module name
+let moduleFiles    = new Map();  // key -> Set(source file paths in that bucket)
+let fileToModule   = new Map();  // normalized file path -> owning module key (for scoped bps)
+let activeModuleId = null;       // null = single-module / none selected
+let moduleReported = false;      // have we surfaced the active module to the UI yet this session?
+let moduleAllFiles = [];         // union of all #FILES paths (for resolveLibrarySources)
+
+function makeSymBucket() {
+    return {
+        symbols: new Map(), addrSym: new Map(), addrSource: new Map(), symSource: new Map(),
+        lineTable: [], typeDefs: new Map(), varTypes: new Map(), localDefs: new Map()
+    };
+}
+
+// Compose resident + the given module id into the global symbol maps.
+function applyActiveModule(id) {
+    symbols.clear(); addrSym.clear(); addrSource.clear(); symSource.clear();
+    typeDefs.clear(); varTypes.clear(); localDefs.clear();
+    lineTable = []; zpSymbols = [];
+
+    const order = [];
+    if (moduleBuckets.has('R')) order.push(moduleBuckets.get('R'));
+    if (id !== null && moduleBuckets.has(id)) order.push(moduleBuckets.get(id));
+
+    for (const b of order) {
+        for (const [n, a] of b.symbols)    symbols.set(n, a);
+        for (const [a, n] of b.addrSym)    if (!addrSym.has(a)) addrSym.set(a, n);
+        for (const [a, s] of b.addrSource) if (!addrSource.has(a)) addrSource.set(a, s);
+        for (const [n, s] of b.symSource)  symSource.set(n, s);
+        for (const [k, v] of b.typeDefs)   typeDefs.set(k, v);
+        for (const [k, v] of b.varTypes)   varTypes.set(k, v);
+        for (const [k, v] of b.localDefs)  localDefs.set(k, v);
+        for (const e of b.lineTable)       lineTable.push(e);
+    }
+    activeModuleId = id;
+
+    // Sort + dedupe line table: keep last entry per address (the code-producing line)
+    if (lineTable.length > 1) {
+        lineTable.sort((a, b) => a.addr - b.addr);
+        const deduped = [];
+        for (let i = 0; i < lineTable.length; i++) {
+            if (i === lineTable.length - 1 || lineTable[i + 1].addr !== lineTable[i].addr) {
+                deduped.push(lineTable[i]);
+            }
+        }
+        lineTable = deduped;
+    }
+
+    // Build sorted zero-page symbol list with inferred sizes
+    const zpAddrs = [];
+    for (const [a, n] of addrSym) { if (a <= 0xFF) zpAddrs.push({ addr: a, name: n }); }
+    zpAddrs.sort((a, b) => a.addr - b.addr);
+    for (let i = 0; i < zpAddrs.length; i++) {
+        const next = i + 1 < zpAddrs.length ? zpAddrs[i + 1].addr : zpAddrs[i].addr + 2;
+        const size = Math.min(next - zpAddrs[i].addr, 2);
+        zpSymbols.push({ addr: zpAddrs[i].addr, name: zpAddrs[i].name, size: size });
+    }
+
+    resolveLibrarySources(moduleAllFiles);
+    varRefs.clear(); nextVarRef = 100;
+}
+
+// Modules for the manual-override UI.
+function listModules() {
+    const out = [];
+    for (const [id, name] of moduleNames) out.push({ id, name, active: id === activeModuleId });
+    out.sort((a, b) => a.id - b.id);
+    return out;
+}
+
+// Read the resident _osdk_dbg_module byte and switch the active module if it
+// changed. No-op for single-module projects (no #MODULE sections, or no
+// _osdk_dbg_module symbol). Reads are benign (gdb_read_memory uses mon_read).
+async function checkModuleSwitch() {
+    if (moduleNames.size === 0) return;
+    if (pendingResolve) return; // a command is already in flight; skip to avoid queueing behind it
+    const addr = symbols.get('_osdk_dbg_module');
+    if (addr === undefined) return;
+    const bytes = await readMem(addr & 0xffff, 1);
+    const val = bytes[0];
+    if (moduleNames.has(val) && val !== activeModuleId) {
+        applyActiveModule(val);
+        await rearmModuleBreakpoints();
+        log('Active module -> ' + moduleNames.get(val) + ' (id ' + val + ')');
+        evt('oricActiveModule', { id: val, name: moduleNames.get(val) });
+        moduleReported = true;
+    } else if (!moduleReported && activeModuleId !== null) {
+        // First stop of the session: the running module matches the default, so
+        // no switch fired — but the UI has never been told what's active. Surface
+        // it once so the status bar shows the current module from the start.
+        log('Active module = ' + moduleNames.get(activeModuleId) + ' (id ' + activeModuleId + ')');
+        evt('oricActiveModule', { id: activeModuleId, name: moduleNames.get(activeModuleId) });
+        moduleReported = true;
+    }
+}
+
+// Sync source-breakpoint arming to the active module: (re)arm resident + active-
+// module breakpoints in the stub, disarm the rest. Called after the active module
+// changes so a breakpoint in an overlay only fires while that overlay is loaded.
+async function rearmModuleBreakpoints() {
+    for (const [, arr] of srcBps) {
+        for (const bp of arr) {
+            const desired = (bp.module === 'R' || bp.module === activeModuleId);
+            if (desired && !bp.armed) {
+                await armAddr(bp.addr);
+                bp.armed = true;
+                evt('breakpoint', { reason: 'changed', breakpoint: { id: bp.id, verified: true, line: bp.line, source: bp.source } });
+            } else if (!desired && bp.armed) {
+                await disarmAddr(bp.addr);
+                bp.armed = false;
+                evt('breakpoint', { reason: 'changed', breakpoint: { id: bp.id, verified: false, line: bp.line, source: bp.source,
+                    message: 'Inactive module (' + (moduleNames.get(bp.module) || bp.module) + ') — binds when it loads' } });
+            }
+        }
+    }
+}
+
 function loadSymbols(file) {
-    symbols.clear();
-    addrSym.clear();
-    addrSource.clear();
-    symSource.clear();
-    lineTable = [];
-    zpSymbols = [];
-    typeDefs.clear();
-    varTypes.clear();
-    localDefs.clear();
-    evalFailCache.clear();
-    varRefs.clear();
-    nextVarRef = 100;
+    symbols.clear(); addrSym.clear(); addrSource.clear(); symSource.clear();
+    lineTable = []; zpSymbols = [];
+    typeDefs.clear(); varTypes.clear(); localDefs.clear();
+    evalFailCache.clear(); varRefs.clear(); nextVarRef = 100;
+
+    moduleBuckets = new Map(); moduleNames = new Map(); moduleFiles = new Map();
+    moduleAllFiles = []; activeModuleId = null; moduleReported = false;
+    const resident = makeSymBucket();
+    moduleBuckets.set('R', resident); moduleFiles.set('R', new Set());
+
     try {
         const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
         let isV2 = false;
-        let section = 'sym';    // 'sym', 'files', or 'lines'
-        let fileIndex = [];     // index -> absolute path (from #FILES)
+        let section = 'sym';    // 'sym', 'files', 'lines', or 'types'
+        let fileIndex = [];     // index -> absolute path (from #FILES, per block)
+        let cur = resident;     // bucket currently being filled
+        let curKey = 'R';
 
         for (const line of lines) {
             const trimmed = line.trim();
+
+            // Module section marker: "#MODULE <id> <name>" — everything until the
+            // next marker belongs to that module. Text before the first marker is resident.
+            const mm = trimmed.match(/^#MODULE\s+(\d+)\s+(\S+)/);
+            if (mm) {
+                const id = parseInt(mm[1], 10);
+                moduleNames.set(id, mm[2]);
+                if (!moduleBuckets.has(id)) { moduleBuckets.set(id, makeSymBucket()); moduleFiles.set(id, new Set()); }
+                cur = moduleBuckets.get(id); curKey = id;
+                section = 'sym'; fileIndex = [];
+                continue;
+            }
             if (trimmed === '#SYM V2')  { isV2 = true; section = 'sym'; continue; }
             if (trimmed === '#FILES')   { section = 'files'; fileIndex = []; continue; }
             if (trimmed === '#LINES')   { section = 'lines'; continue; }
@@ -358,7 +496,7 @@ function loadSymbols(file) {
             if (section === 'files') {
                 // Format: "index filepath"
                 const fm = trimmed.match(/^(\d+)\s+(.+)$/);
-                if (fm) fileIndex[parseInt(fm[1], 10)] = fm[2];
+                if (fm) { fileIndex[parseInt(fm[1], 10)] = fm[2]; moduleAllFiles.push(fm[2]); moduleFiles.get(curKey).add(fm[2]); }
                 continue;
             }
 
@@ -367,7 +505,7 @@ function loadSymbols(file) {
                 const lm = trimmed.match(/^([0-9a-fA-F]{4})\s+(\d+):(\d+)$/);
                 if (lm) {
                     const fi = parseInt(lm[2], 10);
-                    lineTable.push({
+                    cur.lineTable.push({
                         addr: parseInt(lm[1], 16),
                         file: fileIndex[fi] || ('file#' + fi),
                         line: parseInt(lm[3], 10)
@@ -377,8 +515,6 @@ function loadSymbols(file) {
             }
 
             if (section === 'types') {
-                // Format: "struct <name> <size> <field>:<type>:<offset>:<size> ..."
-                //     or: "var <asm_name> <type_string> <totalSize>"
                 const sm = trimmed.match(/^struct\s+(\S+)\s+(\d+)\s+(.+)$/);
                 if (sm) {
                     const name = sm[1];
@@ -387,31 +523,22 @@ function loadSymbols(file) {
                     for (const ft of sm[3].split(/\s+/)) {
                         const parts = ft.split(':');
                         if (parts.length >= 4) {
-                            fields.push({
-                                name: parts[0],
-                                type: parts[1],
-                                offset: parseInt(parts[2], 10),
-                                size: parseInt(parts[3], 10)
-                            });
+                            fields.push({ name: parts[0], type: parts[1], offset: parseInt(parts[2], 10), size: parseInt(parts[3], 10) });
                         }
                     }
-                    typeDefs.set(name, { size, fields });
+                    cur.typeDefs.set(name, { size, fields });
                     continue;
                 }
                 const vm = trimmed.match(/^var\s+(\S+)\s+(\S+)\s+(\d+)$/);
                 if (vm) {
                     const asmName = vm[1];
-                    const typeStr = vm[2];    // e.g. "score_entry[24]" or "int"
+                    const typeStr = vm[2];
                     const totalSize = parseInt(vm[3], 10);
                     const am = typeStr.match(/^(.+)\[(\d+)\]$/);
-                    if (am) {
-                        varTypes.set(asmName, { type: typeStr, base: am[1], count: parseInt(am[2], 10), totalSize });
-                    } else {
-                        varTypes.set(asmName, { type: typeStr, base: typeStr, count: 1, totalSize });
-                    }
+                    if (am) cur.varTypes.set(asmName, { type: typeStr, base: am[1], count: parseInt(am[2], 10), totalSize });
+                    else    cur.varTypes.set(asmName, { type: typeStr, base: typeStr, count: 1, totalSize });
                     continue;
                 }
-                // Format: "local <func> <cname> <base> <offset> <type> <size>"
                 const lm = trimmed.match(/^local\s+(\S+)\s+(\S+)\s+(fp|ap)\s+(\d+)\s+(\S+)\s+(\d+)$/);
                 if (lm) {
                     const func = lm[1];
@@ -421,68 +548,52 @@ function loadSymbols(file) {
                     const typeStr = lm[5];
                     const size = parseInt(lm[6], 10);
                     const am = typeStr.match(/^(.+)\[(\d+)\]$/);
-                    const entry = {
-                        cname, base, offset, type: typeStr, size,
-                        baseType: am ? am[1] : typeStr,
-                        count: am ? parseInt(am[2], 10) : 1
-                    };
-                    if (!localDefs.has(func)) localDefs.set(func, []);
-                    localDefs.get(func).push(entry);
+                    const entry = { cname, base, offset, type: typeStr, size, baseType: am ? am[1] : typeStr, count: am ? parseInt(am[2], 10) : 1 };
+                    if (!cur.localDefs.has(func)) cur.localDefs.set(func, []);
+                    cur.localDefs.get(func).push(entry);
                     continue;
                 }
                 continue;
             }
 
-            // section === 'sym': parse symbol entries
+            // section === 'sym'
             const m = line.match(/^([0-9a-fA-F]{4})\s+(\S+)/);
             if (m) {
                 const a = parseInt(m[1], 16);
                 const n = m[2];
-                symbols.set(n, a);
-                if (!addrSym.has(a)) addrSym.set(a, n);
+                cur.symbols.set(n, a);
+                if (!cur.addrSym.has(a)) cur.addrSym.set(a, n);
                 if (isV2) {
                     const rest = line.substring(m[0].length).trim();
                     const cm = rest.match(/^(.+):(\d+)$/);
                     if (cm) {
                         const src = { file: cm[1], line: parseInt(cm[2], 10) };
-                        symSource.set(n, src);
-                        if (!addrSource.has(a)) addrSource.set(a, src);
+                        cur.symSource.set(n, src);
+                        if (!cur.addrSource.has(a)) cur.addrSource.set(a, src);
                     }
                 }
             }
         }
 
-        // Sort line table by address (modules may be concatenated in any order)
-        // then deduplicate: keep last entry for each address (the code-producing line)
-        if (lineTable.length > 1) {
-            lineTable.sort((a, b) => a.addr - b.addr);
-            const deduped = [];
-            for (let i = 0; i < lineTable.length; i++) {
-                if (i === lineTable.length - 1 || lineTable[i + 1].addr !== lineTable[i].addr) {
-                    deduped.push(lineTable[i]);
-                }
-            }
-            lineTable = deduped;
+        // Map each source file to the module that owns it (module-scoped breakpoints).
+        fileToModule = new Map();
+        for (const [key, fset] of moduleFiles) {
+            for (const f of fset) fileToModule.set(path.resolve(f).toLowerCase(), key);
         }
 
-        // Build sorted zero-page symbol list with inferred sizes
-        const zpAddrs = [];
-        for (const [a, n] of addrSym) {
-            if (a <= 0xFF) zpAddrs.push({ addr: a, name: n });
+        // Default active module: config override, else lowest id, else none (single-module).
+        let defaultId = null;
+        if (moduleNames.size > 0) {
+            defaultId = Math.min(...moduleNames.keys());
+            if (typeof config.activeModule === 'number' && moduleNames.has(config.activeModule)) defaultId = config.activeModule;
         }
-        zpAddrs.sort((a, b) => a.addr - b.addr);
-        for (let i = 0; i < zpAddrs.length; i++) {
-            const next = i + 1 < zpAddrs.length ? zpAddrs[i + 1].addr : zpAddrs[i].addr + 2;
-            const size = Math.min(next - zpAddrs[i].addr, 2); // 1 or 2 bytes
-            zpSymbols.push({ addr: zpAddrs[i].addr, name: zpAddrs[i].name, size: size });
-        }
-        // Resolve symbols that reference build artifacts (linked.s) by scanning
-        // the actual source/library files for their original definitions.
-        resolveLibrarySources(fileIndex);
+        applyActiveModule(defaultId);
 
+        const modNote = moduleNames.size > 0
+            ? (' [' + moduleNames.size + ' modules, active=' + (moduleNames.get(activeModuleId) || '?') + ']') : '';
         log('Loaded ' + symbols.size + ' symbols, ' + lineTable.length + ' line entries, ' +
             typeDefs.size + ' types, ' + varTypes.size + ' typed vars, ' +
-            localDefs.size + ' funcs with locals from ' + file);
+            localDefs.size + ' funcs with locals from ' + file + modNote);
     } catch (e) {
         log('Could not load symbols: ' + e.message);
     }
@@ -620,7 +731,7 @@ function parseStopRegs(payload) {
 // Asynchronous stop-reply handler
 // ----------------------------------------------------------------
 
-function onStopReply(payload) {
+async function onStopReply(payload) {
     running = false;
     regs = parseStopRegs(payload);
     varRefs.clear();
@@ -637,11 +748,12 @@ function onStopReply(payload) {
         return; // don't emit stopped event — real stop will come through later
     }
 
-    // Clean up temp breakpoint from source-level stepping (F10/F11)
+    // Clean up temp breakpoint from source-level stepping (F10/F11).
+    // Ref-counted: if a real breakpoint shares this address it survives.
     if (tempStepBp >= 0) {
         const addr = tempStepBp;
         tempStepBp = -1;
-        gdbCmd('z0,' + addr.toString(16) + ',1'); // remove temp BP asynchronously
+        disarmAddr(addr); // release temp BP asynchronously
     }
 
     const sig = parseInt(payload.substring(1, 3), 16);
@@ -681,7 +793,45 @@ function onStopReply(payload) {
         };
     }
 
+    // Auto-select the symbol module from the resident _osdk_dbg_module byte
+    // (before emitting 'stopped', so VS Code queries stack/vars with the right symbols).
+    // Guarded so single-module sessions keep a fully synchronous stop path.
+    if (moduleNames.size > 0) await checkModuleSwitch();
+
+    // Sync any by-hand monitor breakpoint edits into VS Code's model.
+    await reconcileMonitorBreakpoints();
+
     onStopReply_emit(watchAddr);
+}
+
+// Reconcile the stub's live execution-breakpoint table (shared between the GDB
+// stub and Oricutron's own monitor) against what THIS adapter armed. Any address
+// the stub has that we didn't arm was set by hand in the monitor → promote it into
+// VS Code's model. Any address we armed that the stub no longer has was cleared in
+// the monitor → remove it from VS Code. Oricutron is thus just another bp view.
+async function reconcileMonitorBreakpoints() {
+    const reply = await gdbCmd('qOricBreakpoints');
+    // Guard: only act on a stub new enough to answer (reply starts with "bp:").
+    // An old stub returns an empty packet — treating that as "no breakpoints"
+    // would wrongly wipe the model.
+    if (typeof reply !== 'string' || !reply.startsWith('bp:')) return;
+
+    const stubAddrs = new Set();
+    const list = reply.slice(3);
+    if (list.length) {
+        for (const tok of list.split(',')) {
+            const a = parseInt(tok, 16);
+            if (!isNaN(a)) stubAddrs.add(a & 0xffff);
+        }
+    }
+
+    const locFor = a => { const s = sourceFor(a); return s ? { address: a, file: s.file, line: s.line } : { address: a }; };
+    const added = [];
+    for (const a of stubAddrs) if (!armedAddrs.has(a)) added.push(locFor(a));
+    const removed = [];
+    for (const a of armedAddrs.keys()) if (!stubAddrs.has(a)) removed.push(locFor(a));
+
+    if (added.length || removed.length) evt('oricMonitorBreakpoints', { added, removed });
 }
 
 // Emit the stopped event — used by onStopReply and by source-level stepping
@@ -698,25 +848,16 @@ function onStopReply_emit(watchAddr) {
     if (watchAddr !== null && watchAddr !== undefined) {
         reason = 'data breakpoint';
     } else if (regs && regs.pc !== undefined) {
-        // Check function breakpoints
-        for (const [id, bp] of bps) {
-            if (bp.addr === regs.pc) { reason = 'breakpoint'; hitIds = [id]; break; }
+        // Collect EVERY logical breakpoint at this PC across all kinds, so if the
+        // same address is covered by more than one breakpoint VS Code lights up all
+        // of them (not just the first). Disarmed source bps can't have fired.
+        const ids = [];
+        for (const [id, bp] of bps)  { if (bp.addr === regs.pc) ids.push(id); }
+        for (const [id, bp] of ibps) { if (bp.addr === regs.pc) ids.push(id); }
+        for (const [, arr] of srcBps) {
+            for (const bp of arr) { if (bp.addr === regs.pc && bp.armed) ids.push(bp.id); }
         }
-        // Check instruction breakpoints
-        if (!hitIds) {
-            for (const [id, bp] of ibps) {
-                if (bp.addr === regs.pc) { reason = 'breakpoint'; hitIds = [id]; break; }
-            }
-        }
-        // Check source breakpoints
-        if (!hitIds) {
-            for (const [, arr] of srcBps) {
-                for (const bp of arr) {
-                    if (bp.addr === regs.pc) { reason = 'breakpoint'; hitIds = [bp.id]; break; }
-                }
-                if (hitIds) break;
-            }
-        }
+        if (ids.length) { reason = 'breakpoint'; hitIds = ids; }
     }
 
     const body = { reason: reason, threadId: 1, allThreadsStopped: true };
@@ -1010,11 +1151,37 @@ function findNextSourceLineAddr(pc, file, line) {
     return -1;
 }
 
-// Check if any user-set breakpoint already exists at this address
+// Arm an execution breakpoint (Z0) in the stub, ref-counted so that N logical
+// breakpoints (source/function/instruction/temp) sharing one address arm exactly
+// one Z0. Returns true if the address is armed after the call. See armedAddrs.
+async function armAddr(addr) {
+    const n = armedAddrs.get(addr) || 0;
+    armedAddrs.set(addr, n + 1);
+    if (n === 0) {
+        const r = await gdbCmd('Z0,' + addr.toString(16) + ',1');
+        if (r !== 'OK') { armedAddrs.delete(addr); return false; } // roll back on failure
+    }
+    return true;
+}
+
+// Release one reference to an execution breakpoint; sends z0 only when the last
+// logical breakpoint at that address goes away.
+async function disarmAddr(addr) {
+    const n = armedAddrs.get(addr) || 0;
+    if (n <= 1) {
+        armedAddrs.delete(addr);
+        if (n >= 1) await gdbCmd('z0,' + addr.toString(16) + ',1');
+    } else {
+        armedAddrs.set(addr, n - 1);
+    }
+}
+
+// Check if any user-set breakpoint is armed (live in the stub) at this address.
+// Disarmed source breakpoints (inactive overlay module) don't count.
 function isBreakpointAt(addr) {
     for (const [, bp] of bps)  { if (bp.addr === addr) return true; }
     for (const [, bp] of ibps) { if (bp.addr === addr) return true; }
-    for (const [, arr] of srcBps) { for (const bp of arr) { if (bp.addr === addr) return true; } }
+    for (const [, arr] of srcBps) { for (const bp of arr) { if (bp.addr === addr && bp.armed) return true; } }
     return false;
 }
 
@@ -1035,8 +1202,10 @@ function resolveSrcLineAddr(file, reqLine) {
 // Arm a Turbo Run: optional one-shot breakpoint at addr, then enable warp,
 // remembering the prior warp state so onStopReply_emit can restore it.
 async function armTurbo(addr) {
-    if (addr >= 0 && !isBreakpointAt(addr)) {
-        await gdbCmd('Z0,' + addr.toString(16) + ',1');
+    if (addr >= 0) {
+        // Ref-counted: safe even if a real breakpoint already sits here — cleanup
+        // decrements without removing the user's breakpoint.
+        await armAddr(addr);
         tempStepBp = addr;
     }
     const prev = await gdbCmd('qOricWarp');
@@ -1976,11 +2145,7 @@ const handlers = {
         // then continue via the continueAfterStep flag in onStopReply
         if (regs && regs.pc !== undefined) {
             const pc = regs.pc;
-            let onBp = false;
-            for (const [, bp] of bps)    { if (bp.addr === pc) { onBp = true; break; } }
-            if (!onBp) for (const [, bp] of ibps)   { if (bp.addr === pc) { onBp = true; break; } }
-            if (!onBp) for (const [, arr] of srcBps) { for (const bp of arr) { if (bp.addr === pc) { onBp = true; break; } } if (onBp) break; }
-            if (onBp) {
+            if (isBreakpointAt(pc)) {
                 continueAfterStep = true;
                 regs = null;
                 respond(req, { allThreadsContinued: true });
@@ -2005,9 +2170,8 @@ const handlers = {
         if (granularity === 'statement' && src && /\.[cC]$/i.test(src.file)) {
             const nextAddr = findNextSourceLineAddr(regs.pc, src.file, src.line);
             if (nextAddr >= 0) {
-                const alreadySet = isBreakpointAt(nextAddr);
-                if (!alreadySet) await gdbCmd('Z0,' + nextAddr.toString(16) + ',1');
-                tempStepBp = alreadySet ? -1 : nextAddr;
+                await armAddr(nextAddr); // ref-counted; released on the next stop
+                tempStepBp = nextAddr;
                 // If PC is on a breakpoint, step past it first (onStopReply will 'c')
                 const onBp = isBreakpointAt(regs.pc);
                 regs = null;
@@ -2037,9 +2201,8 @@ const handlers = {
         if (granularity === 'statement' && src && /\.[cC]$/i.test(src.file)) {
             const nextAddr = findNextSourceLineAddr(regs.pc, src.file, src.line);
             if (nextAddr >= 0) {
-                const alreadySet = isBreakpointAt(nextAddr);
-                if (!alreadySet) await gdbCmd('Z0,' + nextAddr.toString(16) + ',1');
-                tempStepBp = alreadySet ? -1 : nextAddr;
+                await armAddr(nextAddr); // ref-counted; released on the next stop
+                tempStepBp = nextAddr;
                 const onBp = isBreakpointAt(regs.pc);
                 regs = null;
                 respond(req);
@@ -2077,13 +2240,23 @@ const handlers = {
     async setBreakpoints(req) {
         const args = req.arguments;
         const srcPath = args.source && args.source.path ? args.source.path : '';
+        // Key srcBps by the normalized path so a re-cased/non-canonical path for the
+        // same file can't leave a stale bucket (and stale armed Z0s) behind.
+        const norm = path.resolve(srcPath).toLowerCase();
 
-        // Remove previous source breakpoints for this file
-        const prev = srcBps.get(srcPath) || [];
+        // Remove previous source breakpoints for this file (only armed ones are in the stub)
+        const prev = srcBps.get(norm) || [];
         for (const bp of prev) {
-            await gdbCmd('z0,' + bp.addr.toString(16) + ',1');
+            if (bp.armed) await disarmAddr(bp.addr);
         }
-        srcBps.set(srcPath, []);
+        srcBps.set(norm, []);
+
+        // Resolve against the line table of the module that OWNS this file, so a
+        // breakpoint in a not-currently-active overlay still binds. Arm it in the
+        // stub only while its module is active (or it's resident); rearm on switch.
+        const bpModule = fileToModule.has(norm) ? fileToModule.get(norm) : 'R';
+        const ownerBucket = moduleBuckets.get(bpModule) || moduleBuckets.get('R');
+        const lt = ownerBucket ? ownerBucket.lineTable : lineTable;
 
         const result = [];
         const newBps = [];
@@ -2091,11 +2264,10 @@ const handlers = {
         for (const sbp of (args.breakpoints || [])) {
             const reqLine = sbp.line;
 
-            // Search line table for best match: same file, nearest line <= requested
+            // Search the owning module's line table: same file, nearest line <= requested
             let bestAddr = -1, bestLine = -1;
-            for (const entry of lineTable) {
-                // Compare paths case-insensitively on Windows
-                const match = path.resolve(entry.file).toLowerCase() === path.resolve(srcPath).toLowerCase();
+            for (const entry of lt) {
+                const match = path.resolve(entry.file).toLowerCase() === norm;
                 if (match && entry.line <= reqLine && entry.line > bestLine) {
                     bestLine = entry.line;
                     bestAddr = entry.addr;
@@ -2103,16 +2275,27 @@ const handlers = {
             }
 
             if (bestAddr >= 0) {
-                const r = await gdbCmd('Z0,' + bestAddr.toString(16) + ',1');
+                const shouldArm = (bpModule === 'R' || bpModule === activeModuleId);
+                let ok = true;
+                if (shouldArm) {
+                    ok = await armAddr(bestAddr);
+                }
                 const id = bpId++;
-                const ok = r === 'OK';
-                newBps.push({ id: id, addr: bestAddr });
+                // "verified" (red) means the breakpoint is live in the stub right
+                // now. A breakpoint in a not-currently-active overlay is resolved
+                // but disarmed, so it shows unverified (gray) until its module
+                // loads — rearmModuleBreakpoints() flips it via a breakpoint event.
+                const verified = shouldArm && ok;
+                const inactiveMsg = (bpModule !== 'R' && bpModule !== activeModuleId)
+                    ? 'Inactive module (' + (moduleNames.get(bpModule) || bpModule) + ') — binds when it loads'
+                    : undefined;
+                newBps.push({ id: id, addr: bestAddr, module: bpModule, armed: verified, line: bestLine, source: args.source });
                 result.push({
                     id: id,
-                    verified: ok,
+                    verified: verified,
                     line: bestLine,
                     source: args.source,
-                    message: ok ? undefined : 'Failed to set breakpoint'
+                    message: ok ? inactiveMsg : 'Failed to set breakpoint'
                 });
             } else {
                 result.push({
@@ -2122,14 +2305,14 @@ const handlers = {
                 });
             }
         }
-        srcBps.set(srcPath, newBps);
+        srcBps.set(norm, newBps);
         respond(req, { breakpoints: result });
     },
 
     async setFunctionBreakpoints(req) {
         // Clear all existing function breakpoints from the stub
         for (const [, bp] of bps) {
-            await gdbCmd('z0,' + bp.addr.toString(16) + ',1');
+            await disarmAddr(bp.addr);
         }
         bps.clear();
 
@@ -2139,9 +2322,8 @@ const handlers = {
             const name = fbp.name;
             const addr = symbols.get(name);
             if (addr !== undefined) {
-                const r = await gdbCmd('Z0,' + addr.toString(16) + ',1');
+                const ok = await armAddr(addr);
                 const id = bpId++;
-                const ok = r === 'OK';
                 bps.set(id, { id: id, addr: addr, name: name });
                 result.push({
                     id: id,
@@ -2166,16 +2348,15 @@ const handlers = {
     async setInstructionBreakpoints(req) {
         // Clear existing instruction breakpoints
         for (const [, bp] of ibps) {
-            await gdbCmd('z0,' + bp.addr.toString(16) + ',1');
+            await disarmAddr(bp.addr);
         }
         ibps.clear();
 
         const result = [];
         for (const ibp of (req.arguments.breakpoints || [])) {
             const addr = (parseInt(ibp.instructionReference, 16) + (ibp.offset || 0)) & 0xFFFF;
-            const r = await gdbCmd('Z0,' + addr.toString(16) + ',1');
+            const ok = await armAddr(addr);
             const id = bpId++;
-            const ok = r === 'OK';
             if (ok) ibps.set(id, { id: id, addr: addr });
             result.push({
                 id: id,
@@ -2669,6 +2850,22 @@ const handlers = {
         return handlers.continue(req); // responds + issues continue (handles PC-on-BP)
     },
 
+    // -- Multi-module symbol selection (custom requests) --------------
+    getModules(req) {
+        respond(req, { modules: listModules(), active: activeModuleId });
+    },
+
+    async setActiveModule(req) {
+        const id = req.arguments ? req.arguments.id : undefined;
+        if (id === null) { applyActiveModule(null); }
+        else if (moduleNames.has(id)) { applyActiveModule(id); }
+        else { respond(req, {}, false, 'Unknown module id ' + id); return; }
+        await rearmModuleBreakpoints();
+        respond(req, { active: activeModuleId, name: (activeModuleId !== null ? moduleNames.get(activeModuleId) : null) });
+        // Re-emit a stop so VS Code re-queries stack/scopes/variables with the new symbols.
+        if (!running) evt('stopped', { reason: 'module switch', threadId: 1, allThreadsStopped: true });
+    },
+
     // -- Reset cycle counter (custom request) -------------------------
 
     async resetCycles(req) {
@@ -3089,63 +3286,33 @@ const handlers = {
         const windowEnd = Math.min(allInsns.length, windowStart + count);
         const instructions = allInsns.slice(windowStart, windowEnd);
 
-        // Collect all breakpoint addresses
+        // Collect breakpoint addresses, split by whether they're live in the stub.
+        // Armed → solid dot; pending (resolved but disarmed, e.g. inactive overlay
+        // module) → hollow dot. Function/instruction bps are always armed.
         const bpAddrs = [];
+        const pendingAddrs = [];
         for (const [, bp] of bps) bpAddrs.push(bp.addr);
         for (const [, bp] of ibps) bpAddrs.push(bp.addr);
         for (const [, fileBps] of srcBps) {
-            for (const bp of fileBps) bpAddrs.push(bp.addr);
+            for (const bp of fileBps) (bp.armed ? bpAddrs : pendingAddrs).push(bp.addr);
         }
 
-        respond(req, { instructions, pc, breakpoints: bpAddrs });
-    },
-
-    // -- Toggle instruction breakpoint (custom request) ---------------
-
-    async toggleInstructionBreakpoint(req) {
-        const args = req.arguments || {};
-        const addr = args.address;
-        if (typeof addr !== 'number') {
-            respond(req, { set: false, address: 0 }, false, 'address required');
-            return;
-        }
-
-        // Check if there's already an instruction breakpoint at this address
-        let existingId = null;
-        for (const [id, bp] of ibps) {
-            if (bp.addr === addr) { existingId = id; break; }
-        }
-
-        if (existingId !== null) {
-            // Remove it
-            await gdbCmd('z0,' + addr.toString(16) + ',1');
-            ibps.delete(existingId);
-            // Notify VS Code so the breakpoints view stays in sync
-            sendDap({ type: 'event', event: 'breakpoint', body: {
-                reason: 'removed', breakpoint: { id: existingId, verified: false }
-            }});
-            respond(req, { set: false, address: addr });
-        } else {
-            // Set it
-            const r = await gdbCmd('Z0,' + addr.toString(16) + ',1');
-            const ok = r === 'OK';
-            if (ok) {
-                const id = bpId++;
-                ibps.set(id, { id, addr });
-                sendDap({ type: 'event', event: 'breakpoint', body: {
-                    reason: 'new', breakpoint: {
-                        id, verified: true,
-                        instructionReference: '0x' + addr.toString(16).padStart(4, '0')
-                    }
-                }});
-            }
-            respond(req, { set: ok, address: addr });
-        }
+        respond(req, { instructions, pc, breakpoints: bpAddrs, pendingBreakpoints: pendingAddrs });
     },
 
     // -- Get last cycle annotation (custom request) -------------------
 
     getCycleAnnotation(req) {
         respond(req, { annotation: lastCycleAnnotation });
+    },
+
+    // -- Map an address to its source location (custom request) -------
+    // Used by the disassembly view so a gutter toggle can create a real
+    // SourceBreakpoint in VS Code's model rather than a view-local one.
+    locationForAddress(req) {
+        const addr = req.arguments && req.arguments.address;
+        if (typeof addr !== 'number') { respond(req, { location: null }); return; }
+        const src = sourceFor(addr & 0xffff);
+        respond(req, { location: src ? { file: src.file, line: src.line } : null });
     }
 };
