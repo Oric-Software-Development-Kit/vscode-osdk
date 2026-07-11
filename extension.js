@@ -1075,6 +1075,11 @@ const VIZ_VIDRAM_MAIN    = 8000;
 const VIZ_VIDRAM_BOTTOM  = 120;
 const VIZ_FRAME_SIZE_V1  = VIZ_FRAME_SIZE_V0 + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN + VIZ_VIDRAM_BOTTOM; // 258512
 const VIZ_MAGIC          = 0x4349564F;  // "OVIC" as uint32 LE
+// Viz server port = gdb port + this offset. Kept well clear of +1..+N so it can't
+// collide with the "Claude agent uses base gdb port + 1/+2/..." convention (a human
+// on 6502 would otherwise put viz on 6503, clashing with an agent's gdb on 6503).
+// MUST match viz_init() in Oricutron's viz_stream.c.
+const VIZ_PORT_OFFSET    = 16;
 
 function vizLog(msg) {
     if (vizOutputChannel) vizOutputChannel.appendLine('[VIZ] ' + msg);
@@ -1100,7 +1105,7 @@ function vizScheduleReconnect() {
         if (!s || s.type !== 'oric-debug') return;
         const config = s.configuration;
         const h = config.host || 'localhost';
-        const p = (config.port || 6502) + 1;
+        const p = (config.port || 6502) + VIZ_PORT_OFFSET;
         vizLog('Auto-reconnecting to ' + h + ':' + p + '...');
         vizConnect(h, p);
     }, 2000);
@@ -1275,7 +1280,7 @@ function vizRegisterConsumer(consumer) {
             const config = session.configuration;
             const gdbHost = config.host || 'localhost';
             const gdbPort = config.port || 6502;
-            vizConnect(gdbHost, gdbPort + 1);
+            vizConnect(gdbHost, gdbPort + VIZ_PORT_OFFSET);
         }
     }
 }
@@ -3999,7 +4004,7 @@ function activate(context) {
                 setTimeout(() => refreshAll(), 500);
                 // Auto-connect viz stream if any consumer panels are open
                 if (vizConsumers.size > 0) {
-                    vizConnect(gdbHost, gdbPort + 1);
+                    vizConnect(gdbHost, gdbPort + VIZ_PORT_OFFSET);
                 }
             }
         }),

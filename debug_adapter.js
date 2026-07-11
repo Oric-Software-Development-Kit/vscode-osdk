@@ -166,6 +166,14 @@ let sock = null;
 let rxBuf = '';
 let pendingResolve = null;
 let pendingCmdType = null;   // first char of pending GDB command (to distinguish responses)
+let pendingCmd = null;       // full pending GDB command (some commands reply with a stop packet)
+
+// Commands whose legitimate RESPONSE is a stop packet (T../S..), so a T/S while
+// they're pending must resolve the await — NOT be treated as an unsolicited stop.
+// (`?` is the initial stop query; `qOricHardReset` replies T05 after resetting.)
+function stopReplyIsResponse() {
+    return pendingCmdType === '?' || pendingCmd === 'qOricHardReset';
+}
 let gdbQueue = [];           // queued commands: [{cmd, resolve}]
 let disconnecting = false;
 
@@ -196,6 +204,7 @@ function gdbConnect(host, port) {
                 const r = pendingResolve;
                 pendingResolve = null;
                 pendingCmdType = null;
+                pendingCmd = null;
                 r(null);
             }
             for (const entry of gdbQueue) entry.resolve(null);
@@ -204,6 +213,21 @@ function gdbConnect(host, port) {
                 evt('terminated');
             }
         });
+    });
+}
+
+// Quick check whether something is already listening on host:port (a stale
+// emulator on our gdb port). Resolves true if a connection is accepted.
+function probePort(host, port) {
+    return new Promise((resolve) => {
+        const s = new net.Socket();
+        let done = false;
+        const finish = (v) => { if (!done) { done = true; try { s.destroy(); } catch (_) { /* ignore */ } resolve(v); } };
+        s.setTimeout(500);
+        s.once('connect', () => finish(true));
+        s.once('timeout', () => finish(false));
+        s.once('error', () => finish(false));
+        try { s.connect(port, host); } catch (_) { finish(false); }
     });
 }
 
@@ -240,13 +264,16 @@ function onGdbData(data) {
         // (T05/S05) while we're waiting for a non-'?' response.
         if (pendingResolve) {
             const isStop = (payload[0] === 'T' || payload[0] === 'S');
-            if (isStop && pendingCmdType !== '?') {
-                // Unsolicited stop while waiting for a command response
+            if (isStop && !stopReplyIsResponse()) {
+                // Unsolicited stop while waiting for a non-stop command's response
+                // (e.g. a breakpoint hit while a memory read was in flight).
                 onStopReply(payload);
             } else {
+                // The command's response (data, OK, or — for ?/qOricHardReset — a stop packet).
                 const r = pendingResolve;
                 pendingResolve = null;
                 pendingCmdType = null;
+                pendingCmd = null;
                 r(payload);
                 gdbSendNext();
             }
@@ -278,6 +305,7 @@ function gdbSendNext() {
     const { cmd, resolve } = gdbQueue.shift();
     pendingResolve = resolve;
     pendingCmdType = cmd[0];
+    pendingCmd = cmd;
     gdbWrite(cmd);
 }
 
@@ -303,6 +331,7 @@ function gdbCmd(cmd) {
             // Send immediately
             pendingResolve = resolve;
             pendingCmdType = cmd[0];
+            pendingCmd = cmd;
             gdbWrite(cmd);
         }
     });
@@ -332,7 +361,7 @@ let nextVarRef = 100;         // next available variablesReference id (1-5 reser
 let displayHex = true;        // true = hex primary, false = decimal primary
 let configDone = false;
 let pendingStop = null;       // deferred stopped event body
-let srcBps     = new Map();   // file -> [{id, addr}] (source breakpoints per file)
+let srcBps     = new Map();   // file -> [{id, line, source, bindings:[{addr,module,armed}]}] — one binding per owning overlay (shared files span several)
 let dataBps    = new Map();   // id -> { addr, accessType, gdbType } (data breakpoints)
 let armedAddrs = new Map();   // addr -> refcount of execution breakpoints armed in the stub
 let moduleWatchAddr = -1;     // addr of the hidden _osdk_dbg_module write-watch (-1 = none); arms overlays on load
@@ -430,7 +459,7 @@ function runBuild(command, cwd) {
 let moduleBuckets  = new Map();  // key ('R' | id) -> bucket
 let moduleNames    = new Map();  // id(number) -> module name
 let moduleFiles    = new Map();  // key -> Set(source file paths in that bucket)
-let fileToModule   = new Map();  // normalized file path -> owning module key (for scoped bps)
+let fileToModules  = new Map();  // normalized file path -> [owning module keys] (a shared source file can be linked into several overlays, at a different address in each)
 let activeModuleId = null;       // null = single-module / none selected
 let moduleReported = false;      // have we surfaced the active module to the UI yet this session?
 let moduleAllFiles = [];         // union of all #FILES paths (for resolveLibrarySources)
@@ -502,9 +531,13 @@ function listModules() {
 // Read the resident _osdk_dbg_module byte and switch the active module if it
 // changed. No-op for single-module projects (no #MODULE sections, or no
 // _osdk_dbg_module symbol). Reads are benign (gdb_read_memory uses mon_read).
-async function checkModuleSwitch() {
+async function checkModuleSwitch(force) {
     if (moduleNames.size === 0) return;
-    if (pendingResolve) return; // a command is already in flight; skip to avoid queueing behind it
+    // At a normal stop, skip if a command is in flight to avoid queueing behind it
+    // (the check re-runs next stop). But the module-load handoff (phase 2) MUST run
+    // even then, or the incoming overlay's breakpoints never get armed before resume;
+    // `force` lets its read queue behind the in-flight command and resolve after.
+    if (pendingResolve && !force) return;
     // At cold boot the module byte is uninitialized RAM (could read as any value,
     // including a valid id like 0). Don't believe it until a write has been observed
     // (moduleWatchPending path) or we attached to an already-running program. Until
@@ -544,16 +577,21 @@ async function checkModuleSwitch() {
 async function rearmModuleBreakpoints() {
     for (const [, arr] of srcBps) {
         for (const bp of arr) {
-            const desired = (bp.module === 'R' || bp.module === activeModuleId);
-            if (desired && !bp.armed) {
-                await armAddr(bp.addr);
-                bp.armed = true;
-                evt('breakpoint', { reason: 'changed', breakpoint: { id: bp.id, verified: true, line: bp.line, source: bp.source } });
-            } else if (!desired && bp.armed) {
-                await disarmAddr(bp.addr);
-                bp.armed = false;
-                evt('breakpoint', { reason: 'changed', breakpoint: { id: bp.id, verified: false, line: bp.line, source: bp.source,
-                    message: 'Inactive module (' + (moduleNames.get(bp.module) || bp.module) + ') — binds when it loads' } });
+            // A source breakpoint has one binding per owning module (shared files
+            // span several overlays). Arm the binding whose module is now active or
+            // resident; disarm the rest. The bp is verified if ANY binding is armed.
+            let changed = false;
+            for (const b of bp.bindings) {
+                const desired = (b.module === 'R' || b.module === activeModuleId);
+                if (desired && !b.armed) { b.armed = await armAddr(b.addr); changed = true; }
+                else if (!desired && b.armed) { await disarmAddr(b.addr); b.armed = false; changed = true; }
+            }
+            if (changed) {
+                const verified = bp.bindings.some(b => b.armed);
+                evt('breakpoint', { reason: 'changed', breakpoint: verified
+                    ? { id: bp.id, verified: true, line: bp.line, source: bp.source }
+                    : { id: bp.id, verified: false, line: bp.line, source: bp.source,
+                        message: 'Inactive module — binds when its overlay loads' } });
             }
         }
     }
@@ -680,10 +718,17 @@ function loadSymbols(file) {
             }
         }
 
-        // Map each source file to the module that owns it (module-scoped breakpoints).
-        fileToModule = new Map();
+        // Map each source file to ALL modules that own it (module-scoped breakpoints).
+        // A file shared across overlays (e.g. printf.s linked into several modules)
+        // maps to each, so a breakpoint in it binds in whichever module is active.
+        fileToModules = new Map();
         for (const [key, fset] of moduleFiles) {
-            for (const f of fset) fileToModule.set(canonPath(f), key);
+            for (const f of fset) {
+                const k = canonPath(f);
+                let list = fileToModules.get(k);
+                if (!list) { list = []; fileToModules.set(k, list); }
+                if (!list.includes(key)) list.push(key);
+            }
         }
 
         // Default active module: config override, else NONE (resident-only). On boot
@@ -861,7 +906,7 @@ async function onStopReply(payload) {
     if (moduleWatchPending) {
         moduleWatchPending = false;
         moduleByteTrusted = true; // a real write to the byte just committed — it's meaningful now
-        if (moduleNames.size > 0) await checkModuleSwitch(); // reads new id, arms its bps
+        if (moduleNames.size > 0) await checkModuleSwitch(true); // force: must arm incoming bps before resume, even if a read is in flight
         if (resumeMode === 'run') {
             running = true;
             regs = null;
@@ -966,6 +1011,12 @@ async function onStopReply(payload) {
 // Internal/hidden: tracked only in moduleWatchAddr, never surfaced to VS Code or
 // stored in dataBps, so the user can't delete it by accident. Multi-module only.
 async function armModuleWatch() {
+    // Clear a previously-armed module watch first. A restart reuses the same socket
+    // and resetoric preserves watchpoints, so re-arming without clearing would leak a
+    // stub watchpoint slot every restart (16 → the feature dies).
+    if (moduleWatchAddr >= 0) {
+        await gdbCmd('z2,' + moduleWatchAddr.toString(16) + ',1');
+    }
     moduleWatchAddr = -1;
     if (moduleNames.size === 0) { log('Module-load watch: skipped — no #MODULE sections'); return; }
     const addr = symbols.get('_osdk_dbg_module');
@@ -1031,7 +1082,7 @@ function onStopReply_emit(watchAddr) {
         for (const [id, bp] of bps)  { if (bp.addr === regs.pc) ids.push(id); }
         for (const [id, bp] of ibps) { if (bp.addr === regs.pc) ids.push(id); }
         for (const [, arr] of srcBps) {
-            for (const bp of arr) { if (bp.addr === regs.pc && bp.armed) ids.push(bp.id); }
+            for (const bp of arr) { if (bp.bindings.some(b => b.addr === regs.pc && b.armed)) ids.push(bp.id); }
         }
         if (ids.length) { reason = 'breakpoint'; hitIds = ids; }
     }
@@ -1357,7 +1408,7 @@ async function disarmAddr(addr) {
 function isBreakpointAt(addr) {
     for (const [, bp] of bps)  { if (bp.addr === addr) return true; }
     for (const [, bp] of ibps) { if (bp.addr === addr) return true; }
-    for (const [, arr] of srcBps) { for (const bp of arr) { if (bp.addr === addr && bp.armed) return true; } }
+    for (const [, arr] of srcBps) { for (const bp of arr) { for (const b of bp.bindings) if (b.addr === addr && b.armed) return true; } }
     return false;
 }
 
@@ -1711,6 +1762,14 @@ const handlers = {
         if (config.emulatorPath) {
             // VS Code sends noDebug inside arguments for Ctrl+F5
             const isNoDebug = config.noDebug || false;
+            // Guard: if something already listens on the gdb port, a stale emulator
+            // owns it. Spawning another would fail to bind and we'd silently attach to
+            // the OLD emulator (fresh symbols vs stale code). Refuse with guidance.
+            if (!isNoDebug && await probePort(config.host || 'localhost', port)) {
+                respond(req, {}, false, 'gdb port ' + port + ' is already in use — another Oricutron/debug ' +
+                    'session is likely running on it. Close it (or change "port" in launch.json) and retry.');
+                return;
+            }
             const emuArgs = isNoDebug
                 ? [config.diskImage, '-s', 'symbols', ...(config.emulatorArgs || [])]
                 : [config.diskImage, '--gdb_port', String(port), '-s', 'symbols', ...(config.emulatorArgs || [])];
@@ -1774,6 +1833,12 @@ const handlers = {
                     await new Promise(r => setTimeout(r, retryDelay));
                 }
             }
+        }
+        // Total connect failure: kill the emulator we spawned so it doesn't linger and
+        // own the port for the next launch (which would then attach to this stale one).
+        if (launchedProcess) {
+            try { launchedProcess.kill(); } catch (_) { /* ignore */ }
+            launchedProcess = null;
         }
         respond(req, {}, false, 'Could not connect to ' + host + ':' + port +
             ' after ' + retries + ' retries — is Oricutron running?');
@@ -1865,6 +1930,9 @@ const handlers = {
         configDone = false;
         pendingStop = null;
         running = false;
+        // Fresh boot: don't trust the resident module byte until the loader re-stamps
+        // it (loadSymbols already reset activeModuleId/moduleReported). Matches launch().
+        moduleByteTrusted = false;
 
         const reply = await gdbCmd('qOricHardReset');
         if (reply) {
@@ -2444,73 +2512,69 @@ const handlers = {
         // same file can't leave a stale bucket (and stale armed Z0s) behind.
         const norm = canonPath(srcPath);
 
-        // Remove previous source breakpoints for this file (only armed ones are in the stub)
+        // Remove previous source breakpoints for this file (disarm every live binding).
         const prev = srcBps.get(norm) || [];
         for (const bp of prev) {
-            if (bp.armed) await disarmAddr(bp.addr);
+            for (const b of bp.bindings) if (b.armed) await disarmAddr(b.addr);
         }
         srcBps.set(norm, []);
 
-        // Resolve against the line table of the module that OWNS this file, so a
-        // breakpoint in a not-currently-active overlay still binds. Arm it in the
-        // stub only while its module is active (or it's resident); rearm on switch.
-        const bpModule = fileToModule.has(norm) ? fileToModule.get(norm) : 'R';
-        const ownerBucket = moduleBuckets.get(bpModule) || moduleBuckets.get('R');
-        const lt = ownerBucket ? ownerBucket.lineTable : lineTable;
+        // A source file can be linked into several overlays (shared code like
+        // printf.s), at a different address in each. Resolve the line in EACH owning
+        // module so the breakpoint binds wherever the file lives; arm the binding for
+        // the currently active/resident module, keep the rest pending for a switch.
+        const owners = fileToModules.get(norm) || ['R'];
+        const activeInFile = owners.includes('R') || owners.includes(activeModuleId);
 
         const result = [];
         const newBps = [];
 
         for (const sbp of (args.breakpoints || [])) {
             const reqLine = sbp.line;
+            const bindings = [];
+            let dispLine = -1;
 
-            // Snap to the nearest executable line AT/AFTER the requested line (forward —
-            // the debugger convention when a line has no code, e.g. a comment or blank).
-            // Only fall back to the nearest line before it when nothing follows in the
-            // file (breakpoint set past the last statement). Snapping backward would make
-            // distinct requested lines collapse onto one earlier line (the "two at 489").
-            let bestAddr = -1, bestLine = -1;         // forward: smallest line >= reqLine
-            let beforeAddr = -1, beforeLine = -1;     // fallback: largest line < reqLine
-            for (const entry of lt) {
-                if (canonPath(entry.file) !== norm) continue;
-                if (entry.line >= reqLine) {
-                    if (bestLine < 0 || entry.line < bestLine) { bestLine = entry.line; bestAddr = entry.addr; }
-                } else if (entry.line > beforeLine) {
-                    beforeLine = entry.line; beforeAddr = entry.addr;
+            for (const mod of owners) {
+                const bucket = moduleBuckets.get(mod) || moduleBuckets.get('R');
+                const lt = bucket ? bucket.lineTable : lineTable;
+                // Snap forward to the next executable line at/after reqLine (comment/
+                // blank lines have no code); fall back to the nearest before only at
+                // end of file. Snapping backward would collapse distinct lines (the
+                // old "two at 489" bug).
+                let bestAddr = -1, bestLine = -1, beforeAddr = -1, beforeLine = -1;
+                for (const entry of lt) {
+                    if (canonPath(entry.file) !== norm) continue;
+                    if (entry.line >= reqLine) {
+                        if (bestLine < 0 || entry.line < bestLine) { bestLine = entry.line; bestAddr = entry.addr; }
+                    } else if (entry.line > beforeLine) {
+                        beforeLine = entry.line; beforeAddr = entry.addr;
+                    }
+                }
+                if (bestAddr < 0) { bestAddr = beforeAddr; bestLine = beforeLine; }
+                if (bestAddr >= 0) {
+                    bindings.push({ addr: bestAddr, module: mod, armed: false });
+                    if (dispLine < 0 || mod === activeModuleId) dispLine = bestLine; // prefer the active module's snapped line
                 }
             }
-            if (bestAddr < 0) { bestAddr = beforeAddr; bestLine = beforeLine; }
 
-            if (bestAddr >= 0) {
-                const shouldArm = (bpModule === 'R' || bpModule === activeModuleId);
-                let ok = true;
-                if (shouldArm) {
-                    ok = await armAddr(bestAddr);
-                }
-                const id = bpId++;
-                // "verified" (red) means the breakpoint is live in the stub right
-                // now. A breakpoint in a not-currently-active overlay is resolved
-                // but disarmed, so it shows unverified (gray) until its module
-                // loads — rearmModuleBreakpoints() flips it via a breakpoint event.
-                const verified = shouldArm && ok;
-                const inactiveMsg = (bpModule !== 'R' && bpModule !== activeModuleId)
-                    ? 'Inactive module (' + (moduleNames.get(bpModule) || bpModule) + ') — binds when it loads'
-                    : undefined;
-                newBps.push({ id: id, addr: bestAddr, module: bpModule, armed: verified, line: bestLine, source: args.source });
-                result.push({
-                    id: id,
-                    verified: verified,
-                    line: bestLine,
-                    source: args.source,
-                    message: ok ? inactiveMsg : 'Failed to set breakpoint'
-                });
-            } else {
-                result.push({
-                    id: bpId++,
-                    verified: false,
-                    message: 'No code at this line'
-                });
+            const id = bpId++;
+            if (!bindings.length) {
+                result.push({ id, verified: false, message: 'No code at this line' });
+                continue;
             }
+            // Arm bindings for the active/resident module now; others arm on switch
+            // (rearmModuleBreakpoints). armAddr is ref-counted so overlap is safe.
+            let anyArmed = false, anyFail = false;
+            for (const b of bindings) {
+                if (b.module === 'R' || b.module === activeModuleId) {
+                    b.armed = await armAddr(b.addr);
+                    if (b.armed) anyArmed = true; else anyFail = true;
+                }
+            }
+            const message = anyFail ? 'Failed to set breakpoint'
+                : (!activeInFile ? 'Inactive module (' + owners.map(m => moduleNames.get(m) || m).join('/') + ') — binds when it loads' : undefined);
+            newBps.push({ id, line: dispLine, source: args.source, bindings });
+            result.push({ id, verified: anyArmed, line: dispLine, source: args.source, message });
         }
         srcBps.set(norm, newBps);
         respond(req, { breakpoints: result });
@@ -3019,19 +3083,34 @@ const handlers = {
     },
 
     async evaluateMemory(req) {
-        const expr = req.arguments.expression || '';
+        const rawExpr = req.arguments.expression || '';
         const count = req.arguments.count || 128;
-        // Evaluate expression via qOricEval
+        // Resolve symbol NAMES against the extension's module-composed table (from
+        // config.symbolFile + the active overlay), NOT Oricutron's separate flat
+        // `-s symbols` file that mon_eval would otherwise use — which is module-unaware
+        // and can be stale/missing/from another project. Substitute each known symbol
+        // with its hex address so qOricEval only does the arithmetic/deref; unknown
+        // tokens (CPU registers X/Y, literals) pass through to mon_eval. Keeps the
+        // memory panel consistent with hover/call-stack/symbol-browser across switches.
+        // Lookbehind (?<![$\w]) so we only match standalone identifiers: a token right
+        // after '$' is a hex literal (e.g. $ACCA), and one glued to a word char is part
+        // of a larger token — neither should be rewritten even if it names a symbol.
+        const expr = rawExpr.replace(/(?<![$\w])[A-Za-z_.][\w.]*/g, (tok) => {
+            if (symbols.has(tok)) return '$' + (symbols.get(tok) & 0xffff).toString(16);
+            const alt = tok.startsWith('_') ? tok : '_' + tok; // C symbols carry a leading _
+            if (symbols.has(alt)) return '$' + (symbols.get(alt) & 0xffff).toString(16);
+            return tok;
+        });
         const hexExpr = Buffer.from(expr, 'utf8').toString('hex');
         const evalReply = await gdbCmd('qOricEval,' + hexExpr);
         if (!evalReply || !evalReply.startsWith('V')) {
-            respond(req, { error: 'Invalid expression: ' + expr });
+            respond(req, { error: 'Invalid expression: ' + rawExpr });
             return;
         }
         const addr = parseInt(evalReply.substring(1), 16);
         // Read memory
         const memReply = await gdbCmd('m' + addr.toString(16) + ',' + count.toString(16));
-        respond(req, { address: addr, data: memReply || '', expression: expr });
+        respond(req, { address: addr, data: memReply || '', expression: rawExpr });
     },
 
     logToConsole(req) {
@@ -3154,10 +3233,14 @@ const handlers = {
         // Group contiguous pages into ranges for batch reading
         const pageArr = Array.from(pages).sort((a, b) => a - b);
         const ranges = [];
+        // Cap each range at 15 pages (3840 bytes). The stub clamps a single `m` reply
+        // to (GDB_PKT_SIZE-5)/2 = 4093 bytes; a larger request comes back truncated and
+        // the fill loop below would silently leave the tail pages as zeros — shown as
+        // real values in the Symbols view. 15 pages stays safely under the clamp.
         for (let i = 0; i < pageArr.length; ) {
             const start = pageArr[i];
             let end = start;
-            while (i + 1 < pageArr.length && pageArr[i + 1] === end + 1 && end - start < 31) {
+            while (i + 1 < pageArr.length && pageArr[i + 1] === end + 1 && (end - start + 1) < 15) {
                 end = pageArr[++i];
             }
             ranges.push({ start, count: end - start + 1 });
@@ -3531,7 +3614,7 @@ const handlers = {
         for (const [, bp] of bps) bpAddrs.push(bp.addr);
         for (const [, bp] of ibps) bpAddrs.push(bp.addr);
         for (const [, fileBps] of srcBps) {
-            for (const bp of fileBps) (bp.armed ? bpAddrs : pendingAddrs).push(bp.addr);
+            for (const bp of fileBps) for (const b of bp.bindings) (b.armed ? bpAddrs : pendingAddrs).push(b.addr);
         }
 
         respond(req, { instructions, pc, breakpoints: bpAddrs, pendingBreakpoints: pendingAddrs });
