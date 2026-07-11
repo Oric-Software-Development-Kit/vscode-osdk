@@ -12,6 +12,26 @@ const LOG_LEVEL_KEY = 'oric-debug.logLevel';
 // recovered on next activation rather than leaving GitLens blame off forever.
 const GITLENS_BLAME_KEY = 'oric-debug.gitlensBlamePrev';
 
+// mtime of extension.js as loaded by THIS VS Code host (captured once at module
+// load). If the on-disk file later becomes newer, the running host is stale and a
+// window reload is needed. Only extension.js can go stale this way — the adapter
+// and resolver.cjs respawn from disk on every debug session.
+const loadedExtMtimeMs = (() => { try { return require('fs').statSync(__filename).mtimeMs; } catch (_) { return 0; } })();
+
+// Warn (with a Reload action) when extension.js on disk is newer than what the
+// host loaded — complements the adapter's session banner, which only reports disk
+// mtimes and can't tell whether the running host matches them.
+function warnIfStaleExtension(session) {
+    let cur = 0;
+    try { cur = require('fs').statSync(__filename).mtimeMs; } catch (_) { return; }
+    if (!loadedExtMtimeMs || cur <= loadedExtMtimeMs + 1000) return; // 1s slack for fs mtime granularity
+    const msg = 'Oric Debug: extension.js changed since this window loaded — reload to run the latest.';
+    if (session) session.customRequest('logToConsole', { text: '⚠ ' + msg }).catch(() => {});
+    vscode.window.showWarningMessage(msg, 'Reload Window').then(pick => {
+        if (pick === 'Reload Window') vscode.commands.executeCommand('workbench.action.reloadWindow');
+    });
+}
+
 // Canonical key for comparing filesystem paths across sources (symbol-file
 // paths vs VS Code's editor.document.uri.fsPath). path.resolve normalizes the
 // separators for the host OS (and, on Windows, e.g. "E:\a" vs "e:/a"), which is
@@ -3858,6 +3878,7 @@ function activate(context) {
                 const gdbHost = config.host || 'localhost';
                 const gdbPort = config.port || 6502;
                 vizLog('Debug session started — GDB on ' + gdbHost + ':' + gdbPort);
+                warnIfStaleExtension(s); // flag a stale host (on-disk extension.js newer than loaded)
                 disassemblyAutoOpened = false;
                 disasmCenterAddr = null;
                 vscode.commands.executeCommand('setContext', 'oric-debug.warp', false); // session starts at normal speed

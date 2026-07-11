@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.8
+
+### Stale-Host Detection
+- On session start, if `extension.js` on disk is newer than the version this VS Code window actually loaded, a warning fires (with a **Reload Window** button) and a note prints in the Debug Console — closing the gap the mtime banner alone leaves (it reports disk state, not whether the running host matches). The adapter and `resolver.cjs` respawn per session so they can't go stale; only the host-resident `extension.js` can.
+
 ## 0.0.7
 
 ### Single-Source-of-Truth Address Resolver (call stack fixed)
