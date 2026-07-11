@@ -24,6 +24,11 @@ const canonPath = p => {
     return caseInsensitiveFS ? r.toLowerCase() : r;
 };
 
+// Single-source-of-truth address resolver (SPEC-address-resolver.md). Built per
+// symbol load; every view that needs "what is at address X" goes through it.
+const { buildResolver } = require('./resolver.cjs');
+let resolverInstance = null;
+
 // ----------------------------------------------------------------
 // DAP protocol I/O  (Content-Length framing over stdin/stdout)
 // ----------------------------------------------------------------
@@ -102,6 +107,22 @@ function logVerbose(msg) {
 function applyLogLevel(lvl, initial) {
     logLevel = lvl;
     evt('oricLogLevel', { level: logLevel, name: LOG_LEVEL_NAMES[logLevel], initial: !!initial });
+}
+
+// Session-start banner: extension version + file mtimes, so you can confirm at a
+// glance that a reload/respawn actually picked up your edits. The adapter is
+// respawned each session (edits live on next session); extension.js only refreshes
+// on a window reload — showing both mtimes makes a stale extension.js obvious.
+function logSessionBanner() {
+    let ver = '?';
+    try { ver = require('./package.json').version; } catch (_) { /* ignore */ }
+    const stamp = f => {
+        try { return fs.statSync(path.join(__dirname, f)).mtime.toISOString().replace('T', ' ').slice(0, 16); }
+        catch (_) { return '?'; }
+    };
+    log('Oric Debug v' + ver + '  ·  adapter ' + stamp('debug_adapter.js') +
+        '  ·  extension ' + stamp('extension.js') + '  ·  resolver ' + stamp('resolver.cjs') +
+        '  (file mtimes, UTC)');
 }
 
 // Full reference for the Debug Console `help` command.
@@ -442,6 +463,7 @@ function applyActiveModule(id) {
         for (const e of b.lineTable)       lineTable.push(e);
     }
     activeModuleId = id;
+    if (resolverInstance) resolverInstance.setActiveModule(id); // keep the resolver's composed view in sync
 
     // Sort + dedupe line table: keep last entry per address (the code-producing line)
     if (lineTable.length > 1) {
@@ -549,7 +571,8 @@ function loadSymbols(file) {
     moduleBuckets.set('R', resident); moduleFiles.set('R', new Set());
 
     try {
-        const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
+        const fileText = fs.readFileSync(file, 'utf8');
+        const lines = fileText.split(/\r?\n/);
         let isV2 = false;
         let section = 'sym';    // 'sym', 'files', 'lines', or 'types'
         let fileIndex = [];     // index -> absolute path (from #FILES, per block)
@@ -673,6 +696,14 @@ function loadSymbols(file) {
             typeof config.activeModule === 'number' && moduleNames.has(config.activeModule)) {
             defaultId = config.activeModule;
         }
+        // Build the single-source-of-truth resolver from the same file text, sharing
+        // getSourceLine so classification reuses the adapter's source cache. Must exist
+        // before applyActiveModule so its setActiveModule() hook can fire.
+        resolverInstance = buildResolver(fileText, {
+            readSourceLine: getSourceLine,
+            sourceRoot: config.sourceRoot,
+            workspaceFolder: config.workspaceFolder,
+        });
         applyActiveModule(defaultId);
 
         const modNote = moduleNames.size > 0
@@ -1595,6 +1626,7 @@ const handlers = {
 
     async attach(req) {
         config = req.arguments || {};
+        logSessionBanner();
         moduleByteTrusted = true; // attaching to a running program — the module byte is already valid
         if (config.logLevel !== undefined) logLevel = config.logLevel;
         applyLogLevel(logLevel, true); // reflect the initial level in the status bar (don't re-persist)
@@ -1638,6 +1670,7 @@ const handlers = {
 
     async launch(req) {
         config = req.arguments || {};
+        logSessionBanner();
         moduleByteTrusted = false; // fresh boot — don't believe the module byte until the loader stamps it
         if (config.logLevel !== undefined) logLevel = config.logLevel;
         applyLogLevel(logLevel, true); // reflect the initial level in the status bar (don't re-persist)
@@ -1888,21 +1921,24 @@ const handlers = {
 
         // Build a stack frame with optional source location from V2 symbols
         function makeFrame(id, addr) {
+            // Single-source-of-truth resolver: name AND source come from ONE owner,
+            // so the call stack can't disagree with the disassembly view (DOGFOODING #1).
+            const R = resolverInstance ? resolverInstance.resolve(addr) : null;
+            const name = R
+                ? (R.symbol
+                    ? (R.symbol.offset ? R.symbol.name + '+$' + R.symbol.offset.toString(16).toUpperCase() : R.symbol.name)
+                    : '$' + addr.toString(16).toUpperCase().padStart(4, '0'))
+                : labelFor(addr);
             const frame = {
                 id: id,
-                name: labelFor(addr),
+                name: name,
                 line: 0,
                 column: 0,
                 instructionPointerReference: '0x' + addr.toString(16).padStart(4, '0')
             };
-            const src = sourceFor(addr);
-            if (src) {
-                const filePath = path.isAbsolute(src.file) ? src.file
-                    : config.sourceRoot ? path.resolve(config.sourceRoot, src.file)
-                    : config.workspaceFolder ? path.resolve(config.workspaceFolder, src.file)
-                    : src.file;
-                frame.source = { name: path.basename(filePath), path: filePath };
-                frame.line = src.line;
+            if (R && R.source) {
+                frame.source = { name: path.basename(R.source.file), path: R.source.file };
+                frame.line = R.source.line;
             } else if (disasmCache && disasmCache.lineForAddr.has(addr)) {
                 // Address is within the cached disassembly window — reuse
                 // the same sourceReference so VS Code just scrolls, no tab refresh.

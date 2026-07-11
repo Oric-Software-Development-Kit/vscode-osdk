@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.0.7
+
+### Single-Source-of-Truth Address Resolver (call stack fixed)
+- New `resolver.cjs`: one pure, testable resolver that every view uses to answer "what is at address X" — name and source come from ONE canonical owner, so the call stack, disassembly, hover and annotations can't disagree
+- Fixes the call stack landing on the wrong symbol at an aliased address (DOGFOODING #1): at `$FD40`, `jmp _LoaderResidentStart` now resolves to `_LoaderResidentStart @ loader.asm:150` (the real `jsr`), not the coincidental `_OverlayBufferEnd @ kernel.s:734` boundary marker
+- Correct owner selection across all aliased addresses: line-entry-first with per-unit run detection, storage-over-EQU tie-break, source-text code/data classification; arbitrary mid-routine PCs resolve to `symbol+$offset` + enclosing line, gated so a ZP symbol never owns a mid-memory PC and an unlabeled stretch doesn't get a nonsense `func+$big`
+- Validated by two independent implementations agreeing: an offline golden test (412 aliased addresses × 7 module views) + nearest-below fixtures — runnable with plain `node test/resolver.golden.test.cjs`
+- So far wired into the call stack (`makeFrame`); the inline annotation, disassembly labels, and breakpoint binding migrate to the resolver next
+
+### Session Banner
+- The Debug Console now prints, at session start, the extension version + file mtimes of `debug_adapter.js` / `extension.js` / `resolver.cjs`, so it's obvious at a glance whether a reload/respawn picked up your edits (the adapter respawns per session; `extension.js` needs a window reload)
+
 ## 0.0.6
 
 ### Inline Current-Line Value Annotation (fixed + enhanced)

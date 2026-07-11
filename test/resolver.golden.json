@@ -1,0 +1,4951 @@
+{
+  "_meta": {
+    "symbolFile": "E:/git/Nova2026/build/symbols_ext_combined",
+    "rule": "spec v3 §5.3 (line-entry-first + unit restriction + stage-3b tie-break) / §5.4 (source-text kind)",
+    "generated": "2026-07-11T11:28:58.796Z",
+    "note": "Independent oracle (Fable). Aliased = >=2 distinct symbol names OR >=2 #LINES entries in the composed view. owner.file is absolute; compare paths case/slash-insensitively.",
+    "modules": {
+      "0": "Megabuilding",
+      "1": "Monitor",
+      "2": "Greetings",
+      "3": "Demo",
+      "4": "Credits",
+      "5": "Flatline"
+    }
+  },
+  "views": {
+    "R": {
+      "module": null,
+      "count": 40,
+      "addresses": {
+        "0004": {
+          "addr": 4,
+          "owner": {
+            "name": "pt2_DT",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 37
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0018": {
+          "addr": 24,
+          "owner": {
+            "name": "_PsgfreqA",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 59
+          },
+          "kind": "data",
+          "aliases": [
+            "_PsgVirtualRegisters"
+          ]
+        },
+        "0027": {
+          "addr": 39,
+          "owner": {
+            "name": "_MusicPsgfreqA",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 72
+          },
+          "kind": "data",
+          "aliases": [
+            "_MusicPsgVirtualRegisters"
+          ]
+        },
+        "0051": {
+          "addr": 81,
+          "owner": {
+            "name": "tmp1",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 16
+          },
+          "kind": "data",
+          "aliases": [
+            "_MemsetValue",
+            "col",
+            "count"
+          ]
+        },
+        "0053": {
+          "addr": 83,
+          "owner": {
+            "name": "tmp2",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 17
+          },
+          "kind": "data",
+          "aliases": [
+            "_MemcpySizeL",
+            "_MemsetSizeL",
+            "count",
+            "line",
+            "value",
+            "width"
+          ]
+        },
+        "0054": {
+          "addr": 84,
+          "owner": {
+            "name": "_MemsetSizeH",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 135
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_MemcpySizeH"
+          ]
+        },
+        "0055": {
+          "addr": 85,
+          "owner": {
+            "name": "tmp3",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 18
+          },
+          "kind": "data",
+          "aliases": [
+            "_fill_paper",
+            "height",
+            "stride",
+            "width"
+          ]
+        },
+        "0057": {
+          "addr": 87,
+          "owner": {
+            "name": "tmp4",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 19
+          },
+          "kind": "data",
+          "aliases": [
+            "height",
+            "value"
+          ]
+        },
+        "0059": {
+          "addr": 89,
+          "owner": {
+            "name": "tmp5",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 20
+          },
+          "kind": "data",
+          "aliases": [
+            "stride"
+          ]
+        },
+        "c14b": {
+          "addr": 49483,
+          "owner": {
+            "name": "_FillTextLines",
+            "file": "E:\\git\\Nova2026\\code\\memory.s",
+            "line": 138
+          },
+          "kind": "code",
+          "aliases": [
+            "ftl_loop"
+          ]
+        },
+        "c238": {
+          "addr": 49720,
+          "owner": {
+            "name": "_ByteStreamCommand_STOP_MUSIC",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 266
+          },
+          "kind": "code",
+          "aliases": [
+            "_EndMusic"
+          ]
+        },
+        "c248": {
+          "addr": 49736,
+          "owner": {
+            "name": "_PlayMusicFrame",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 276
+          },
+          "kind": "code",
+          "aliases": [
+            "auto_play_stop"
+          ]
+        },
+        "c423": {
+          "addr": 50211,
+          "owner": {
+            "name": "PLY_AKY_PSGREGISTER13_END",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 609
+          },
+          "kind": "code",
+          "aliases": [
+            "PLY_AKY_EXIT"
+          ]
+        },
+        "c56f": {
+          "addr": 50543,
+          "owner": {
+            "name": "PLY_AKY_RRB_NONINITIALSTATE",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 971
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c5e4": {
+          "addr": 50660,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SOFTWAREONLY_NOLSP",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1087
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c648": {
+          "addr": 50760,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWAREONLY_NOLSB",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1187
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c656": {
+          "addr": 50774,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWAREONLY_NOMSB",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1201
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c678": {
+          "addr": 50808,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERLSBH",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1235
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c686": {
+          "addr": 50822,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERMSBH",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1248
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c6bd": {
+          "addr": 50877,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERENVELOPE",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1310
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c6c3": {
+          "addr": 50883,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWARE_SHARED_NOISEORRETRIG_ANDSTOP",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1325
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c9c9": {
+          "addr": 51657,
+          "owner": {
+            "name": "_WaitKeyOrSignal",
+            "file": "E:\\git\\Nova2026\\code\\subtitle.s",
+            "line": 134
+          },
+          "kind": "code",
+          "aliases": [
+            "release"
+          ]
+        },
+        "d22e": {
+          "addr": 53806,
+          "owner": {
+            "name": "mask_patch",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 200
+          },
+          "kind": "code",
+          "aliases": [
+            "loop"
+          ]
+        },
+        "d2c6": {
+          "addr": 53958,
+          "owner": {
+            "name": "patch_bit2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 309
+          },
+          "kind": "code",
+          "aliases": [
+            "loopY"
+          ]
+        },
+        "d2cb": {
+          "addr": 53963,
+          "owner": {
+            "name": "patch_ptr0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 314
+          },
+          "kind": "code",
+          "aliases": [
+            "_opp_mh",
+            "contColumn"
+          ]
+        },
+        "d3a2": {
+          "addr": 54178,
+          "owner": {
+            "name": "patch_dy1",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 482
+          },
+          "kind": "code",
+          "aliases": [
+            "contColumn"
+          ]
+        },
+        "d3c9": {
+          "addr": 54217,
+          "owner": {
+            "name": "patch_dy2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 526
+          },
+          "kind": "code",
+          "aliases": [
+            "contColumnEnd"
+          ]
+        },
+        "d48a": {
+          "addr": 54410,
+          "owner": {
+            "name": "patch_inc0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 645
+          },
+          "kind": "code",
+          "aliases": [
+            "incHiPtr"
+          ]
+        },
+        "d497": {
+          "addr": 54423,
+          "owner": {
+            "name": "patch_ptr0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 659
+          },
+          "kind": "code",
+          "aliases": [
+            "_opp_mv",
+            "loopX"
+          ]
+        },
+        "d4e1": {
+          "addr": 54497,
+          "owner": {
+            "name": "patch_inc2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 730
+          },
+          "kind": "code",
+          "aliases": [
+            "incHiPtrEnd"
+          ]
+        },
+        "d5dd": {
+          "addr": 54749,
+          "owner": {
+            "name": "_StartBSS_Kernel",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 671
+          },
+          "kind": "data",
+          "aliases": [
+            "_KernelEnd",
+            "_KernelIrqCounter"
+          ]
+        },
+        "fd40": {
+          "addr": 64832,
+          "owner": {
+            "name": "_LoaderResidentStart",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 150
+          },
+          "kind": "code",
+          "aliases": [
+            "_OverlayBufferEnd"
+          ]
+        },
+        "fd45": {
+          "addr": 64837,
+          "owner": {
+            "name": "_LoaderAddress",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 152
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_LoaderAddressLow"
+          ]
+        },
+        "fe9a": {
+          "addr": 65178,
+          "owner": {
+            "name": "auto_fdc_readsector",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 396
+          },
+          "kind": "code",
+          "aliases": [
+            "RetryRead"
+          ]
+        },
+        "fead": {
+          "addr": 65197,
+          "owner": {
+            "name": "auto_fdc_status_1",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 412
+          },
+          "kind": "code",
+          "aliases": [
+            "waitdrq"
+          ]
+        },
+        "fecd": {
+          "addr": 65229,
+          "owner": {
+            "name": "auto_fdc_status_2",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 438
+          },
+          "kind": "code",
+          "aliases": [
+            "r2_wait_completion"
+          ]
+        },
+        "fefa": {
+          "addr": 65274,
+          "owner": {
+            "name": "_LoaderRefreshAccessIndicator",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 477
+          },
+          "kind": "code",
+          "aliases": [
+            "auto_nop_or_rts"
+          ]
+        },
+        "ff09": {
+          "addr": 65289,
+          "owner": {
+            "name": "FileStartSector",
+            "file": "E:\\git\\Nova2026\\build\\floppy_description.h",
+            "line": 10
+          },
+          "kind": "data",
+          "aliases": [
+            "_FloppyBuilderFileData"
+          ]
+        },
+        "ff6d": {
+          "addr": 65389,
+          "owner": {
+            "name": "_LoaderFileStartSector",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 516
+          },
+          "kind": "data",
+          "aliases": [
+            "_EndLoaderCode"
+          ]
+        },
+        "ff6e": {
+          "addr": 65390,
+          "owner": {
+            "name": "_osdk_dbg_module",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 528
+          },
+          "kind": "data",
+          "aliases": [
+            "_LoaderDbgModule"
+          ]
+        }
+      }
+    },
+    "R+0": {
+      "module": 0,
+      "count": 67,
+      "addresses": {
+        "3917": {
+          "addr": 14615,
+          "owner": {
+            "name": "_MapNusaImagePacked",
+            "file": "E:\\git\\Nova2026\\code\\module_megabuilding.s",
+            "line": 1592
+          },
+          "kind": "data",
+          "aliases": [
+            "_BufferAddrLow",
+            "_TrainBgBuffer"
+          ]
+        },
+        "0004": {
+          "addr": 4,
+          "owner": {
+            "name": "pt2_DT",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 37
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0006": {
+          "addr": 6,
+          "owner": {
+            "name": "ACCA",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 38
+          },
+          "kind": "data",
+          "aliases": [
+            "NC_RECT_WIDTH"
+          ]
+        },
+        "0008": {
+          "addr": 8,
+          "owner": {
+            "name": "volumeRegister",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 40
+          },
+          "kind": "data",
+          "aliases": [
+            "CA_RECT_WIDTH",
+            "CA_RECT_X0"
+          ]
+        },
+        "000c": {
+          "addr": 12,
+          "owner": {
+            "name": "PLY_AKY_CHANNEL3_WAITCOUNT",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 45
+          },
+          "kind": "data",
+          "aliases": [
+            "NC_RECT_COL"
+          ]
+        },
+        "0018": {
+          "addr": 24,
+          "owner": {
+            "name": "_PsgfreqA",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 59
+          },
+          "kind": "data",
+          "aliases": [
+            "_PsgVirtualRegisters"
+          ]
+        },
+        "001a": {
+          "addr": 26,
+          "owner": {
+            "name": "_PsgfreqB",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 60
+          },
+          "kind": "data",
+          "aliases": [
+            "NC_RECT_HEIGHT"
+          ]
+        },
+        "0027": {
+          "addr": 39,
+          "owner": {
+            "name": "_MusicPsgfreqA",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 72
+          },
+          "kind": "data",
+          "aliases": [
+            "_MusicPsgVirtualRegisters"
+          ]
+        },
+        "0031": {
+          "addr": 49,
+          "owner": {
+            "name": "_MusicPsgvolumeC",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 79
+          },
+          "kind": "data",
+          "aliases": [
+            "CA_RECT_HEIGHT",
+            "CA_RECT_X1"
+          ]
+        },
+        "004f": {
+          "addr": 79,
+          "owner": {
+            "name": "tmp0",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 15
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0051": {
+          "addr": 81,
+          "owner": {
+            "name": "tmp1",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 16
+          },
+          "kind": "data",
+          "aliases": [
+            "_MemsetValue",
+            "col",
+            "count"
+          ]
+        },
+        "0053": {
+          "addr": 83,
+          "owner": {
+            "name": "tmp2",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 17
+          },
+          "kind": "data",
+          "aliases": [
+            "_MemcpySizeL",
+            "_MemsetSizeL",
+            "count",
+            "line",
+            "value",
+            "width"
+          ]
+        },
+        "0054": {
+          "addr": 84,
+          "owner": {
+            "name": "_MemsetSizeH",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 135
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_MemcpySizeH"
+          ]
+        },
+        "0055": {
+          "addr": 85,
+          "owner": {
+            "name": "tmp3",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 18
+          },
+          "kind": "data",
+          "aliases": [
+            "_fill_paper",
+            "height",
+            "stride",
+            "width"
+          ]
+        },
+        "0057": {
+          "addr": 87,
+          "owner": {
+            "name": "tmp4",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 19
+          },
+          "kind": "data",
+          "aliases": [
+            "height",
+            "value"
+          ]
+        },
+        "0059": {
+          "addr": 89,
+          "owner": {
+            "name": "tmp5",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 20
+          },
+          "kind": "data",
+          "aliases": [
+            "stride"
+          ]
+        },
+        "005b": {
+          "addr": 91,
+          "owner": {
+            "name": "tmp6",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 21
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "005d": {
+          "addr": 93,
+          "owner": {
+            "name": "reg0",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 25
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "005f": {
+          "addr": 95,
+          "owner": {
+            "name": "reg1",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 26
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0060": {
+          "addr": 96,
+          "owner": {
+            "name": "NC_RECT_Y0",
+            "file": "E:\\git\\Nova2026\\code\\module_megabuilding.s",
+            "line": 46
+          },
+          "kind": "unknown",
+          "aliases": [
+            "NC_RECT_LINE"
+          ]
+        },
+        "0061": {
+          "addr": 97,
+          "owner": {
+            "name": "reg2",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 27
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0063": {
+          "addr": 99,
+          "owner": {
+            "name": "e",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 30
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0065": {
+          "addr": 101,
+          "owner": {
+            "name": "i",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 31
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0066": {
+          "addr": 102,
+          "owner": {
+            "name": "dx",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 32
+          },
+          "kind": "data",
+          "aliases": [
+            "NC_RECT_X1"
+          ]
+        },
+        "0067": {
+          "addr": 103,
+          "owner": {
+            "name": "dy",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 33
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0068": {
+          "addr": 104,
+          "owner": {
+            "name": "_CurrentPixelX",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 38
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006c": {
+          "addr": 108,
+          "owner": {
+            "name": "save_a",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 47
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006d": {
+          "addr": 109,
+          "owner": {
+            "name": "curBit",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 48
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006e": {
+          "addr": 110,
+          "owner": {
+            "name": "chunk",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 49
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006f": {
+          "addr": 111,
+          "owner": {
+            "name": "lastSum",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 50
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0070": {
+          "addr": 112,
+          "owner": {
+            "name": "_flash_idx",
+            "file": "E:\\git\\Nova2026\\code\\module_megabuilding.s",
+            "line": 393
+          },
+          "kind": "data",
+          "aliases": [
+            "ZpCommonEnd"
+          ]
+        },
+        "0071": {
+          "addr": 113,
+          "owner": {
+            "name": "_delay_idx",
+            "file": "E:\\git\\Nova2026\\code\\module_megabuilding.s",
+            "line": 394
+          },
+          "kind": "data",
+          "aliases": [
+            "CA_RECT_LINE",
+            "CA_RECT_Y0"
+          ]
+        },
+        "0079": {
+          "addr": 121,
+          "owner": {
+            "name": "_segs_this_frame",
+            "file": "E:\\git\\Nova2026\\code\\module_megabuilding.s",
+            "line": 401
+          },
+          "kind": "data",
+          "aliases": [
+            "NC_RECT_Y1"
+          ]
+        },
+        "0400": {
+          "addr": 1024,
+          "owner": {
+            "name": "_TrainBuffer",
+            "file": "E:\\git\\Nova2026\\code\\module_megabuilding.s",
+            "line": 217
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_Buffer_8000",
+            "_MetroInsideView",
+            "_WindowViewImage"
+          ]
+        },
+        "2df5": {
+          "addr": 11765,
+          "owner": {
+            "name": "_DrawFrame",
+            "file": "E:\\git\\Nova2026\\code\\module_megabuilding.s",
+            "line": 1336
+          },
+          "kind": "code",
+          "aliases": [
+            "df_shape_loop"
+          ]
+        },
+        "85d9": {
+          "addr": 34265,
+          "owner": {
+            "name": "_EndText",
+            "file": "E:\\git\\Nova2026\\code\\module_end.h",
+            "line": 24
+          },
+          "kind": "data",
+          "aliases": [
+            "_EndModule",
+            "_StartBSS"
+          ]
+        },
+        "c14b": {
+          "addr": 49483,
+          "owner": {
+            "name": "_FillTextLines",
+            "file": "E:\\git\\Nova2026\\code\\memory.s",
+            "line": 138
+          },
+          "kind": "code",
+          "aliases": [
+            "ftl_loop"
+          ]
+        },
+        "c238": {
+          "addr": 49720,
+          "owner": {
+            "name": "_ByteStreamCommand_STOP_MUSIC",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 266
+          },
+          "kind": "code",
+          "aliases": [
+            "_EndMusic"
+          ]
+        },
+        "c248": {
+          "addr": 49736,
+          "owner": {
+            "name": "_PlayMusicFrame",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 276
+          },
+          "kind": "code",
+          "aliases": [
+            "auto_play_stop"
+          ]
+        },
+        "c423": {
+          "addr": 50211,
+          "owner": {
+            "name": "PLY_AKY_PSGREGISTER13_END",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 609
+          },
+          "kind": "code",
+          "aliases": [
+            "PLY_AKY_EXIT"
+          ]
+        },
+        "c56f": {
+          "addr": 50543,
+          "owner": {
+            "name": "PLY_AKY_RRB_NONINITIALSTATE",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 971
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c5e4": {
+          "addr": 50660,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SOFTWAREONLY_NOLSP",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1087
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c648": {
+          "addr": 50760,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWAREONLY_NOLSB",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1187
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c656": {
+          "addr": 50774,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWAREONLY_NOMSB",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1201
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c678": {
+          "addr": 50808,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERLSBH",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1235
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c686": {
+          "addr": 50822,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERMSBH",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1248
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c6bd": {
+          "addr": 50877,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERENVELOPE",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1310
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c6c3": {
+          "addr": 50883,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWARE_SHARED_NOISEORRETRIG_ANDSTOP",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1325
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c9c9": {
+          "addr": 51657,
+          "owner": {
+            "name": "_WaitKeyOrSignal",
+            "file": "E:\\git\\Nova2026\\code\\subtitle.s",
+            "line": 134
+          },
+          "kind": "code",
+          "aliases": [
+            "release"
+          ]
+        },
+        "d22e": {
+          "addr": 53806,
+          "owner": {
+            "name": "mask_patch",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 200
+          },
+          "kind": "code",
+          "aliases": [
+            "loop"
+          ]
+        },
+        "d2c6": {
+          "addr": 53958,
+          "owner": {
+            "name": "patch_bit2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 309
+          },
+          "kind": "code",
+          "aliases": [
+            "loopY"
+          ]
+        },
+        "d2cb": {
+          "addr": 53963,
+          "owner": {
+            "name": "patch_ptr0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 314
+          },
+          "kind": "code",
+          "aliases": [
+            "_opp_mh",
+            "contColumn"
+          ]
+        },
+        "d3a2": {
+          "addr": 54178,
+          "owner": {
+            "name": "patch_dy1",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 482
+          },
+          "kind": "code",
+          "aliases": [
+            "contColumn"
+          ]
+        },
+        "d3c9": {
+          "addr": 54217,
+          "owner": {
+            "name": "patch_dy2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 526
+          },
+          "kind": "code",
+          "aliases": [
+            "contColumnEnd"
+          ]
+        },
+        "d48a": {
+          "addr": 54410,
+          "owner": {
+            "name": "patch_inc0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 645
+          },
+          "kind": "code",
+          "aliases": [
+            "incHiPtr"
+          ]
+        },
+        "d497": {
+          "addr": 54423,
+          "owner": {
+            "name": "patch_ptr0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 659
+          },
+          "kind": "code",
+          "aliases": [
+            "_opp_mv",
+            "loopX"
+          ]
+        },
+        "d4e1": {
+          "addr": 54497,
+          "owner": {
+            "name": "patch_inc2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 730
+          },
+          "kind": "code",
+          "aliases": [
+            "incHiPtrEnd"
+          ]
+        },
+        "d5dd": {
+          "addr": 54749,
+          "owner": {
+            "name": "_StartBSS_Kernel",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 671
+          },
+          "kind": "data",
+          "aliases": [
+            "_KernelEnd",
+            "_KernelIrqCounter"
+          ]
+        },
+        "fd40": {
+          "addr": 64832,
+          "owner": {
+            "name": "_LoaderResidentStart",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 150
+          },
+          "kind": "code",
+          "aliases": [
+            "_OverlayBufferEnd"
+          ]
+        },
+        "fd45": {
+          "addr": 64837,
+          "owner": {
+            "name": "_LoaderAddress",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 152
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_LoaderAddressLow"
+          ]
+        },
+        "fe9a": {
+          "addr": 65178,
+          "owner": {
+            "name": "auto_fdc_readsector",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 396
+          },
+          "kind": "code",
+          "aliases": [
+            "RetryRead"
+          ]
+        },
+        "fead": {
+          "addr": 65197,
+          "owner": {
+            "name": "auto_fdc_status_1",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 412
+          },
+          "kind": "code",
+          "aliases": [
+            "waitdrq"
+          ]
+        },
+        "fecd": {
+          "addr": 65229,
+          "owner": {
+            "name": "auto_fdc_status_2",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 438
+          },
+          "kind": "code",
+          "aliases": [
+            "r2_wait_completion"
+          ]
+        },
+        "fefa": {
+          "addr": 65274,
+          "owner": {
+            "name": "_LoaderRefreshAccessIndicator",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 477
+          },
+          "kind": "code",
+          "aliases": [
+            "auto_nop_or_rts"
+          ]
+        },
+        "ff09": {
+          "addr": 65289,
+          "owner": {
+            "name": "FileStartSector",
+            "file": "E:\\git\\Nova2026\\build\\floppy_description.h",
+            "line": 10
+          },
+          "kind": "data",
+          "aliases": [
+            "_FloppyBuilderFileData"
+          ]
+        },
+        "ff6d": {
+          "addr": 65389,
+          "owner": {
+            "name": "_LoaderFileStartSector",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 516
+          },
+          "kind": "data",
+          "aliases": [
+            "_EndLoaderCode"
+          ]
+        },
+        "ff6e": {
+          "addr": 65390,
+          "owner": {
+            "name": "_osdk_dbg_module",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 528
+          },
+          "kind": "data",
+          "aliases": [
+            "_LoaderDbgModule"
+          ]
+        }
+      }
+    },
+    "R+1": {
+      "module": 1,
+      "count": 58,
+      "addresses": {
+        "2767": {
+          "addr": 10087,
+          "owner": {
+            "name": "ss_start_outro",
+            "file": "E:\\git\\Nova2026\\code\\module_monitor.s",
+            "line": 439
+          },
+          "kind": "code",
+          "aliases": [
+            "ss_outro_loop"
+          ]
+        },
+        "8740": {
+          "addr": 34624,
+          "owner": {
+            "name": "_EndModule",
+            "file": "E:\\git\\Nova2026\\code\\module_end.h",
+            "line": 24
+          },
+          "kind": "data",
+          "aliases": [
+            "_EndBSS"
+          ]
+        },
+        "0004": {
+          "addr": 4,
+          "owner": {
+            "name": "pt2_DT",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 37
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0018": {
+          "addr": 24,
+          "owner": {
+            "name": "_PsgfreqA",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 59
+          },
+          "kind": "data",
+          "aliases": [
+            "_PsgVirtualRegisters"
+          ]
+        },
+        "0027": {
+          "addr": 39,
+          "owner": {
+            "name": "_MusicPsgfreqA",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 72
+          },
+          "kind": "data",
+          "aliases": [
+            "_MusicPsgVirtualRegisters"
+          ]
+        },
+        "004f": {
+          "addr": 79,
+          "owner": {
+            "name": "tmp0",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 15
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0051": {
+          "addr": 81,
+          "owner": {
+            "name": "tmp1",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 16
+          },
+          "kind": "data",
+          "aliases": [
+            "_MemsetValue",
+            "col",
+            "count"
+          ]
+        },
+        "0053": {
+          "addr": 83,
+          "owner": {
+            "name": "tmp2",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 17
+          },
+          "kind": "data",
+          "aliases": [
+            "_MemcpySizeL",
+            "_MemsetSizeL",
+            "count",
+            "line",
+            "value",
+            "width"
+          ]
+        },
+        "0054": {
+          "addr": 84,
+          "owner": {
+            "name": "_MemsetSizeH",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 135
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_MemcpySizeH"
+          ]
+        },
+        "0055": {
+          "addr": 85,
+          "owner": {
+            "name": "tmp3",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 18
+          },
+          "kind": "data",
+          "aliases": [
+            "_fill_paper",
+            "height",
+            "stride",
+            "width"
+          ]
+        },
+        "0057": {
+          "addr": 87,
+          "owner": {
+            "name": "tmp4",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 19
+          },
+          "kind": "data",
+          "aliases": [
+            "height",
+            "value"
+          ]
+        },
+        "0059": {
+          "addr": 89,
+          "owner": {
+            "name": "tmp5",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 20
+          },
+          "kind": "data",
+          "aliases": [
+            "stride"
+          ]
+        },
+        "005b": {
+          "addr": 91,
+          "owner": {
+            "name": "tmp6",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 21
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "005d": {
+          "addr": 93,
+          "owner": {
+            "name": "reg0",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 25
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "005f": {
+          "addr": 95,
+          "owner": {
+            "name": "reg1",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 26
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0061": {
+          "addr": 97,
+          "owner": {
+            "name": "reg2",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 27
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0063": {
+          "addr": 99,
+          "owner": {
+            "name": "e",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 30
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0065": {
+          "addr": 101,
+          "owner": {
+            "name": "i",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 31
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0066": {
+          "addr": 102,
+          "owner": {
+            "name": "dx",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 32
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0067": {
+          "addr": 103,
+          "owner": {
+            "name": "dy",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 33
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0068": {
+          "addr": 104,
+          "owner": {
+            "name": "_CurrentPixelX",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 38
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006c": {
+          "addr": 108,
+          "owner": {
+            "name": "save_a",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 47
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006d": {
+          "addr": 109,
+          "owner": {
+            "name": "curBit",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 48
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006e": {
+          "addr": 110,
+          "owner": {
+            "name": "chunk",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 49
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006f": {
+          "addr": 111,
+          "owner": {
+            "name": "lastSum",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 50
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0070": {
+          "addr": 112,
+          "owner": {
+            "name": "_font_ptr",
+            "file": "E:\\git\\Nova2026\\code\\module_monitor.s",
+            "line": 300
+          },
+          "kind": "data",
+          "aliases": [
+            "ZpCommonEnd"
+          ]
+        },
+        "0400": {
+          "addr": 1024,
+          "owner": {
+            "name": "_ScrollDataBuffer",
+            "file": "E:\\git\\Nova2026\\code\\module_monitor_scroll.s",
+            "line": 28
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_Buffer_8000"
+          ]
+        },
+        "c14b": {
+          "addr": 49483,
+          "owner": {
+            "name": "_FillTextLines",
+            "file": "E:\\git\\Nova2026\\code\\memory.s",
+            "line": 138
+          },
+          "kind": "code",
+          "aliases": [
+            "ftl_loop"
+          ]
+        },
+        "c238": {
+          "addr": 49720,
+          "owner": {
+            "name": "_ByteStreamCommand_STOP_MUSIC",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 266
+          },
+          "kind": "code",
+          "aliases": [
+            "_EndMusic"
+          ]
+        },
+        "c248": {
+          "addr": 49736,
+          "owner": {
+            "name": "_PlayMusicFrame",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 276
+          },
+          "kind": "code",
+          "aliases": [
+            "auto_play_stop"
+          ]
+        },
+        "c423": {
+          "addr": 50211,
+          "owner": {
+            "name": "PLY_AKY_PSGREGISTER13_END",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 609
+          },
+          "kind": "code",
+          "aliases": [
+            "PLY_AKY_EXIT"
+          ]
+        },
+        "c56f": {
+          "addr": 50543,
+          "owner": {
+            "name": "PLY_AKY_RRB_NONINITIALSTATE",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 971
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c5e4": {
+          "addr": 50660,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SOFTWAREONLY_NOLSP",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1087
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c648": {
+          "addr": 50760,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWAREONLY_NOLSB",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1187
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c656": {
+          "addr": 50774,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWAREONLY_NOMSB",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1201
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c678": {
+          "addr": 50808,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERLSBH",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1235
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c686": {
+          "addr": 50822,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERMSBH",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1248
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c6bd": {
+          "addr": 50877,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERENVELOPE",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1310
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c6c3": {
+          "addr": 50883,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWARE_SHARED_NOISEORRETRIG_ANDSTOP",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1325
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c9c9": {
+          "addr": 51657,
+          "owner": {
+            "name": "_WaitKeyOrSignal",
+            "file": "E:\\git\\Nova2026\\code\\subtitle.s",
+            "line": 134
+          },
+          "kind": "code",
+          "aliases": [
+            "release"
+          ]
+        },
+        "d22e": {
+          "addr": 53806,
+          "owner": {
+            "name": "mask_patch",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 200
+          },
+          "kind": "code",
+          "aliases": [
+            "loop"
+          ]
+        },
+        "d2c6": {
+          "addr": 53958,
+          "owner": {
+            "name": "patch_bit2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 309
+          },
+          "kind": "code",
+          "aliases": [
+            "loopY"
+          ]
+        },
+        "d2cb": {
+          "addr": 53963,
+          "owner": {
+            "name": "patch_ptr0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 314
+          },
+          "kind": "code",
+          "aliases": [
+            "_opp_mh",
+            "contColumn"
+          ]
+        },
+        "d3a2": {
+          "addr": 54178,
+          "owner": {
+            "name": "patch_dy1",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 482
+          },
+          "kind": "code",
+          "aliases": [
+            "contColumn"
+          ]
+        },
+        "d3c9": {
+          "addr": 54217,
+          "owner": {
+            "name": "patch_dy2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 526
+          },
+          "kind": "code",
+          "aliases": [
+            "contColumnEnd"
+          ]
+        },
+        "d48a": {
+          "addr": 54410,
+          "owner": {
+            "name": "patch_inc0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 645
+          },
+          "kind": "code",
+          "aliases": [
+            "incHiPtr"
+          ]
+        },
+        "d497": {
+          "addr": 54423,
+          "owner": {
+            "name": "patch_ptr0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 659
+          },
+          "kind": "code",
+          "aliases": [
+            "_opp_mv",
+            "loopX"
+          ]
+        },
+        "d4e1": {
+          "addr": 54497,
+          "owner": {
+            "name": "patch_inc2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 730
+          },
+          "kind": "code",
+          "aliases": [
+            "incHiPtrEnd"
+          ]
+        },
+        "d5dd": {
+          "addr": 54749,
+          "owner": {
+            "name": "_StartBSS_Kernel",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 671
+          },
+          "kind": "data",
+          "aliases": [
+            "_KernelEnd",
+            "_KernelIrqCounter"
+          ]
+        },
+        "fd40": {
+          "addr": 64832,
+          "owner": {
+            "name": "_LoaderResidentStart",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 150
+          },
+          "kind": "code",
+          "aliases": [
+            "_OverlayBufferEnd"
+          ]
+        },
+        "fd45": {
+          "addr": 64837,
+          "owner": {
+            "name": "_LoaderAddress",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 152
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_LoaderAddressLow"
+          ]
+        },
+        "fe9a": {
+          "addr": 65178,
+          "owner": {
+            "name": "auto_fdc_readsector",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 396
+          },
+          "kind": "code",
+          "aliases": [
+            "RetryRead"
+          ]
+        },
+        "fead": {
+          "addr": 65197,
+          "owner": {
+            "name": "auto_fdc_status_1",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 412
+          },
+          "kind": "code",
+          "aliases": [
+            "waitdrq"
+          ]
+        },
+        "fecd": {
+          "addr": 65229,
+          "owner": {
+            "name": "auto_fdc_status_2",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 438
+          },
+          "kind": "code",
+          "aliases": [
+            "r2_wait_completion"
+          ]
+        },
+        "fefa": {
+          "addr": 65274,
+          "owner": {
+            "name": "_LoaderRefreshAccessIndicator",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 477
+          },
+          "kind": "code",
+          "aliases": [
+            "auto_nop_or_rts"
+          ]
+        },
+        "ff09": {
+          "addr": 65289,
+          "owner": {
+            "name": "FileStartSector",
+            "file": "E:\\git\\Nova2026\\build\\floppy_description.h",
+            "line": 10
+          },
+          "kind": "data",
+          "aliases": [
+            "_FloppyBuilderFileData"
+          ]
+        },
+        "ff6d": {
+          "addr": 65389,
+          "owner": {
+            "name": "_LoaderFileStartSector",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 516
+          },
+          "kind": "data",
+          "aliases": [
+            "_EndLoaderCode"
+          ]
+        },
+        "ff6e": {
+          "addr": 65390,
+          "owner": {
+            "name": "_osdk_dbg_module",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 528
+          },
+          "kind": "data",
+          "aliases": [
+            "_LoaderDbgModule"
+          ]
+        }
+      }
+    },
+    "R+2": {
+      "module": 2,
+      "count": 58,
+      "addresses": {
+        "2340": {
+          "addr": 9024,
+          "owner": {
+            "name": "_FloppyImageBuffer",
+            "file": "E:\\git\\Nova2026\\code\\module_start.h",
+            "line": 43
+          },
+          "kind": "data",
+          "aliases": [
+            "_CybernovaImage"
+          ]
+        },
+        "0004": {
+          "addr": 4,
+          "owner": {
+            "name": "pt2_DT",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 37
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0018": {
+          "addr": 24,
+          "owner": {
+            "name": "_PsgfreqA",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 59
+          },
+          "kind": "data",
+          "aliases": [
+            "_PsgVirtualRegisters"
+          ]
+        },
+        "0027": {
+          "addr": 39,
+          "owner": {
+            "name": "_MusicPsgfreqA",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 72
+          },
+          "kind": "data",
+          "aliases": [
+            "_MusicPsgVirtualRegisters"
+          ]
+        },
+        "004f": {
+          "addr": 79,
+          "owner": {
+            "name": "tmp0",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 15
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0051": {
+          "addr": 81,
+          "owner": {
+            "name": "tmp1",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 16
+          },
+          "kind": "data",
+          "aliases": [
+            "_MemsetValue",
+            "col",
+            "count"
+          ]
+        },
+        "0053": {
+          "addr": 83,
+          "owner": {
+            "name": "tmp2",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 17
+          },
+          "kind": "data",
+          "aliases": [
+            "_MemcpySizeL",
+            "_MemsetSizeL",
+            "count",
+            "line",
+            "value",
+            "width"
+          ]
+        },
+        "0054": {
+          "addr": 84,
+          "owner": {
+            "name": "_MemsetSizeH",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 135
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_MemcpySizeH"
+          ]
+        },
+        "0055": {
+          "addr": 85,
+          "owner": {
+            "name": "tmp3",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 18
+          },
+          "kind": "data",
+          "aliases": [
+            "_fill_paper",
+            "height",
+            "stride",
+            "width"
+          ]
+        },
+        "0057": {
+          "addr": 87,
+          "owner": {
+            "name": "tmp4",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 19
+          },
+          "kind": "data",
+          "aliases": [
+            "height",
+            "value"
+          ]
+        },
+        "0059": {
+          "addr": 89,
+          "owner": {
+            "name": "tmp5",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 20
+          },
+          "kind": "data",
+          "aliases": [
+            "stride"
+          ]
+        },
+        "005b": {
+          "addr": 91,
+          "owner": {
+            "name": "tmp6",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 21
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "005d": {
+          "addr": 93,
+          "owner": {
+            "name": "reg0",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 25
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "005f": {
+          "addr": 95,
+          "owner": {
+            "name": "reg1",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 26
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0061": {
+          "addr": 97,
+          "owner": {
+            "name": "reg2",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 27
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0063": {
+          "addr": 99,
+          "owner": {
+            "name": "e",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 30
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0065": {
+          "addr": 101,
+          "owner": {
+            "name": "i",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 31
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0066": {
+          "addr": 102,
+          "owner": {
+            "name": "dx",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 32
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0067": {
+          "addr": 103,
+          "owner": {
+            "name": "dy",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 33
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0068": {
+          "addr": 104,
+          "owner": {
+            "name": "_CurrentPixelX",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 38
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006c": {
+          "addr": 108,
+          "owner": {
+            "name": "save_a",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 47
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006d": {
+          "addr": 109,
+          "owner": {
+            "name": "curBit",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 48
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006e": {
+          "addr": 110,
+          "owner": {
+            "name": "chunk",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 49
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006f": {
+          "addr": 111,
+          "owner": {
+            "name": "lastSum",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 50
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0070": {
+          "addr": 112,
+          "owner": {
+            "name": "_blit_arg_src",
+            "file": "E:\\git\\Nova2026\\code\\module_greetings.s",
+            "line": 80
+          },
+          "kind": "data",
+          "aliases": [
+            "ZpCommonEnd"
+          ]
+        },
+        "0400": {
+          "addr": 1024,
+          "owner": {
+            "name": "_Buffer_8000",
+            "file": "E:\\git\\Nova2026\\code\\module_start.h",
+            "line": 20
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_FloppyInsertionImage"
+          ]
+        },
+        "98cf": {
+          "addr": 39119,
+          "owner": {
+            "name": "_EndText",
+            "file": "E:\\git\\Nova2026\\code\\module_end.h",
+            "line": 24
+          },
+          "kind": "data",
+          "aliases": [
+            "_EndModule"
+          ]
+        },
+        "c14b": {
+          "addr": 49483,
+          "owner": {
+            "name": "_FillTextLines",
+            "file": "E:\\git\\Nova2026\\code\\memory.s",
+            "line": 138
+          },
+          "kind": "code",
+          "aliases": [
+            "ftl_loop"
+          ]
+        },
+        "c238": {
+          "addr": 49720,
+          "owner": {
+            "name": "_ByteStreamCommand_STOP_MUSIC",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 266
+          },
+          "kind": "code",
+          "aliases": [
+            "_EndMusic"
+          ]
+        },
+        "c248": {
+          "addr": 49736,
+          "owner": {
+            "name": "_PlayMusicFrame",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 276
+          },
+          "kind": "code",
+          "aliases": [
+            "auto_play_stop"
+          ]
+        },
+        "c423": {
+          "addr": 50211,
+          "owner": {
+            "name": "PLY_AKY_PSGREGISTER13_END",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 609
+          },
+          "kind": "code",
+          "aliases": [
+            "PLY_AKY_EXIT"
+          ]
+        },
+        "c56f": {
+          "addr": 50543,
+          "owner": {
+            "name": "PLY_AKY_RRB_NONINITIALSTATE",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 971
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c5e4": {
+          "addr": 50660,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SOFTWAREONLY_NOLSP",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1087
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c648": {
+          "addr": 50760,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWAREONLY_NOLSB",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1187
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c656": {
+          "addr": 50774,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWAREONLY_NOMSB",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1201
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c678": {
+          "addr": 50808,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERLSBH",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1235
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c686": {
+          "addr": 50822,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERMSBH",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1248
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c6bd": {
+          "addr": 50877,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERENVELOPE",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1310
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c6c3": {
+          "addr": 50883,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWARE_SHARED_NOISEORRETRIG_ANDSTOP",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1325
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c9c9": {
+          "addr": 51657,
+          "owner": {
+            "name": "_WaitKeyOrSignal",
+            "file": "E:\\git\\Nova2026\\code\\subtitle.s",
+            "line": 134
+          },
+          "kind": "code",
+          "aliases": [
+            "release"
+          ]
+        },
+        "d22e": {
+          "addr": 53806,
+          "owner": {
+            "name": "mask_patch",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 200
+          },
+          "kind": "code",
+          "aliases": [
+            "loop"
+          ]
+        },
+        "d2c6": {
+          "addr": 53958,
+          "owner": {
+            "name": "patch_bit2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 309
+          },
+          "kind": "code",
+          "aliases": [
+            "loopY"
+          ]
+        },
+        "d2cb": {
+          "addr": 53963,
+          "owner": {
+            "name": "patch_ptr0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 314
+          },
+          "kind": "code",
+          "aliases": [
+            "_opp_mh",
+            "contColumn"
+          ]
+        },
+        "d3a2": {
+          "addr": 54178,
+          "owner": {
+            "name": "patch_dy1",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 482
+          },
+          "kind": "code",
+          "aliases": [
+            "contColumn"
+          ]
+        },
+        "d3c9": {
+          "addr": 54217,
+          "owner": {
+            "name": "patch_dy2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 526
+          },
+          "kind": "code",
+          "aliases": [
+            "contColumnEnd"
+          ]
+        },
+        "d48a": {
+          "addr": 54410,
+          "owner": {
+            "name": "patch_inc0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 645
+          },
+          "kind": "code",
+          "aliases": [
+            "incHiPtr"
+          ]
+        },
+        "d497": {
+          "addr": 54423,
+          "owner": {
+            "name": "patch_ptr0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 659
+          },
+          "kind": "code",
+          "aliases": [
+            "_opp_mv",
+            "loopX"
+          ]
+        },
+        "d4e1": {
+          "addr": 54497,
+          "owner": {
+            "name": "patch_inc2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 730
+          },
+          "kind": "code",
+          "aliases": [
+            "incHiPtrEnd"
+          ]
+        },
+        "d5dd": {
+          "addr": 54749,
+          "owner": {
+            "name": "_StartBSS_Kernel",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 671
+          },
+          "kind": "data",
+          "aliases": [
+            "_KernelEnd",
+            "_KernelIrqCounter"
+          ]
+        },
+        "fd40": {
+          "addr": 64832,
+          "owner": {
+            "name": "_LoaderResidentStart",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 150
+          },
+          "kind": "code",
+          "aliases": [
+            "_OverlayBufferEnd"
+          ]
+        },
+        "fd45": {
+          "addr": 64837,
+          "owner": {
+            "name": "_LoaderAddress",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 152
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_LoaderAddressLow"
+          ]
+        },
+        "fe9a": {
+          "addr": 65178,
+          "owner": {
+            "name": "auto_fdc_readsector",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 396
+          },
+          "kind": "code",
+          "aliases": [
+            "RetryRead"
+          ]
+        },
+        "fead": {
+          "addr": 65197,
+          "owner": {
+            "name": "auto_fdc_status_1",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 412
+          },
+          "kind": "code",
+          "aliases": [
+            "waitdrq"
+          ]
+        },
+        "fecd": {
+          "addr": 65229,
+          "owner": {
+            "name": "auto_fdc_status_2",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 438
+          },
+          "kind": "code",
+          "aliases": [
+            "r2_wait_completion"
+          ]
+        },
+        "fefa": {
+          "addr": 65274,
+          "owner": {
+            "name": "_LoaderRefreshAccessIndicator",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 477
+          },
+          "kind": "code",
+          "aliases": [
+            "auto_nop_or_rts"
+          ]
+        },
+        "ff09": {
+          "addr": 65289,
+          "owner": {
+            "name": "FileStartSector",
+            "file": "E:\\git\\Nova2026\\build\\floppy_description.h",
+            "line": 10
+          },
+          "kind": "data",
+          "aliases": [
+            "_FloppyBuilderFileData"
+          ]
+        },
+        "ff6d": {
+          "addr": 65389,
+          "owner": {
+            "name": "_LoaderFileStartSector",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 516
+          },
+          "kind": "data",
+          "aliases": [
+            "_EndLoaderCode"
+          ]
+        },
+        "ff6e": {
+          "addr": 65390,
+          "owner": {
+            "name": "_osdk_dbg_module",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 528
+          },
+          "kind": "data",
+          "aliases": [
+            "_LoaderDbgModule"
+          ]
+        }
+      }
+    },
+    "R+3": {
+      "module": 3,
+      "count": 76,
+      "addresses": {
+        "2797": {
+          "addr": 10135,
+          "owner": {
+            "name": "_DistorterShowDefenceForceLogo",
+            "file": "E:\\git\\Nova2026\\code\\module_demo_distorter.s",
+            "line": 29
+          },
+          "kind": "code",
+          "aliases": [
+            "_DistorterCodeStart"
+          ]
+        },
+        "2875": {
+          "addr": 10357,
+          "owner": {
+            "name": "_ContinueLogoAnimation",
+            "file": "E:\\git\\Nova2026\\code\\module_demo_distorter.s",
+            "line": 242
+          },
+          "kind": "code",
+          "aliases": [
+            "frame_loop"
+          ]
+        },
+        "2959": {
+          "addr": 10585,
+          "owner": {
+            "name": "skip_bottom_odd_lines",
+            "file": "E:\\git\\Nova2026\\code\\module_demo_distorter.s",
+            "line": 404
+          },
+          "kind": "code",
+          "aliases": [
+            "skip2"
+          ]
+        },
+        "3298": {
+          "addr": 12952,
+          "owner": {
+            "name": "_DotIdx",
+            "file": "E:\\git\\Nova2026\\code\\module_demo_dots.s",
+            "line": 47
+          },
+          "kind": "data",
+          "aliases": [
+            "_DotsCodeStart",
+            "_TextScrollCodeEnd"
+          ]
+        },
+        "3498": {
+          "addr": 13464,
+          "owner": {
+            "name": "_BallsShowEffect",
+            "file": "E:\\git\\Nova2026\\code\\module_demo_balls.s",
+            "line": 132
+          },
+          "kind": "code",
+          "aliases": [
+            "_BallsCodeStart",
+            "_DotsCodeEnd"
+          ]
+        },
+        "5900": {
+          "addr": 22784,
+          "owner": {
+            "name": "_TextScrollBuffer",
+            "file": "E:\\git\\Nova2026\\code\\module_demo.s",
+            "line": 488
+          },
+          "kind": "data",
+          "aliases": [
+            "_BallHiresAddrLow_Mirror",
+            "_DotHiresAddrLow_Mirror"
+          ]
+        },
+        "9472": {
+          "addr": 38002,
+          "owner": {
+            "name": "_EndModule",
+            "file": "E:\\git\\Nova2026\\code\\module_demo.s",
+            "line": 530
+          },
+          "kind": "data",
+          "aliases": [
+            "_BSSEnd_Distorter"
+          ]
+        },
+        "0004": {
+          "addr": 4,
+          "owner": {
+            "name": "pt2_DT",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 37
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0018": {
+          "addr": 24,
+          "owner": {
+            "name": "_PsgfreqA",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 59
+          },
+          "kind": "data",
+          "aliases": [
+            "_PsgVirtualRegisters"
+          ]
+        },
+        "0027": {
+          "addr": 39,
+          "owner": {
+            "name": "_MusicPsgfreqA",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 72
+          },
+          "kind": "data",
+          "aliases": [
+            "_MusicPsgVirtualRegisters"
+          ]
+        },
+        "004f": {
+          "addr": 79,
+          "owner": {
+            "name": "tmp0",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 15
+          },
+          "kind": "data",
+          "aliases": [
+            "srcPtr"
+          ]
+        },
+        "0051": {
+          "addr": 81,
+          "owner": {
+            "name": "tmp1",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 16
+          },
+          "kind": "data",
+          "aliases": [
+            "_MemsetValue",
+            "col",
+            "count"
+          ]
+        },
+        "0053": {
+          "addr": 83,
+          "owner": {
+            "name": "tmp2",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 17
+          },
+          "kind": "data",
+          "aliases": [
+            "_MemcpySizeL",
+            "_MemsetSizeL",
+            "count",
+            "line",
+            "offset",
+            "value",
+            "width"
+          ]
+        },
+        "0054": {
+          "addr": 84,
+          "owner": {
+            "name": "_MemsetSizeH",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 135
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_MemcpySizeH"
+          ]
+        },
+        "0055": {
+          "addr": 85,
+          "owner": {
+            "name": "tmp3",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 18
+          },
+          "kind": "data",
+          "aliases": [
+            "_fill_paper",
+            "height",
+            "stride",
+            "sumOffset",
+            "width"
+          ]
+        },
+        "0057": {
+          "addr": 87,
+          "owner": {
+            "name": "tmp4",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 19
+          },
+          "kind": "data",
+          "aliases": [
+            "angle2",
+            "height",
+            "value"
+          ]
+        },
+        "0059": {
+          "addr": 89,
+          "owner": {
+            "name": "tmp5",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 20
+          },
+          "kind": "data",
+          "aliases": [
+            "angle4",
+            "stride"
+          ]
+        },
+        "005b": {
+          "addr": 91,
+          "owner": {
+            "name": "tmp6",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 21
+          },
+          "kind": "data",
+          "aliases": [
+            "sourceOffset"
+          ]
+        },
+        "005d": {
+          "addr": 93,
+          "owner": {
+            "name": "reg0",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 25
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "005f": {
+          "addr": 95,
+          "owner": {
+            "name": "reg1",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 26
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0061": {
+          "addr": 97,
+          "owner": {
+            "name": "reg2",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 27
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0063": {
+          "addr": 99,
+          "owner": {
+            "name": "e",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 30
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0065": {
+          "addr": 101,
+          "owner": {
+            "name": "i",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 31
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0066": {
+          "addr": 102,
+          "owner": {
+            "name": "dx",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 32
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0067": {
+          "addr": 103,
+          "owner": {
+            "name": "dy",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 33
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0068": {
+          "addr": 104,
+          "owner": {
+            "name": "_CurrentPixelX",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 38
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006c": {
+          "addr": 108,
+          "owner": {
+            "name": "save_a",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 47
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006d": {
+          "addr": 109,
+          "owner": {
+            "name": "curBit",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 48
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006e": {
+          "addr": 110,
+          "owner": {
+            "name": "chunk",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 49
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006f": {
+          "addr": 111,
+          "owner": {
+            "name": "lastSum",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 50
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0070": {
+          "addr": 112,
+          "owner": {
+            "name": "_ptrDst",
+            "file": "E:\\git\\Nova2026\\code\\module_demo.s",
+            "line": 58
+          },
+          "kind": "data",
+          "aliases": [
+            "ZpCommonEnd"
+          ]
+        },
+        "0081": {
+          "addr": 129,
+          "owner": {
+            "name": "_ptrDstBottom",
+            "file": "E:\\git\\Nova2026\\code\\module_demo_distorter.s",
+            "line": 18
+          },
+          "kind": "data",
+          "aliases": [
+            "dstPtr"
+          ]
+        },
+        "0400": {
+          "addr": 1024,
+          "owner": {
+            "name": "_Buffer_8000",
+            "file": "E:\\git\\Nova2026\\code\\module_start.h",
+            "line": 20
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_FontRatboy"
+          ]
+        },
+        "28f5": {
+          "addr": 10485,
+          "owner": {
+            "name": "do_bottom",
+            "file": "E:\\git\\Nova2026\\code\\module_demo_distorter.s",
+            "line": 332
+          },
+          "kind": "code",
+          "aliases": [
+            "skip2"
+          ]
+        },
+        "2b7d": {
+          "addr": 11133,
+          "owner": {
+            "name": "_LogoRiseAsm",
+            "file": "E:\\git\\Nova2026\\code\\module_demo_logo.s",
+            "line": 57
+          },
+          "kind": "code",
+          "aliases": [
+            "_DistorterCodeEnd",
+            "_LogoCodeStart"
+          ]
+        },
+        "2c1e": {
+          "addr": 11294,
+          "owner": {
+            "name": "_RastersShowEffect",
+            "file": "E:\\git\\Nova2026\\code\\module_demo_rasters.s",
+            "line": 34
+          },
+          "kind": "code",
+          "aliases": [
+            "_LogoCodeEnd",
+            "_RastersCodeStart"
+          ]
+        },
+        "2f3b": {
+          "addr": 12091,
+          "owner": {
+            "name": "_RastersCodeEnd",
+            "file": "E:\\git\\Nova2026\\code\\module_demo_textscroll.s",
+            "line": 70
+          },
+          "kind": "code",
+          "aliases": [
+            "_TextScrollCodeStart",
+            "_TextScrollDebugDumpGlyph0"
+          ]
+        },
+        "2fbc": {
+          "addr": 12220,
+          "owner": {
+            "name": "char_loop",
+            "file": "E:\\git\\Nova2026\\code\\module_demo_textscroll.s",
+            "line": 170
+          },
+          "kind": "code",
+          "aliases": [
+            "_TextScrollMsgOperand"
+          ]
+        },
+        "4d90": {
+          "addr": 19856,
+          "owner": {
+            "name": "_FontRatboyPacked",
+            "file": "E:\\git\\Nova2026\\build\\files\\font_ratboy_packed.s",
+            "line": 2
+          },
+          "kind": "data",
+          "aliases": [
+            "_RatBoyFontStart"
+          ]
+        },
+        "58a2": {
+          "addr": 22690,
+          "owner": {
+            "name": "_LabelPicture1",
+            "file": "E:\\git\\Nova2026\\code\\module_demo.s",
+            "line": 482
+          },
+          "kind": "data",
+          "aliases": [
+            "_BallOffsetX",
+            "_BufferZ",
+            "_DotPrevX",
+            "_EndText",
+            "_RatBoyFontEnd",
+            "_StartBSS"
+          ]
+        },
+        "58b2": {
+          "addr": 22706,
+          "owner": {
+            "name": "_DotPrevY",
+            "file": "E:\\git\\Nova2026\\code\\module_demo.s",
+            "line": 483
+          },
+          "kind": "data",
+          "aliases": [
+            "_BallOffsetY"
+          ]
+        },
+        "5a00": {
+          "addr": 23040,
+          "owner": {
+            "name": "_PaperBuf0",
+            "file": "E:\\git\\Nova2026\\code\\module_demo.s",
+            "line": 489
+          },
+          "kind": "data",
+          "aliases": [
+            "_BallHiresAddrHigh_Mirror",
+            "_DotHiresAddrHigh_Mirror"
+          ]
+        },
+        "5b00": {
+          "addr": 23296,
+          "owner": {
+            "name": "_PaperBuf1",
+            "file": "E:\\git\\Nova2026\\code\\module_demo.s",
+            "line": 494
+          },
+          "kind": "data",
+          "aliases": [
+            "_BSSEnd_Dots",
+            "_CosTable_X"
+          ]
+        },
+        "5c00": {
+          "addr": 23552,
+          "owner": {
+            "name": "_PaperBuf2",
+            "file": "E:\\git\\Nova2026\\code\\module_demo.s",
+            "line": 495
+          },
+          "kind": "data",
+          "aliases": [
+            "_CosTable_Y"
+          ]
+        },
+        "5d00": {
+          "addr": 23808,
+          "owner": {
+            "name": "_PaperBuf3",
+            "file": "E:\\git\\Nova2026\\code\\module_demo.s",
+            "line": 505
+          },
+          "kind": "data",
+          "aliases": [
+            "_BSSEnd_Balls"
+          ]
+        },
+        "c14b": {
+          "addr": 49483,
+          "owner": {
+            "name": "_FillTextLines",
+            "file": "E:\\git\\Nova2026\\code\\memory.s",
+            "line": 138
+          },
+          "kind": "code",
+          "aliases": [
+            "ftl_loop"
+          ]
+        },
+        "c238": {
+          "addr": 49720,
+          "owner": {
+            "name": "_ByteStreamCommand_STOP_MUSIC",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 266
+          },
+          "kind": "code",
+          "aliases": [
+            "_EndMusic"
+          ]
+        },
+        "c248": {
+          "addr": 49736,
+          "owner": {
+            "name": "_PlayMusicFrame",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 276
+          },
+          "kind": "code",
+          "aliases": [
+            "auto_play_stop"
+          ]
+        },
+        "c423": {
+          "addr": 50211,
+          "owner": {
+            "name": "PLY_AKY_PSGREGISTER13_END",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 609
+          },
+          "kind": "code",
+          "aliases": [
+            "PLY_AKY_EXIT"
+          ]
+        },
+        "c56f": {
+          "addr": 50543,
+          "owner": {
+            "name": "PLY_AKY_RRB_NONINITIALSTATE",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 971
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c5e4": {
+          "addr": 50660,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SOFTWAREONLY_NOLSP",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1087
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c648": {
+          "addr": 50760,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWAREONLY_NOLSB",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1187
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c656": {
+          "addr": 50774,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWAREONLY_NOMSB",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1201
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c678": {
+          "addr": 50808,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERLSBH",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1235
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c686": {
+          "addr": 50822,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERMSBH",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1248
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c6bd": {
+          "addr": 50877,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERENVELOPE",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1310
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c6c3": {
+          "addr": 50883,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWARE_SHARED_NOISEORRETRIG_ANDSTOP",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1325
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c9c9": {
+          "addr": 51657,
+          "owner": {
+            "name": "_WaitKeyOrSignal",
+            "file": "E:\\git\\Nova2026\\code\\subtitle.s",
+            "line": 134
+          },
+          "kind": "code",
+          "aliases": [
+            "release"
+          ]
+        },
+        "d22e": {
+          "addr": 53806,
+          "owner": {
+            "name": "mask_patch",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 200
+          },
+          "kind": "code",
+          "aliases": [
+            "loop"
+          ]
+        },
+        "d2c6": {
+          "addr": 53958,
+          "owner": {
+            "name": "patch_bit2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 309
+          },
+          "kind": "code",
+          "aliases": [
+            "loopY"
+          ]
+        },
+        "d2cb": {
+          "addr": 53963,
+          "owner": {
+            "name": "patch_ptr0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 314
+          },
+          "kind": "code",
+          "aliases": [
+            "_opp_mh",
+            "contColumn"
+          ]
+        },
+        "d3a2": {
+          "addr": 54178,
+          "owner": {
+            "name": "patch_dy1",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 482
+          },
+          "kind": "code",
+          "aliases": [
+            "contColumn"
+          ]
+        },
+        "d3c9": {
+          "addr": 54217,
+          "owner": {
+            "name": "patch_dy2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 526
+          },
+          "kind": "code",
+          "aliases": [
+            "contColumnEnd"
+          ]
+        },
+        "d48a": {
+          "addr": 54410,
+          "owner": {
+            "name": "patch_inc0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 645
+          },
+          "kind": "code",
+          "aliases": [
+            "incHiPtr"
+          ]
+        },
+        "d497": {
+          "addr": 54423,
+          "owner": {
+            "name": "patch_ptr0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 659
+          },
+          "kind": "code",
+          "aliases": [
+            "_opp_mv",
+            "loopX"
+          ]
+        },
+        "d4e1": {
+          "addr": 54497,
+          "owner": {
+            "name": "patch_inc2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 730
+          },
+          "kind": "code",
+          "aliases": [
+            "incHiPtrEnd"
+          ]
+        },
+        "d5dd": {
+          "addr": 54749,
+          "owner": {
+            "name": "_StartBSS_Kernel",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 671
+          },
+          "kind": "data",
+          "aliases": [
+            "_KernelEnd",
+            "_KernelIrqCounter"
+          ]
+        },
+        "fd40": {
+          "addr": 64832,
+          "owner": {
+            "name": "_LoaderResidentStart",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 150
+          },
+          "kind": "code",
+          "aliases": [
+            "_OverlayBufferEnd"
+          ]
+        },
+        "fd45": {
+          "addr": 64837,
+          "owner": {
+            "name": "_LoaderAddress",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 152
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_LoaderAddressLow"
+          ]
+        },
+        "fe9a": {
+          "addr": 65178,
+          "owner": {
+            "name": "auto_fdc_readsector",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 396
+          },
+          "kind": "code",
+          "aliases": [
+            "RetryRead"
+          ]
+        },
+        "fead": {
+          "addr": 65197,
+          "owner": {
+            "name": "auto_fdc_status_1",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 412
+          },
+          "kind": "code",
+          "aliases": [
+            "waitdrq"
+          ]
+        },
+        "fecd": {
+          "addr": 65229,
+          "owner": {
+            "name": "auto_fdc_status_2",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 438
+          },
+          "kind": "code",
+          "aliases": [
+            "r2_wait_completion"
+          ]
+        },
+        "fefa": {
+          "addr": 65274,
+          "owner": {
+            "name": "_LoaderRefreshAccessIndicator",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 477
+          },
+          "kind": "code",
+          "aliases": [
+            "auto_nop_or_rts"
+          ]
+        },
+        "ff09": {
+          "addr": 65289,
+          "owner": {
+            "name": "FileStartSector",
+            "file": "E:\\git\\Nova2026\\build\\floppy_description.h",
+            "line": 10
+          },
+          "kind": "data",
+          "aliases": [
+            "_FloppyBuilderFileData"
+          ]
+        },
+        "ff6d": {
+          "addr": 65389,
+          "owner": {
+            "name": "_LoaderFileStartSector",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 516
+          },
+          "kind": "data",
+          "aliases": [
+            "_EndLoaderCode"
+          ]
+        },
+        "ff6e": {
+          "addr": 65390,
+          "owner": {
+            "name": "_osdk_dbg_module",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 528
+          },
+          "kind": "data",
+          "aliases": [
+            "_LoaderDbgModule"
+          ]
+        }
+      }
+    },
+    "R+4": {
+      "module": 4,
+      "count": 56,
+      "addresses": {
+        "8931": {
+          "addr": 35121,
+          "owner": {
+            "name": "_QuickHacksData",
+            "file": "E:\\git\\Nova2026\\code\\module_credits.s",
+            "line": 999
+          },
+          "kind": "data",
+          "aliases": [
+            "_CreditsImageDataEnd"
+          ]
+        },
+        "0004": {
+          "addr": 4,
+          "owner": {
+            "name": "pt2_DT",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 37
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0018": {
+          "addr": 24,
+          "owner": {
+            "name": "_PsgfreqA",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 59
+          },
+          "kind": "data",
+          "aliases": [
+            "_PsgVirtualRegisters"
+          ]
+        },
+        "0027": {
+          "addr": 39,
+          "owner": {
+            "name": "_MusicPsgfreqA",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 72
+          },
+          "kind": "data",
+          "aliases": [
+            "_MusicPsgVirtualRegisters"
+          ]
+        },
+        "004f": {
+          "addr": 79,
+          "owner": {
+            "name": "tmp0",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 15
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0051": {
+          "addr": 81,
+          "owner": {
+            "name": "tmp1",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 16
+          },
+          "kind": "data",
+          "aliases": [
+            "_MemsetValue",
+            "col",
+            "count"
+          ]
+        },
+        "0053": {
+          "addr": 83,
+          "owner": {
+            "name": "tmp2",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 17
+          },
+          "kind": "data",
+          "aliases": [
+            "_MemcpySizeL",
+            "_MemsetSizeL",
+            "count",
+            "line",
+            "value",
+            "width"
+          ]
+        },
+        "0054": {
+          "addr": 84,
+          "owner": {
+            "name": "_MemsetSizeH",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 135
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_MemcpySizeH"
+          ]
+        },
+        "0055": {
+          "addr": 85,
+          "owner": {
+            "name": "tmp3",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 18
+          },
+          "kind": "data",
+          "aliases": [
+            "_fill_paper",
+            "height",
+            "stride",
+            "width"
+          ]
+        },
+        "0057": {
+          "addr": 87,
+          "owner": {
+            "name": "tmp4",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 19
+          },
+          "kind": "data",
+          "aliases": [
+            "height",
+            "value"
+          ]
+        },
+        "0059": {
+          "addr": 89,
+          "owner": {
+            "name": "tmp5",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 20
+          },
+          "kind": "data",
+          "aliases": [
+            "stride"
+          ]
+        },
+        "005b": {
+          "addr": 91,
+          "owner": {
+            "name": "tmp6",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 21
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "005d": {
+          "addr": 93,
+          "owner": {
+            "name": "reg0",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 25
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "005f": {
+          "addr": 95,
+          "owner": {
+            "name": "reg1",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 26
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0061": {
+          "addr": 97,
+          "owner": {
+            "name": "reg2",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 27
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0063": {
+          "addr": 99,
+          "owner": {
+            "name": "e",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 30
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0065": {
+          "addr": 101,
+          "owner": {
+            "name": "i",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 31
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0066": {
+          "addr": 102,
+          "owner": {
+            "name": "dx",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 32
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0067": {
+          "addr": 103,
+          "owner": {
+            "name": "dy",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 33
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0068": {
+          "addr": 104,
+          "owner": {
+            "name": "_CurrentPixelX",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 38
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006c": {
+          "addr": 108,
+          "owner": {
+            "name": "save_a",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 47
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006d": {
+          "addr": 109,
+          "owner": {
+            "name": "curBit",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 48
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006e": {
+          "addr": 110,
+          "owner": {
+            "name": "chunk",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 49
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006f": {
+          "addr": 111,
+          "owner": {
+            "name": "lastSum",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 50
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0070": {
+          "addr": 112,
+          "owner": {
+            "name": "_src_ptr",
+            "file": "E:\\git\\Nova2026\\code\\module_credits.s",
+            "line": 34
+          },
+          "kind": "data",
+          "aliases": [
+            "ZpCommonEnd"
+          ]
+        },
+        "c14b": {
+          "addr": 49483,
+          "owner": {
+            "name": "_FillTextLines",
+            "file": "E:\\git\\Nova2026\\code\\memory.s",
+            "line": 138
+          },
+          "kind": "code",
+          "aliases": [
+            "ftl_loop"
+          ]
+        },
+        "c238": {
+          "addr": 49720,
+          "owner": {
+            "name": "_ByteStreamCommand_STOP_MUSIC",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 266
+          },
+          "kind": "code",
+          "aliases": [
+            "_EndMusic"
+          ]
+        },
+        "c248": {
+          "addr": 49736,
+          "owner": {
+            "name": "_PlayMusicFrame",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 276
+          },
+          "kind": "code",
+          "aliases": [
+            "auto_play_stop"
+          ]
+        },
+        "c423": {
+          "addr": 50211,
+          "owner": {
+            "name": "PLY_AKY_PSGREGISTER13_END",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 609
+          },
+          "kind": "code",
+          "aliases": [
+            "PLY_AKY_EXIT"
+          ]
+        },
+        "c56f": {
+          "addr": 50543,
+          "owner": {
+            "name": "PLY_AKY_RRB_NONINITIALSTATE",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 971
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c5e4": {
+          "addr": 50660,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SOFTWAREONLY_NOLSP",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1087
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c648": {
+          "addr": 50760,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWAREONLY_NOLSB",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1187
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c656": {
+          "addr": 50774,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWAREONLY_NOMSB",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1201
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c678": {
+          "addr": 50808,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERLSBH",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1235
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c686": {
+          "addr": 50822,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERMSBH",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1248
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c6bd": {
+          "addr": 50877,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERENVELOPE",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1310
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c6c3": {
+          "addr": 50883,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWARE_SHARED_NOISEORRETRIG_ANDSTOP",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1325
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c9c9": {
+          "addr": 51657,
+          "owner": {
+            "name": "_WaitKeyOrSignal",
+            "file": "E:\\git\\Nova2026\\code\\subtitle.s",
+            "line": 134
+          },
+          "kind": "code",
+          "aliases": [
+            "release"
+          ]
+        },
+        "d22e": {
+          "addr": 53806,
+          "owner": {
+            "name": "mask_patch",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 200
+          },
+          "kind": "code",
+          "aliases": [
+            "loop"
+          ]
+        },
+        "d2c6": {
+          "addr": 53958,
+          "owner": {
+            "name": "patch_bit2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 309
+          },
+          "kind": "code",
+          "aliases": [
+            "loopY"
+          ]
+        },
+        "d2cb": {
+          "addr": 53963,
+          "owner": {
+            "name": "patch_ptr0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 314
+          },
+          "kind": "code",
+          "aliases": [
+            "_opp_mh",
+            "contColumn"
+          ]
+        },
+        "d3a2": {
+          "addr": 54178,
+          "owner": {
+            "name": "patch_dy1",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 482
+          },
+          "kind": "code",
+          "aliases": [
+            "contColumn"
+          ]
+        },
+        "d3c9": {
+          "addr": 54217,
+          "owner": {
+            "name": "patch_dy2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 526
+          },
+          "kind": "code",
+          "aliases": [
+            "contColumnEnd"
+          ]
+        },
+        "d48a": {
+          "addr": 54410,
+          "owner": {
+            "name": "patch_inc0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 645
+          },
+          "kind": "code",
+          "aliases": [
+            "incHiPtr"
+          ]
+        },
+        "d497": {
+          "addr": 54423,
+          "owner": {
+            "name": "patch_ptr0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 659
+          },
+          "kind": "code",
+          "aliases": [
+            "_opp_mv",
+            "loopX"
+          ]
+        },
+        "d4e1": {
+          "addr": 54497,
+          "owner": {
+            "name": "patch_inc2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 730
+          },
+          "kind": "code",
+          "aliases": [
+            "incHiPtrEnd"
+          ]
+        },
+        "d5dd": {
+          "addr": 54749,
+          "owner": {
+            "name": "_StartBSS_Kernel",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 671
+          },
+          "kind": "data",
+          "aliases": [
+            "_KernelEnd",
+            "_KernelIrqCounter"
+          ]
+        },
+        "fd40": {
+          "addr": 64832,
+          "owner": {
+            "name": "_LoaderResidentStart",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 150
+          },
+          "kind": "code",
+          "aliases": [
+            "_OverlayBufferEnd"
+          ]
+        },
+        "fd45": {
+          "addr": 64837,
+          "owner": {
+            "name": "_LoaderAddress",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 152
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_LoaderAddressLow"
+          ]
+        },
+        "fe9a": {
+          "addr": 65178,
+          "owner": {
+            "name": "auto_fdc_readsector",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 396
+          },
+          "kind": "code",
+          "aliases": [
+            "RetryRead"
+          ]
+        },
+        "fead": {
+          "addr": 65197,
+          "owner": {
+            "name": "auto_fdc_status_1",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 412
+          },
+          "kind": "code",
+          "aliases": [
+            "waitdrq"
+          ]
+        },
+        "fecd": {
+          "addr": 65229,
+          "owner": {
+            "name": "auto_fdc_status_2",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 438
+          },
+          "kind": "code",
+          "aliases": [
+            "r2_wait_completion"
+          ]
+        },
+        "fefa": {
+          "addr": 65274,
+          "owner": {
+            "name": "_LoaderRefreshAccessIndicator",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 477
+          },
+          "kind": "code",
+          "aliases": [
+            "auto_nop_or_rts"
+          ]
+        },
+        "ff09": {
+          "addr": 65289,
+          "owner": {
+            "name": "FileStartSector",
+            "file": "E:\\git\\Nova2026\\build\\floppy_description.h",
+            "line": 10
+          },
+          "kind": "data",
+          "aliases": [
+            "_FloppyBuilderFileData"
+          ]
+        },
+        "ff6d": {
+          "addr": 65389,
+          "owner": {
+            "name": "_LoaderFileStartSector",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 516
+          },
+          "kind": "data",
+          "aliases": [
+            "_EndLoaderCode"
+          ]
+        },
+        "ff6e": {
+          "addr": 65390,
+          "owner": {
+            "name": "_osdk_dbg_module",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 528
+          },
+          "kind": "data",
+          "aliases": [
+            "_LoaderDbgModule"
+          ]
+        }
+      }
+    },
+    "R+5": {
+      "module": 5,
+      "count": 57,
+      "addresses": {
+        "0004": {
+          "addr": 4,
+          "owner": {
+            "name": "pt2_DT",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 37
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0018": {
+          "addr": 24,
+          "owner": {
+            "name": "_PsgfreqA",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 59
+          },
+          "kind": "data",
+          "aliases": [
+            "_PsgVirtualRegisters"
+          ]
+        },
+        "0027": {
+          "addr": 39,
+          "owner": {
+            "name": "_MusicPsgfreqA",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 72
+          },
+          "kind": "data",
+          "aliases": [
+            "_MusicPsgVirtualRegisters"
+          ]
+        },
+        "004f": {
+          "addr": 79,
+          "owner": {
+            "name": "tmp0",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 15
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0051": {
+          "addr": 81,
+          "owner": {
+            "name": "tmp1",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 16
+          },
+          "kind": "data",
+          "aliases": [
+            "_MemsetValue",
+            "col",
+            "count"
+          ]
+        },
+        "0053": {
+          "addr": 83,
+          "owner": {
+            "name": "tmp2",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 17
+          },
+          "kind": "data",
+          "aliases": [
+            "_MemcpySizeL",
+            "_MemsetSizeL",
+            "count",
+            "line",
+            "value",
+            "width"
+          ]
+        },
+        "0054": {
+          "addr": 84,
+          "owner": {
+            "name": "_MemsetSizeH",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 135
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_MemcpySizeH"
+          ]
+        },
+        "0055": {
+          "addr": 85,
+          "owner": {
+            "name": "tmp3",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 18
+          },
+          "kind": "data",
+          "aliases": [
+            "_fill_paper",
+            "height",
+            "stride",
+            "width"
+          ]
+        },
+        "0057": {
+          "addr": 87,
+          "owner": {
+            "name": "tmp4",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 19
+          },
+          "kind": "data",
+          "aliases": [
+            "height",
+            "value"
+          ]
+        },
+        "0059": {
+          "addr": 89,
+          "owner": {
+            "name": "tmp5",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 20
+          },
+          "kind": "data",
+          "aliases": [
+            "stride"
+          ]
+        },
+        "005b": {
+          "addr": 91,
+          "owner": {
+            "name": "tmp6",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 21
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "005d": {
+          "addr": 93,
+          "owner": {
+            "name": "reg0",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 25
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "005f": {
+          "addr": 95,
+          "owner": {
+            "name": "reg1",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 26
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0061": {
+          "addr": 97,
+          "owner": {
+            "name": "reg2",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 27
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0063": {
+          "addr": 99,
+          "owner": {
+            "name": "e",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 30
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0065": {
+          "addr": 101,
+          "owner": {
+            "name": "i",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 31
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0066": {
+          "addr": 102,
+          "owner": {
+            "name": "dx",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 32
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0067": {
+          "addr": 103,
+          "owner": {
+            "name": "dy",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 33
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0068": {
+          "addr": 104,
+          "owner": {
+            "name": "_CurrentPixelX",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 38
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006c": {
+          "addr": 108,
+          "owner": {
+            "name": "save_a",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 47
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006d": {
+          "addr": 109,
+          "owner": {
+            "name": "curBit",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 48
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006e": {
+          "addr": 110,
+          "owner": {
+            "name": "chunk",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 49
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "006f": {
+          "addr": 111,
+          "owner": {
+            "name": "lastSum",
+            "file": "E:\\git\\Nova2026\\code\\common_zp.h",
+            "line": 50
+          },
+          "kind": "data",
+          "aliases": []
+        },
+        "0070": {
+          "addr": 112,
+          "owner": {
+            "name": "_src_ptr",
+            "file": "E:\\git\\Nova2026\\code\\module_flatline.s",
+            "line": 41
+          },
+          "kind": "data",
+          "aliases": [
+            "ZpCommonEnd"
+          ]
+        },
+        "23ea": {
+          "addr": 9194,
+          "owner": {
+            "name": "_FlatlineGlitchLoop",
+            "file": "E:\\git\\Nova2026\\code\\module_flatline.s",
+            "line": 169
+          },
+          "kind": "code",
+          "aliases": [
+            "loop"
+          ]
+        },
+        "269f": {
+          "addr": 9887,
+          "owner": {
+            "name": "_rect_w",
+            "file": "E:\\git\\Nova2026\\code\\module_flatline.s",
+            "line": 702
+          },
+          "kind": "data",
+          "aliases": [
+            "_EndText",
+            "_StartBSS"
+          ]
+        },
+        "c14b": {
+          "addr": 49483,
+          "owner": {
+            "name": "_FillTextLines",
+            "file": "E:\\git\\Nova2026\\code\\memory.s",
+            "line": 138
+          },
+          "kind": "code",
+          "aliases": [
+            "ftl_loop"
+          ]
+        },
+        "c238": {
+          "addr": 49720,
+          "owner": {
+            "name": "_ByteStreamCommand_STOP_MUSIC",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 266
+          },
+          "kind": "code",
+          "aliases": [
+            "_EndMusic"
+          ]
+        },
+        "c248": {
+          "addr": 49736,
+          "owner": {
+            "name": "_PlayMusicFrame",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 276
+          },
+          "kind": "code",
+          "aliases": [
+            "auto_play_stop"
+          ]
+        },
+        "c423": {
+          "addr": 50211,
+          "owner": {
+            "name": "PLY_AKY_PSGREGISTER13_END",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 609
+          },
+          "kind": "code",
+          "aliases": [
+            "PLY_AKY_EXIT"
+          ]
+        },
+        "c56f": {
+          "addr": 50543,
+          "owner": {
+            "name": "PLY_AKY_RRB_NONINITIALSTATE",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 971
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c5e4": {
+          "addr": 50660,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SOFTWAREONLY_NOLSP",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1087
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c648": {
+          "addr": 50760,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWAREONLY_NOLSB",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1187
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c656": {
+          "addr": 50774,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWAREONLY_NOMSB",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1201
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c678": {
+          "addr": 50808,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERLSBH",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1235
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c686": {
+          "addr": 50822,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERMSBH",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1248
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c6bd": {
+          "addr": 50877,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_SAHH_AFTERENVELOPE",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1310
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c6c3": {
+          "addr": 50883,
+          "owner": {
+            "name": "PLY_AKY_RRB_NIS_HARDWARE_SHARED_NOISEORRETRIG_ANDSTOP",
+            "file": "E:\\git\\Nova2026\\code\\akyplayer.s",
+            "line": 1325
+          },
+          "kind": "code",
+          "aliases": [
+            "label"
+          ]
+        },
+        "c9c9": {
+          "addr": 51657,
+          "owner": {
+            "name": "_WaitKeyOrSignal",
+            "file": "E:\\git\\Nova2026\\code\\subtitle.s",
+            "line": 134
+          },
+          "kind": "code",
+          "aliases": [
+            "release"
+          ]
+        },
+        "d22e": {
+          "addr": 53806,
+          "owner": {
+            "name": "mask_patch",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 200
+          },
+          "kind": "code",
+          "aliases": [
+            "loop"
+          ]
+        },
+        "d2c6": {
+          "addr": 53958,
+          "owner": {
+            "name": "patch_bit2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 309
+          },
+          "kind": "code",
+          "aliases": [
+            "loopY"
+          ]
+        },
+        "d2cb": {
+          "addr": 53963,
+          "owner": {
+            "name": "patch_ptr0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 314
+          },
+          "kind": "code",
+          "aliases": [
+            "_opp_mh",
+            "contColumn"
+          ]
+        },
+        "d3a2": {
+          "addr": 54178,
+          "owner": {
+            "name": "patch_dy1",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 482
+          },
+          "kind": "code",
+          "aliases": [
+            "contColumn"
+          ]
+        },
+        "d3c9": {
+          "addr": 54217,
+          "owner": {
+            "name": "patch_dy2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 526
+          },
+          "kind": "code",
+          "aliases": [
+            "contColumnEnd"
+          ]
+        },
+        "d48a": {
+          "addr": 54410,
+          "owner": {
+            "name": "patch_inc0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 645
+          },
+          "kind": "code",
+          "aliases": [
+            "incHiPtr"
+          ]
+        },
+        "d497": {
+          "addr": 54423,
+          "owner": {
+            "name": "patch_ptr0",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 659
+          },
+          "kind": "code",
+          "aliases": [
+            "_opp_mv",
+            "loopX"
+          ]
+        },
+        "d4e1": {
+          "addr": 54497,
+          "owner": {
+            "name": "patch_inc2",
+            "file": "E:\\git\\Nova2026\\code\\linedraw8.s",
+            "line": 730
+          },
+          "kind": "code",
+          "aliases": [
+            "incHiPtrEnd"
+          ]
+        },
+        "d5dd": {
+          "addr": 54749,
+          "owner": {
+            "name": "_StartBSS_Kernel",
+            "file": "E:\\git\\Nova2026\\code\\kernel.s",
+            "line": 671
+          },
+          "kind": "data",
+          "aliases": [
+            "_KernelEnd",
+            "_KernelIrqCounter"
+          ]
+        },
+        "fd40": {
+          "addr": 64832,
+          "owner": {
+            "name": "_LoaderResidentStart",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 150
+          },
+          "kind": "code",
+          "aliases": [
+            "_OverlayBufferEnd"
+          ]
+        },
+        "fd45": {
+          "addr": 64837,
+          "owner": {
+            "name": "_LoaderAddress",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 152
+          },
+          "kind": "unknown",
+          "aliases": [
+            "_LoaderAddressLow"
+          ]
+        },
+        "fe9a": {
+          "addr": 65178,
+          "owner": {
+            "name": "auto_fdc_readsector",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 396
+          },
+          "kind": "code",
+          "aliases": [
+            "RetryRead"
+          ]
+        },
+        "fead": {
+          "addr": 65197,
+          "owner": {
+            "name": "auto_fdc_status_1",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 412
+          },
+          "kind": "code",
+          "aliases": [
+            "waitdrq"
+          ]
+        },
+        "fecd": {
+          "addr": 65229,
+          "owner": {
+            "name": "auto_fdc_status_2",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 438
+          },
+          "kind": "code",
+          "aliases": [
+            "r2_wait_completion"
+          ]
+        },
+        "fefa": {
+          "addr": 65274,
+          "owner": {
+            "name": "_LoaderRefreshAccessIndicator",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 477
+          },
+          "kind": "code",
+          "aliases": [
+            "auto_nop_or_rts"
+          ]
+        },
+        "ff09": {
+          "addr": 65289,
+          "owner": {
+            "name": "FileStartSector",
+            "file": "E:\\git\\Nova2026\\build\\floppy_description.h",
+            "line": 10
+          },
+          "kind": "data",
+          "aliases": [
+            "_FloppyBuilderFileData"
+          ]
+        },
+        "ff6d": {
+          "addr": 65389,
+          "owner": {
+            "name": "_LoaderFileStartSector",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 516
+          },
+          "kind": "data",
+          "aliases": [
+            "_EndLoaderCode"
+          ]
+        },
+        "ff6e": {
+          "addr": 65390,
+          "owner": {
+            "name": "_osdk_dbg_module",
+            "file": "E:\\git\\Nova2026\\code\\loader.asm",
+            "line": 528
+          },
+          "kind": "data",
+          "aliases": [
+            "_LoaderDbgModule"
+          ]
+        }
+      }
+    }
+  }
+}

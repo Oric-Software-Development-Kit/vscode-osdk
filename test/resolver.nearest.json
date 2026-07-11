@@ -1,0 +1,60 @@
+{
+  "_meta": {
+    "purpose": "Independent nearest-below (arbitrary-PC) oracle for SPEC-address-resolver.md §5.7. Additive to resolver.golden.json (which only covers exact aliased addresses). Expected values computed by Fable's independent §5.7 implementation (explore_near.cjs) and hand-verified against Nova source + the raw #LINES table, NOT derived from resolver.cjs.",
+    "symbolFile": "E:/git/Nova2026/build/symbols_ext_combined",
+    "sourceCompare": "by basename + line (full-path plumbing is covered by resolver.golden.json)",
+    "gate": "NEAR_SPAN=1024; pages 0-3 require same-page; offset >= 0",
+    "notes": "base is a 4-hex-digit string; offset is a number; name/source null means the plausibility gate rejected that facet."
+  },
+  "cases": [
+    {
+      "name": "exact-line-no-symbol (the common return-address case, finding #1a)",
+      "why": "PC has an EXACT #LINES entry (c0ef -> memory.s:23 'lda _MemsetValue') but NO symbol at c0ef. Source must use that exact line; name = nearest symbol below (_MemsetSimple@c0ed).",
+      "module": null,
+      "addr": "c0ef",
+      "expect": { "name": "_MemsetSimple", "base": "c0ed", "offset": 2, "source": { "file": "memory.s", "line": 23 }, "kind": "code", "module": "R" }
+    },
+    {
+      "name": "mid-routine, no exact line (floor line below, finding #1b)",
+      "why": "PC c002 has no line entry (table has c001->116, c003->117); floor line = c001 (kernel.s:116 'lda #0', code). Nearest symbol below = _KernelEntry@c000.",
+      "module": null,
+      "addr": "c002",
+      "expect": { "name": "_KernelEntry", "base": "c000", "offset": 2, "source": { "file": "kernel.s", "line": 116 }, "kind": "code", "module": "R" }
+    },
+    {
+      "name": "interior of a data block (PC inside a .word vector)",
+      "why": "PC fffb is the 2nd byte of _VectorNMI's .word at fffa. No line at fffb; floor line = fffa (loader.asm:542 '.word IrqDoNothing' -> data). Name = _VectorNMI@fffa, offset 1, kind data.",
+      "module": null,
+      "addr": "fffb",
+      "expect": { "name": "_VectorNMI", "base": "fffa", "offset": 1, "source": { "file": "loader.asm", "line": 542 }, "kind": "data", "module": "R" }
+    },
+    {
+      "name": "ZP / low-page cross-page gate (no mid-memory owner)",
+      "why": "PC 0200 (page 2). Nearest symbol below is a ZP symbol on page 0; plausible() requires same page for base<0x400 -> rejected. Nearest line below is also a ZP line -> rejected. Both facets null.",
+      "module": null,
+      "addr": "0200",
+      "expect": { "name": null, "base": null, "offset": null, "source": null, "kind": "unknown", "module": "R" }
+    },
+    {
+      "name": "unlabeled stretch beyond NEAR_SPAN",
+      "why": "PC e23d sits 1100 bytes above the nearest symbol/line below (ddf1), which exceeds NEAR_SPAN=1024. Gate rejects both -> no func+$big lie. Empty record.",
+      "module": null,
+      "addr": "e23d",
+      "expect": { "name": null, "base": null, "offset": null, "source": null, "kind": "unknown", "module": "R" }
+    },
+    {
+      "name": "overlay view mid-routine (module 0), source-text code",
+      "why": "setActiveModule(0). PC 2d50 = _DrawClock+2; exact line 2d50 -> module_megabuilding.s:1186 'sta _frame_idx' (code by source text). module field must be the OWNER's module (0).",
+      "module": 0,
+      "addr": "2d50",
+      "expect": { "name": "_DrawClock", "base": "2d4e", "offset": 2, "source": { "file": "module_megabuilding.s", "line": 1186 }, "kind": "code", "module": 0 }
+    },
+    {
+      "name": "overlay view mid-routine (module 0), second case",
+      "why": "PC 289f = _FlashLoop+2; exact line 289f -> module_megabuilding.s:438 'sta _delay_idx' (code). _FlashLoop's #SYM decl line (119) differs from the code line (438) — source is the enclosing code line, not the decl line.",
+      "module": 0,
+      "addr": "289f",
+      "expect": { "name": "_FlashLoop", "base": "289d", "offset": 2, "source": { "file": "module_megabuilding.s", "line": 438 }, "kind": "code", "module": 0 }
+    }
+  ]
+}
