@@ -13,6 +13,17 @@ const fs = require('fs');
 const path = require('path');
 const child_process = require('child_process');
 
+// Canonical key for comparing filesystem paths. Resolve to absolute (normalizes
+// separators for the host OS) and fold case ONLY on case-insensitive filesystems
+// (Windows, macOS) — on Linux, case is significant, so leaving it restricts the
+// extension needlessly. Keeps path matching correct across platforms.
+const caseInsensitiveFS = process.platform === 'win32' || process.platform === 'darwin';
+const canonPath = p => {
+    if (!p) return '';
+    const r = path.resolve(p);
+    return caseInsensitiveFS ? r.toLowerCase() : r;
+};
+
 // ----------------------------------------------------------------
 // DAP protocol I/O  (Content-Length framing over stdin/stdout)
 // ----------------------------------------------------------------
@@ -649,7 +660,7 @@ function loadSymbols(file) {
         // Map each source file to the module that owns it (module-scoped breakpoints).
         fileToModule = new Map();
         for (const [key, fset] of moduleFiles) {
-            for (const f of fset) fileToModule.set(path.resolve(f).toLowerCase(), key);
+            for (const f of fset) fileToModule.set(canonPath(f), key);
         }
 
         // Default active module: config override, else NONE (resident-only). On boot
@@ -1322,11 +1333,11 @@ function isBreakpointAt(addr) {
 // Resolve a source file+line to an address using the #LINES table.
 // Prefers the next executable line at/after reqLine, else the nearest before.
 function resolveSrcLineAddr(file, reqLine) {
-    const norm = path.resolve(file).toLowerCase();
+    const norm = canonPath(file);
     let afterAddr = -1, afterLine = Infinity;
     let beforeAddr = -1, beforeLine = -1;
     for (const entry of lineTable) {
-        if (path.resolve(entry.file).toLowerCase() !== norm) continue;
+        if (canonPath(entry.file) !== norm) continue;
         if (entry.line >= reqLine && entry.line < afterLine) { afterLine = entry.line; afterAddr = entry.addr; }
         if (entry.line <= reqLine && entry.line > beforeLine) { beforeLine = entry.line; beforeAddr = entry.addr; }
     }
@@ -2390,7 +2401,7 @@ const handlers = {
         const srcPath = args.source && args.source.path ? args.source.path : '';
         // Key srcBps by the normalized path so a re-cased/non-canonical path for the
         // same file can't leave a stale bucket (and stale armed Z0s) behind.
-        const norm = path.resolve(srcPath).toLowerCase();
+        const norm = canonPath(srcPath);
 
         // Remove previous source breakpoints for this file (only armed ones are in the stub)
         const prev = srcBps.get(norm) || [];
@@ -2415,7 +2426,7 @@ const handlers = {
             // Search the owning module's line table: same file, nearest line <= requested
             let bestAddr = -1, bestLine = -1;
             for (const entry of lt) {
-                const match = path.resolve(entry.file).toLowerCase() === norm;
+                const match = canonPath(entry.file) === norm;
                 if (match && entry.line <= reqLine && entry.line > bestLine) {
                     bestLine = entry.line;
                     bestAddr = entry.addr;
@@ -3273,6 +3284,8 @@ const handlers = {
         const h2 = v => '$' + (v & 0xFF).toString(16).toUpperCase().padStart(2, '0');
         const h4 = v => (v & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
         const sym = addr => addrSym.get(addr);
+        // Byte value shown three ways: hex | decimal | binary (e.g. $63|99|%01100011)
+        const fmtVal = v => h2(v) + '|' + (v & 0xFF) + '|%' + (v & 0xFF).toString(2).padStart(8, '0');
 
         // Helper to read 1 byte from memory (uses readMem for dedup cache)
         async function readByte(addr) {
@@ -3289,27 +3302,27 @@ const handlers = {
         try {
             switch (mode) {
                 case '#': { // immediate
-                    annotation = '#' + h2(lo) + ' (' + lo + ')';
+                    annotation = '#' + fmtVal(lo);
                     break;
                 }
                 case 'z': { // zero page
                     const val = await readByte(lo);
                     const s = sym(lo);
-                    annotation = '(' + (s || h2(lo)) + ')=' + h2(val);
+                    annotation = '(' + (s || h2(lo)) + ')=' + fmtVal(val);
                     break;
                 }
                 case 'x': { // zp,X
                     const ea = (lo + regs.x) & 0xFF;
                     const val = await readByte(ea);
                     const s = sym(lo);
-                    annotation = '(' + (s || h2(lo)) + '+X:' + h2(regs.x) + '=' + h2(ea) + ')=' + h2(val);
+                    annotation = '(' + (s || h2(lo)) + '+X:' + h2(regs.x) + '=' + h2(ea) + ')=' + fmtVal(val);
                     break;
                 }
                 case 'y': { // zp,Y
                     const ea = (lo + regs.y) & 0xFF;
                     const val = await readByte(ea);
                     const s = sym(lo);
-                    annotation = '(' + (s || h2(lo)) + '+Y:' + h2(regs.y) + '=' + h2(ea) + ')=' + h2(val);
+                    annotation = '(' + (s || h2(lo)) + '+Y:' + h2(regs.y) + '=' + h2(ea) + ')=' + fmtVal(val);
                     break;
                 }
                 case 'a': { // absolute
@@ -3321,7 +3334,7 @@ const handlers = {
                     } else {
                         const val = await readByte(addr);
                         const s = sym(addr);
-                        annotation = '(' + (s || '$' + h4(addr)) + ')=' + h2(val);
+                        annotation = '(' + (s || '$' + h4(addr)) + ')=' + fmtVal(val);
                     }
                     break;
                 }
@@ -3329,14 +3342,14 @@ const handlers = {
                     const base = (hi << 8) | lo;
                     const ea = (base + regs.x) & 0xFFFF;
                     const val = await readByte(ea);
-                    annotation = '$' + h4(base) + '+X:' + h2(regs.x) + '=$' + h4(ea) + ' =' + h2(val);
+                    annotation = '$' + h4(base) + '+X:' + h2(regs.x) + '=$' + h4(ea) + ' =' + fmtVal(val);
                     break;
                 }
                 case 'Y': { // abs,Y
                     const base = (hi << 8) | lo;
                     const ea = (base + regs.y) & 0xFFFF;
                     const val = await readByte(ea);
-                    annotation = '$' + h4(base) + '+Y:' + h2(regs.y) + '=$' + h4(ea) + ' =' + h2(val);
+                    annotation = '$' + h4(base) + '+Y:' + h2(regs.y) + '=$' + h4(ea) + ' =' + fmtVal(val);
                     break;
                 }
                 case '(': { // (zp,X) indirect X
@@ -3344,7 +3357,7 @@ const handlers = {
                     const ea = await readWord(ptr);
                     const val = await readByte(ea);
                     const s = sym(lo);
-                    annotation = '(' + (s || h2(lo)) + '+X:' + h2(regs.x) + '=' + h2(ptr) + ')=$' + h4(ea) + ' =' + h2(val);
+                    annotation = '(' + (s || h2(lo)) + '+X:' + h2(regs.x) + '=' + h2(ptr) + ')=$' + h4(ea) + ' =' + fmtVal(val);
                     break;
                 }
                 case ')': { // (zp),Y indirect Y
@@ -3352,7 +3365,7 @@ const handlers = {
                     const ea = (ptr + regs.y) & 0xFFFF;
                     const val = await readByte(ea);
                     const s = sym(lo);
-                    annotation = '(*(' + (s || h2(lo)) + ')=$' + h4(ptr) + '+Y:' + h2(regs.y) + ')=$' + h4(ea) + ' =' + h2(val);
+                    annotation = '(*(' + (s || h2(lo)) + ')=$' + h4(ptr) + '+Y:' + h2(regs.y) + ')=$' + h4(ea) + ' =' + fmtVal(val);
                     break;
                 }
                 case 'n': { // indirect (JMP only)

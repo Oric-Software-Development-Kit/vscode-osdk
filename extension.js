@@ -7,6 +7,35 @@ const vscode = require('vscode');
 // so each Oric project keeps its own preference.
 const LOG_LEVEL_KEY = 'oric-debug.logLevel';
 
+// workspaceState key: remembers gitlens.currentLine.enabled's prior value while
+// we suppress it during a debug session, so a mid-session crash can still be
+// recovered on next activation rather than leaving GitLens blame off forever.
+const GITLENS_BLAME_KEY = 'oric-debug.gitlensBlamePrev';
+
+// Canonical key for comparing filesystem paths across sources (symbol-file
+// paths vs VS Code's editor.document.uri.fsPath). path.resolve normalizes the
+// separators for the host OS (and, on Windows, e.g. "E:\a" vs "e:/a"), which is
+// why a raw === compare of a symbol-file path against fsPath fails and
+// decorations never render. Case folding is applied ONLY on case-insensitive
+// filesystems (Windows, macOS) so Linux — where case matters — stays correct.
+const nodePath = require('path');
+const caseInsensitiveFS = process.platform === 'win32' || process.platform === 'darwin';
+const canonPath = p => {
+    if (!p) return '';
+    const r = nodePath.resolve(p);
+    return caseInsensitiveFS ? r.toLowerCase() : r;
+};
+
+// Human-readable "go to definition" mouse gesture for hover hints. VS Code binds
+// go-to-definition to the modifier NOT used for multi-cursor: when
+// editor.multiCursorModifier is 'ctrlCmd', the gesture is Alt+Click; otherwise
+// it's Ctrl+Click (Cmd+Click on macOS). Keeps the hint correct on any platform.
+function gotoGesture() {
+    const mod = vscode.workspace.getConfiguration('editor').get('multiCursorModifier');
+    if (mod === 'ctrlCmd') return 'Alt+Click or F12';
+    return (process.platform === 'darwin' ? 'Cmd+Click' : 'Ctrl+Click') + ' or F12';
+}
+
 // ----------------------------------------------------------------
 // Peripheral display names
 // ----------------------------------------------------------------
@@ -2488,7 +2517,7 @@ async function toggleBreakpointViaModel(session, address) {
         const line0 = loc.line - 1;
         const existing = vscode.debug.breakpoints.find(bp =>
             bp instanceof vscode.SourceBreakpoint &&
-            bp.location.uri.fsPath.toLowerCase() === uri.fsPath.toLowerCase() &&
+            canonPath(bp.location.uri.fsPath) === canonPath(uri.fsPath) &&
             bp.location.range.start.line === line0);
         if (existing) vscode.debug.removeBreakpoints([existing]);
         else vscode.debug.addBreakpoints([new vscode.SourceBreakpoint(
@@ -2510,7 +2539,7 @@ async function toggleBreakpointViaModel(session, address) {
 function syncMonitorBreakpoints(body) {
     const sameSource = (bp, file, line0) =>
         bp instanceof vscode.SourceBreakpoint &&
-        bp.location.uri.fsPath.toLowerCase() === vscode.Uri.file(file).fsPath.toLowerCase() &&
+        canonPath(bp.location.uri.fsPath) === canonPath(vscode.Uri.file(file).fsPath) &&
         bp.location.range.start.line === line0;
     const sameInstr = (bp, addr16) =>
         bp instanceof vscode.InstructionBreakpoint &&
@@ -3221,7 +3250,7 @@ function activate(context) {
     function applyCycleDecorations() {
         for (const editor of vscode.window.visibleTextEditors) {
             const filePath = editor.document.uri.fsPath;
-            const fileAnnotations = cycleAnnotations.get(filePath);
+            const fileAnnotations = cycleAnnotations.get(canonPath(filePath));
             if (!fileAnnotations || fileAnnotations.size === 0) {
                 editor.setDecorations(cycleDecorationType, []);
                 continue;
@@ -3270,7 +3299,7 @@ function activate(context) {
     function applyInstrDecoration() {
         for (const editor of vscode.window.visibleTextEditors) {
             const filePath = editor.document.uri.fsPath;
-            if (filePath === instrDecoFile && instrDecoLine > 0 && instrDecoText) {
+            if (canonPath(filePath) === canonPath(instrDecoFile) && instrDecoLine > 0 && instrDecoText) {
                 const range = new vscode.Range(instrDecoLine - 1, 0, instrDecoLine - 1, 0);
                 editor.setDecorations(instrDecorationType, [{
                     range,
@@ -3369,7 +3398,7 @@ function activate(context) {
                     const src = perNameSrc || sym.source;
                     if (src && src.file) {
                         const pathMod = require('path');
-                        md += '  \nDefined in: ' + pathMod.basename(src.file) + ':' + src.line + ' \u2014 Ctrl+Click or F12 to go';
+                        md += '  \nDefined in: ' + pathMod.basename(src.file) + ':' + src.line + ' \u2014 ' + gotoGesture() + ' to go';
                     }
                     return new vscode.Hover(new vscode.MarkdownString(md), range);
                 }
@@ -3384,7 +3413,7 @@ function activate(context) {
                     let md = '**' + word + '** \u2014 `#define`  \n';
                     md += 'Value: `' + def.value + '`';
                     if (def.numValue !== null) md += ' (' + def.numValue + ')';
-                    md += '  \nDefined in: ' + pathMod.basename(def.file) + ':' + def.line + ' \u2014 Ctrl+Click or F12 to go';
+                    md += '  \nDefined in: ' + pathMod.basename(def.file) + ':' + def.line + ' \u2014 ' + gotoGesture() + ' to go';
                     return new vscode.Hover(new vscode.MarkdownString(md), range);
                 }
 
@@ -3695,6 +3724,36 @@ function activate(context) {
         }
     }
 
+    // --- GitLens current-line blame suppression during debug ---
+    // Our inline value annotation renders at end-of-line on the current line —
+    // the same slot GitLens uses for current-line blame, which would hide ours
+    // (its long, truncated text pushes ours past the viewport). The user doesn't
+    // want git blame while tracing, so turn it off for the session and restore it
+    // afterwards. The prior value is mirrored to workspaceState for crash recovery.
+    async function suppressGitLensBlame() {
+        if (!vscode.extensions.getExtension('eamodio.gitlens')) return;
+        const cfg = vscode.workspace.getConfiguration('gitlens');
+        if (cfg.get('currentLine.enabled') === false) return; // already off — nothing to change or restore
+        const insp = cfg.inspect('currentLine.enabled');
+        const prevGlobal = insp ? insp.globalValue : undefined; // undefined = no explicit override
+        // Store null for "no override" (workspaceState can't hold undefined meaningfully).
+        await context.workspaceState.update(GITLENS_BLAME_KEY, { prev: prevGlobal === undefined ? null : prevGlobal });
+        await cfg.update('currentLine.enabled', false, vscode.ConfigurationTarget.Global);
+    }
+    async function restoreGitLensBlame() {
+        const saved = context.workspaceState.get(GITLENS_BLAME_KEY);
+        if (!saved) return;
+        await context.workspaceState.update(GITLENS_BLAME_KEY, undefined);
+        if (!vscode.extensions.getExtension('eamodio.gitlens')) return;
+        const cfg = vscode.workspace.getConfiguration('gitlens');
+        // null -> undefined restores "no explicit override" (GitLens default of true).
+        await cfg.update('currentLine.enabled', saved.prev === null ? undefined : saved.prev, vscode.ConfigurationTarget.Global);
+    }
+    // Crash recovery: a prior session that died mid-run may have left blame off.
+    if (!vscode.debug.activeDebugSession || vscode.debug.activeDebugSession.type !== 'oric-debug') {
+        restoreGitLensBlame();
+    }
+
     const moduleStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
     moduleStatusBar.command = 'oric-debug.selectModule';
     moduleStatusBar.tooltip = 'Active Oric symbol module — click to change';
@@ -3722,6 +3781,10 @@ function activate(context) {
                 return {
                     onDidSendMessage(msg) {
                         if (msg.type === 'event' && msg.event === 'stopped') {
+                            // Drop the previous line's annotation at once so it can't
+                            // flicker there during the post-step navigation churn; the
+                            // fresh one is applied when refreshAll's resolve returns.
+                            clearInstrDecoration();
                             setTimeout(() => refreshAll(), 50);
                             // Skip source-file navigation when the disassembly panel is focused
                             if (!isDisasmFocused()) pendingNavigate = true;
@@ -3754,8 +3817,7 @@ function activate(context) {
                         if (msg.type === 'event' && msg.event === 'cycleAnnotation' && msg.body) {
                             const ann = msg.body;
                             if (ann.file && ann.line > 0 && ann.cycles !== undefined) {
-                                const path = require('path');
-                                const filePath = path.isAbsolute(ann.file) ? ann.file : ann.file;
+                                const filePath = canonPath(ann.file);
                                 if (!cycleAnnotations.has(filePath)) {
                                     cycleAnnotations.set(filePath, new Map());
                                 }
@@ -3800,6 +3862,7 @@ function activate(context) {
                 disasmCenterAddr = null;
                 vscode.commands.executeCommand('setContext', 'oric-debug.warp', false); // session starts at normal speed
                 scanDefines(); // Rescan defines (build may have regenerated headers)
+                suppressGitLensBlame(); // free the end-of-line slot for our value annotation
                 setTimeout(() => refreshAll(), 500);
                 // Auto-connect viz stream if any consumer panels are open
                 if (vizConsumers.size > 0) {
@@ -3814,6 +3877,7 @@ function activate(context) {
             vizDisconnect();
             clearCycleAnnotations();
             clearInstrDecoration();
+            restoreGitLensBlame(); // give the user back their git blame
             lastPcAddr = -1;
             clearHeatmapHighlight();
             symbolCache.clear();

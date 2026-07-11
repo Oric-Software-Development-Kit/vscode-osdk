@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.0.6
+
+### Inline Current-Line Value Annotation (fixed + enhanced)
+- The current-line operand annotation now renders reliably: it never showed on Windows because symbol files store paths with an uppercase drive letter (`E:\`) while VS Code's `fsPath` is lowercase (`e:\`), so the strict path match failed
+- New `canonPath()` (adapter + extension) resolves and case-folds paths **only on case-insensitive filesystems** (Windows/macOS), leaving Linux case-sensitive — replacing the previous Windows-only `.toLowerCase()` matching for decorations, breakpoints, and module mapping
+- GitLens' current-line blame is suppressed during a debug session (restored afterward, crash-safe) so the value annotation owns the end-of-line slot instead of being hidden behind it
+- The annotation is cleared on each stop, so the previous line's value no longer flickers during post-step navigation
+- Resolved byte values are shown three ways: hex | decimal | binary (e.g. `$63|99|%01100011`)
+
+### Go-to-Definition Hint
+- The hover's "go to definition" hint now reflects the actual gesture for your `editor.multiCursorModifier` and OS (Alt+Click / Ctrl+Click / Cmd+Click), instead of hard-coding Ctrl+Click
+
 ## 0.0.5
 
 ### Log Verbosity Control
