@@ -75,6 +75,7 @@ function evt(name, body) {
 
 // Log levels: 0 = errors only, 1 = normal (default), 2 = verbose/debug
 let logLevel = 1;
+const LOG_LEVEL_NAMES = ['Errors', 'Normal', 'Verbose'];
 
 function log(msg) {
     evt('output', { category: 'console', output: msg + '\n' });
@@ -83,6 +84,47 @@ function log(msg) {
 function logVerbose(msg) {
     if (logLevel >= 2) log(msg);
 }
+
+// Set the verbosity and tell the extension host so the status bar can update.
+// `initial` marks the value derived from launch config at session start — the
+// host persists explicit (non-initial) changes so they carry across sessions.
+function applyLogLevel(lvl, initial) {
+    logLevel = lvl;
+    evt('oricLogLevel', { level: logLevel, name: LOG_LEVEL_NAMES[logLevel], initial: !!initial });
+}
+
+// Full reference for the Debug Console `help` command.
+const CONSOLE_HELP = [
+    'Oric Debug Console commands',
+    '',
+    'Registers',
+    '  A  X  Y  SP  PC           read a register',
+    '  A=$1F   X=10   PC=$C000   write ($ = hex, no $ = decimal)',
+    '',
+    'Execution',
+    '  skip                      skip the current instruction (like Oricutron F12)',
+    '  goto $C000                set PC to an address',
+    '  goto label                set PC to a symbol',
+    '',
+    'Memory',
+    '  x $C000 [len]             hex dump (len is decimal, default 16)',
+    '  m C000,20                 hex dump, GDB-style (addr and len in hex)',
+    '  w $C000 $FF               write one byte',
+    '',
+    'Symbols & expressions',
+    '  sym NAME                  show a symbol’s address',
+    '  NAME                      evaluate a symbol / C variable',
+    '  <expr>                    evaluate via Oricutron (e.g. tmp0+2)',
+    '',
+    'Display',
+    '  hex   dec                 number base for this console',
+    '  loglevel [0|1|2]          log verbosity (Errors/Normal/Verbose); no arg = show current',
+    '',
+    'Monitor passthrough',
+    '  ! <cmd>                   run a raw Oricutron monitor command',
+    '',
+    '  help   ?                  show this help'
+].join('\n');
 
 // ----------------------------------------------------------------
 // GDB RSP client  (TCP, $packet#checksum framing)
@@ -94,6 +136,11 @@ let pendingResolve = null;
 let pendingCmdType = null;   // first char of pending GDB command (to distinguish responses)
 let gdbQueue = [];           // queued commands: [{cmd, resolve}]
 let disconnecting = false;
+
+// GDB commands sent constantly to service the variables/memory views —
+// pure noise in the verbose log. Suppress both the '→' send and the '←'
+// response (matched via pendingCmdType). m/M = read/write mem, X = binary write.
+const gdbQuietCmds = new Set(['m', 'M', 'X']);
 
 function gdbConnect(host, port) {
     return new Promise((resolve, reject) => {
@@ -149,8 +196,13 @@ function onGdbData(data) {
         // ACK
         if (sock) sock.write('+');
 
-        if (payload.length <= 80) logVerbose('[GDB] ← ' + payload.substring(0, 60));
-        else logVerbose('[GDB] ← (' + payload.length + ' chars)');
+        // Suppress noisy mem-read/write responses — but never hide an
+        // (unsolicited) stop notification that lands while one is pending.
+        const isStopPkt = (payload[0] === 'T' || payload[0] === 'S');
+        if (isStopPkt || !gdbQuietCmds.has(pendingCmdType)) {
+            if (payload.length <= 80) logVerbose('[GDB] ← ' + payload.substring(0, 60));
+            else logVerbose('[GDB] ← (' + payload.length + ' chars)');
+        }
         // Route the packet: if we're waiting for a command response,
         // deliver it — UNLESS it's an unsolicited stop notification
         // (T05/S05) while we're waiting for a non-'?' response.
@@ -177,7 +229,7 @@ function gdbWrite(cmd) {
     if (!sock) { logVerbose('[GDB] write failed: no socket (cmd=' + cmd.substring(0, 20) + ')'); return; }
     let cs = 0;
     for (let i = 0; i < cmd.length; i++) cs = (cs + cmd.charCodeAt(i)) & 0xff;
-    logVerbose('[GDB] → ' + cmd.substring(0, 40));
+    if (!gdbQuietCmds.has(cmd[0])) logVerbose('[GDB] → ' + cmd.substring(0, 40));
     sock.write('$' + cmd + '#' + cs.toString(16).padStart(2, '0'));
 }
 
@@ -1534,6 +1586,7 @@ const handlers = {
         config = req.arguments || {};
         moduleByteTrusted = true; // attaching to a running program — the module byte is already valid
         if (config.logLevel !== undefined) logLevel = config.logLevel;
+        applyLogLevel(logLevel, true); // reflect the initial level in the status bar (don't re-persist)
         const host = config.host || 'localhost';
         const port = config.port || 6502;
         const retries = config.connectRetries || 10;
@@ -1576,6 +1629,7 @@ const handlers = {
         config = req.arguments || {};
         moduleByteTrusted = false; // fresh boot — don't believe the module byte until the loader stamps it
         if (config.logLevel !== undefined) logLevel = config.logLevel;
+        applyLogLevel(logLevel, true); // reflect the initial level in the status bar (don't re-persist)
         const port = config.port || 6502;
 
         if (config.symbolFile) loadSymbols(config.symbolFile);
@@ -2609,6 +2663,23 @@ const handlers = {
         const expr = (req.arguments.expression || '').trim();
         let m;
 
+        // Help:  help  |  ?  |  h
+        if (/^(help|\?|h)$/i.test(expr)) {
+            respond(req, { result: CONSOLE_HELP, variablesReference: 0 });
+            return;
+        }
+
+        // Log verbosity:  loglevel        (show current)
+        //                 loglevel 0|1|2  (set)
+        if ((m = expr.match(/^loglevel(?:\s+([0-2]))?$/i))) {
+            if (m[1] !== undefined) applyLogLevel(parseInt(m[1], 10));
+            respond(req, {
+                result: 'Log level: ' + logLevel + ' (' + LOG_LEVEL_NAMES[logLevel] + ')',
+                variablesReference: 0
+            });
+            return;
+        }
+
         // Skip instruction (like Oricutron's F12):  skip
         if (expr.toLowerCase() === 'skip') {
             if (!regs) { respond(req, {}, false, 'No register state'); return; }
@@ -2835,9 +2906,9 @@ const handlers = {
             return;
         }
 
-        // Help
+        // Unrecognized — point at the full reference
         respond(req, {}, false,
-            'Commands: A/X/Y/SP/PC (read) | A=$xx (write) | skip | goto $ADDR | goto SYMBOL | x $ADDR [LEN] | w $ADDR $VAL | sym NAME | hex | dec | ! <mon cmd> | <symbol>');
+            "Unrecognized: '" + expr + "'.  Type  help  for the list of console commands.");
     },
 
     // -- Custom requests (called from extension.js) -------------------
@@ -2908,6 +2979,17 @@ const handlers = {
         const text = (req.arguments && req.arguments.text) || '';
         log(text);
         respond(req, {});
+    },
+
+    // -- Log verbosity (custom request from the status bar) ------------
+    setLogLevel(req) {
+        const lvl = req.arguments ? req.arguments.level : undefined;
+        if (typeof lvl === 'number' && lvl >= 0 && lvl <= 2) {
+            applyLogLevel(lvl);
+            respond(req, { level: logLevel, name: LOG_LEVEL_NAMES[logLevel] });
+        } else {
+            respond(req, {}, false, 'level must be 0 (Errors), 1 (Normal), or 2 (Verbose)');
+        }
     },
 
     // -- Skip instruction (custom request) ----------------------------

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.5
+
+### Log Verbosity Control
+- Memory-read/write GDB traffic (`m`/`M`/`X`) is suppressed from the verbose log — the constant `[GDB] → m…` / `[GDB] ← (N chars)` noise from the variables/memory views no longer drowns the trace (genuine stop notifications still show)
+- Status bar (bottom left) shows the current **Log** level; click to switch Errors / Normal / Verbose without editing `launch.json`
+- New `loglevel [0|1|2]` debug-console command shows or sets the level inline
+
+### Debug Console Help
+- New `help` (or `?`) command prints a categorized reference of every console command, replacing the single-line fallback message
+
 ## 0.0.4
 
 ### Transparent Module-Load Breakpoint Arming

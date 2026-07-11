@@ -214,6 +214,14 @@ Type these commands in the VS Code Debug Console during a debug session:
 | `skip` | Skip current instruction (advance PC) | `skip` |
 | `sym NAME` | Look up a symbol address | `sym _irq_handler` |
 | `symbolName` | Look up a symbol by typing its name | `_main` |
+| `hex` / `dec` | Set the number base for console output | `hex` |
+| `loglevel [0\|1\|2]` | Show or set log verbosity (Errors/Normal/Verbose) | `loglevel 1` |
+| `! <cmd>` | Run a raw Oricutron monitor command | `! = tmp0+2` |
+| `help` (or `?`) | Show the full command reference | `help` |
+
+The status bar (bottom left, during a session) shows the active **Module** and the
+current **Log** level. Click either one to change it — the log-level picker is the
+quickest way to silence verbose GDB/DAP tracing without editing `launch.json`.
 
 ---
 

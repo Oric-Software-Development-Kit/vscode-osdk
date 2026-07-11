@@ -2,6 +2,11 @@
 
 const vscode = require('vscode');
 
+// workspaceState key: per-project debug console log verbosity (0/1/2).
+// Persists an explicit runtime choice across sessions; scoped to the workspace
+// so each Oric project keeps its own preference.
+const LOG_LEVEL_KEY = 'oric-debug.logLevel';
+
 // ----------------------------------------------------------------
 // Peripheral display names
 // ----------------------------------------------------------------
@@ -3182,6 +3187,14 @@ function activate(context) {
                         return undefined;
                     }
                 }
+                // Log verbosity precedence: a persisted per-project choice wins;
+                // otherwise an explicit launch.json value; otherwise Normal (1).
+                const persistedLevel = context.workspaceState.get(LOG_LEVEL_KEY);
+                if (typeof persistedLevel === 'number') {
+                    config.logLevel = persistedLevel;
+                } else if (config.logLevel === undefined) {
+                    config.logLevel = 1;
+                }
                 return config;
             }
         })
@@ -3510,6 +3523,25 @@ function activate(context) {
             } catch (e) {
                 vscode.window.showErrorMessage('Module select failed: ' + (e && e.message ? e.message : e));
             }
+        }),
+        vscode.commands.registerCommand('oric-debug.selectLogLevel', async () => {
+            const session = vscode.debug.activeDebugSession;
+            if (!session || session.type !== 'oric-debug') return;
+            try {
+                const pick = await vscode.window.showQuickPick(
+                    [
+                        { label: 'Errors',  description: 'errors only',              level: 0 },
+                        { label: 'Normal',  description: 'default — key events',     level: 1 },
+                        { label: 'Verbose', description: 'full GDB/DAP trace',        level: 2 }
+                    ],
+                    { placeHolder: 'Debug console log verbosity' });
+                if (pick) {
+                    const resp = await session.customRequest('setLogLevel', { level: pick.level });
+                    if (resp && resp.name) vscode.window.setStatusBarMessage('Oric log level: ' + resp.name, 3000);
+                }
+            } catch (e) {
+                vscode.window.showErrorMessage('Log level change failed: ' + (e && e.message ? e.message : e));
+            }
         })
     );
 
@@ -3669,6 +3701,13 @@ function activate(context) {
     context.subscriptions.push(moduleStatusBar);
     context.subscriptions.push(vscode.debug.onDidTerminateDebugSession(() => moduleStatusBar.hide()));
 
+    // Debug console verbosity — click to pick Errors / Normal / Verbose.
+    const logLevelStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 89);
+    logLevelStatusBar.command = 'oric-debug.selectLogLevel';
+    logLevelStatusBar.tooltip = 'Oric debug log verbosity — click to change';
+    context.subscriptions.push(logLevelStatusBar);
+    context.subscriptions.push(vscode.debug.onDidTerminateDebugSession(() => logLevelStatusBar.hide()));
+
     // Keep the disassembly view's breakpoint dots in sync with VS Code's model —
     // whether a breakpoint changed via the source gutter, the Breakpoints panel,
     // the disasm gutter, or (via inbound promotion) Oricutron itself.
@@ -3736,6 +3775,16 @@ function activate(context) {
                         if (msg.type === 'event' && msg.event === 'oricActiveModule' && msg.body) {
                             moduleStatusBar.text = '$(layers) Module: ' + msg.body.name;
                             moduleStatusBar.show();
+                        }
+                        // Log verbosity changed (initial config, status bar, or console) — reflect it
+                        if (msg.type === 'event' && msg.event === 'oricLogLevel' && msg.body) {
+                            logLevelStatusBar.text = '$(output) Log: ' + msg.body.name;
+                            logLevelStatusBar.show();
+                            // Persist explicit changes per project so they survive across
+                            // sessions; the initial value from config is not re-persisted.
+                            if (!msg.body.initial && typeof msg.body.level === 'number') {
+                                context.workspaceState.update(LOG_LEVEL_KEY, msg.body.level);
+                            }
                         }
                     }
                 };
