@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.9
+
+### Breakpoint Line Snapping
+- A breakpoint on a non-executable line (comment, blank, declaration) now snaps **forward** to the next executable line, matching normal debugger behavior — previously it snapped backward to the nearest earlier line, which also caused distinct requested lines to collapse onto one earlier line (duplicate markers). Falls back to the nearest line before only when nothing follows (breakpoint past the last statement).
+
 ## 0.0.8
 
 ### Stale-Host Detection

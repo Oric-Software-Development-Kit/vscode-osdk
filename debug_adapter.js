@@ -2459,15 +2459,22 @@ const handlers = {
         for (const sbp of (args.breakpoints || [])) {
             const reqLine = sbp.line;
 
-            // Search the owning module's line table: same file, nearest line <= requested
-            let bestAddr = -1, bestLine = -1;
+            // Snap to the nearest executable line AT/AFTER the requested line (forward —
+            // the debugger convention when a line has no code, e.g. a comment or blank).
+            // Only fall back to the nearest line before it when nothing follows in the
+            // file (breakpoint set past the last statement). Snapping backward would make
+            // distinct requested lines collapse onto one earlier line (the "two at 489").
+            let bestAddr = -1, bestLine = -1;         // forward: smallest line >= reqLine
+            let beforeAddr = -1, beforeLine = -1;     // fallback: largest line < reqLine
             for (const entry of lt) {
-                const match = canonPath(entry.file) === norm;
-                if (match && entry.line <= reqLine && entry.line > bestLine) {
-                    bestLine = entry.line;
-                    bestAddr = entry.addr;
+                if (canonPath(entry.file) !== norm) continue;
+                if (entry.line >= reqLine) {
+                    if (bestLine < 0 || entry.line < bestLine) { bestLine = entry.line; bestAddr = entry.addr; }
+                } else if (entry.line > beforeLine) {
+                    beforeLine = entry.line; beforeAddr = entry.addr;
                 }
             }
+            if (bestAddr < 0) { bestAddr = beforeAddr; bestLine = beforeLine; }
 
             if (bestAddr >= 0) {
                 const shouldArm = (bpModule === 'R' || bpModule === activeModuleId);
