@@ -1158,39 +1158,86 @@ function vizConnect(host, port) {
             }
 
             const version = vizRxBuf.readUInt16LE(14);
-            const frameSize = (version >= 1) ? VIZ_FRAME_SIZE_V1 : VIZ_FRAME_SIZE_V0;
+            let frame, msg;
 
-            if (vizRxBuf.length < frameSize) return; // wait for more data
-
-            const frame = vizRxBuf.slice(0, frameSize);
-            vizRxBuf = vizRxBuf.slice(frameSize);
-
-            // Build parsed message
-            const msg = {
-                version,
-                frameCounter: frame.readUInt32LE(4),
-                romdis: frame[8],
-                vidMode: frame[9],
-                vidAddr: frame.readUInt16LE(10),
-                charsetAddr: frame.readUInt16LE(12),
-                readHeat: frame.slice(16, 16 + 65536).toString('base64'),
-                writeHeat: frame.slice(16 + 65536, 16 + 65536 * 2).toString('base64'),
-                ulaHeat: frame.slice(16 + 65536 * 2, 16 + 65536 * 3).toString('base64')
-            };
-
-            if (version >= 1) {
-                const v1Off = VIZ_FRAME_SIZE_V0;
-                msg.scrBuf = frame.slice(v1Off, v1Off + VIZ_SCR_SIZE).toString('base64');
-                msg.vidbases = [
-                    frame.readUInt16LE(v1Off + VIZ_SCR_SIZE),
-                    frame.readUInt16LE(v1Off + VIZ_SCR_SIZE + 2),
-                    frame.readUInt16LE(v1Off + VIZ_SCR_SIZE + 4),
-                    frame.readUInt16LE(v1Off + VIZ_SCR_SIZE + 6)
-                ];
-                msg.vidRamMain = frame.slice(v1Off + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE,
-                                             v1Off + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN).toString('base64');
-                msg.vidRamBottom = frame.slice(v1Off + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN,
-                                               v1Off + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN + VIZ_VIDRAM_BOTTOM).toString('base64');
+            if (version >= 2) {
+                // v2: variable length — three heat-delta run-lists, then the fixed
+                // screen block. Parse the run-lists to locate the screen block.
+                const SCREEN_BLOCK = VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN + VIZ_VIDRAM_BOTTOM;
+                let hoff = 16;
+                const ranges = [];
+                let haveAll = true, corrupt = false;
+                for (let a = 0; a < 3; a++) {
+                    if (vizRxBuf.length < hoff + 2) { haveAll = false; break; }
+                    const nRuns = vizRxBuf.readUInt16LE(hoff);
+                    if (nRuns > 32768) { corrupt = true; break; } // > producer max → desync, don't trust the length
+                    const bytes = 2 + nRuns * 4;
+                    if (vizRxBuf.length < hoff + bytes) { haveAll = false; break; }
+                    ranges.push([hoff, hoff + bytes]);
+                    hoff += bytes;
+                }
+                if (corrupt) { vizRxBuf = vizRxBuf.slice(1); continue; } // resync via magic scan
+                if (!haveAll) return;                       // wait for the rest of the heat delta
+                const frameSize = hoff + SCREEN_BLOCK;
+                if (vizRxBuf.length < frameSize) return;    // wait for the screen block
+                frame = vizRxBuf.slice(0, frameSize);
+                vizRxBuf = vizRxBuf.slice(frameSize);
+                const s = hoff; // screen block offset
+                msg = {
+                    version,
+                    frameCounter: frame.readUInt32LE(4),
+                    romdis: frame[8],
+                    vidMode: frame[9],
+                    vidAddr: frame.readUInt16LE(10),
+                    charsetAddr: frame.readUInt16LE(12),
+                    // heat deltas as raw count-prefixed run-list bytes; the webview
+                    // applies them onto its own arrays and does the decay.
+                    readRuns:  frame.slice(ranges[0][0], ranges[0][1]).toString('base64'),
+                    writeRuns: frame.slice(ranges[1][0], ranges[1][1]).toString('base64'),
+                    ulaRuns:   frame.slice(ranges[2][0], ranges[2][1]).toString('base64'),
+                    scrBuf: frame.slice(s, s + VIZ_SCR_SIZE).toString('base64'),
+                    vidbases: [
+                        frame.readUInt16LE(s + VIZ_SCR_SIZE),
+                        frame.readUInt16LE(s + VIZ_SCR_SIZE + 2),
+                        frame.readUInt16LE(s + VIZ_SCR_SIZE + 4),
+                        frame.readUInt16LE(s + VIZ_SCR_SIZE + 6)
+                    ],
+                    vidRamMain: frame.slice(s + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE,
+                                            s + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN).toString('base64'),
+                    vidRamBottom: frame.slice(s + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN,
+                                              s + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN + VIZ_VIDRAM_BOTTOM).toString('base64')
+                };
+            } else {
+                // Legacy v0/v1: full heat arrays, fixed frame size.
+                const frameSize = (version >= 1) ? VIZ_FRAME_SIZE_V1 : VIZ_FRAME_SIZE_V0;
+                if (vizRxBuf.length < frameSize) return;
+                frame = vizRxBuf.slice(0, frameSize);
+                vizRxBuf = vizRxBuf.slice(frameSize);
+                msg = {
+                    version,
+                    frameCounter: frame.readUInt32LE(4),
+                    romdis: frame[8],
+                    vidMode: frame[9],
+                    vidAddr: frame.readUInt16LE(10),
+                    charsetAddr: frame.readUInt16LE(12),
+                    readHeat: frame.slice(16, 16 + 65536).toString('base64'),
+                    writeHeat: frame.slice(16 + 65536, 16 + 65536 * 2).toString('base64'),
+                    ulaHeat: frame.slice(16 + 65536 * 2, 16 + 65536 * 3).toString('base64')
+                };
+                if (version >= 1) {
+                    const v1Off = VIZ_FRAME_SIZE_V0;
+                    msg.scrBuf = frame.slice(v1Off, v1Off + VIZ_SCR_SIZE).toString('base64');
+                    msg.vidbases = [
+                        frame.readUInt16LE(v1Off + VIZ_SCR_SIZE),
+                        frame.readUInt16LE(v1Off + VIZ_SCR_SIZE + 2),
+                        frame.readUInt16LE(v1Off + VIZ_SCR_SIZE + 4),
+                        frame.readUInt16LE(v1Off + VIZ_SCR_SIZE + 6)
+                    ];
+                    msg.vidRamMain = frame.slice(v1Off + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE,
+                                                 v1Off + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN).toString('base64');
+                    msg.vidRamBottom = frame.slice(v1Off + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN,
+                                                   v1Off + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN + VIZ_VIDRAM_BOTTOM).toString('base64');
+                }
             }
 
             for (const c of vizConsumers) c.postFrame(msg);
@@ -1257,11 +1304,16 @@ const heatmapConsumer = {
         if (heatmapPanel) {
             heatmapPanel.webview.postMessage({
                 type: 'heatmapFrame',
+                version: msg.version,
                 frameCounter: msg.frameCounter,
                 romdis: msg.romdis,
                 vidMode: msg.vidMode,
                 vidAddr: msg.vidAddr,
                 charsetAddr: msg.charsetAddr,
+                // v2 heat deltas (run-lists); v0/v1 full arrays (legacy)
+                readRuns: msg.readRuns,
+                writeRuns: msg.writeRuns,
+                ulaRuns: msg.ulaRuns,
                 readHeat: msg.readHeat,
                 writeHeat: msg.writeHeat,
                 ulaHeat: msg.ulaHeat
@@ -1458,6 +1510,13 @@ bottomCanvas.style.aspectRatio = '256 / 64';
 const mainImg = mainCtx.createImageData(256, 188);
 const bottomImg = bottomCtx.createImageData(256, 64);
 
+// v2: the webview owns the heat state; the emulator sends per-frame access
+// deltas (run-lists) and we decay locally at the same rate it used to.
+const heatR = new Uint8Array(65536);
+const heatW = new Uint8Array(65536);
+const heatU = new Uint8Array(65536);
+const HEAT_DECAY = 8;
+
 function b64decode(str) {
     const bin = atob(str);
     const arr = new Uint8Array(bin.length);
@@ -1465,11 +1524,64 @@ function b64decode(str) {
     return arr;
 }
 
+function decayHeat(a) {
+    for (let i = 0; i < a.length; i++) {
+        const v = a[i];
+        if (v) a[i] = v > HEAT_DECAY ? v - HEAT_DECAY : 0;
+    }
+}
+
+// Apply a base64 run-list ([u16 nRuns][nRuns x (u16 start, u16 len)]): set every
+// address in each run to full heat (the emulator marks accesses as 255).
+function applyRuns(heat, b64) {
+    if (!b64) return;
+    const b = b64decode(b64);
+    if (b.length < 2) return;
+    const nRuns = b[0] | (b[1] << 8);
+    let o = 2;
+    for (let r = 0; r < nRuns; r++) {
+        if (o + 4 > b.length) break;
+        const start = b[o] | (b[o + 1] << 8);
+        const len   = b[o + 2] | (b[o + 3] << 8);
+        o += 4;
+        const end = Math.min(start + len, 65536);
+        for (let a = start; a < end; a++) heat[a] = 255;
+    }
+}
+
+let heatDrawPending = false;
+const heatMeta = { frameCounter: 0, romdis: 0, vidMode: 0, vidAddr: 0 };
+
 function renderFrame(msg) {
     errorDiv.style.display = 'none';
-    const readHeat = b64decode(msg.readHeat);
-    const writeHeat = b64decode(msg.writeHeat);
-    const ulaHeat = b64decode(msg.ulaHeat);
+    // State update runs on EVERY message — v2 deltas are non-droppable (each
+    // carries one frame's decay + accesses). Only the draw is coalesced below.
+    if (msg.version >= 2) {
+        decayHeat(heatR); decayHeat(heatW); decayHeat(heatU);
+        applyRuns(heatR, msg.readRuns);
+        applyRuns(heatW, msg.writeRuns);
+        applyRuns(heatU, msg.ulaRuns);
+    } else {
+        // legacy v0/v1: full arrays every frame.
+        heatR.set(b64decode(msg.readHeat));
+        heatW.set(b64decode(msg.writeHeat));
+        heatU.set(b64decode(msg.ulaHeat));
+    }
+    heatMeta.frameCounter = msg.frameCounter;
+    heatMeta.romdis = msg.romdis;
+    heatMeta.vidMode = msg.vidMode;
+    heatMeta.vidAddr = msg.vidAddr;
+    // Coalesce the expensive canvas redraw to at most once per display frame, so
+    // a burst of 50fps deltas on a slow/backgrounded webview can't back up.
+    if (!heatDrawPending) {
+        heatDrawPending = true;
+        requestAnimationFrame(drawHeat);
+    }
+}
+
+function drawHeat() {
+    heatDrawPending = false;
+    const readHeat = heatR, writeHeat = heatW, ulaHeat = heatU;
 
     for (let block = 0; block < 4; block++) {
         const baseAddr = block * 256;
@@ -1506,10 +1618,10 @@ function renderFrame(msg) {
     }
     bottomCtx.putImageData(bottomImg, 0, 0);
 
-    romLabelRight.textContent = msg.romdis ? 'RAM $FFFF' : 'ROM $FFFF';
-    status.textContent = 'Frame ' + msg.frameCounter +
-        ' | Mode ' + msg.vidMode +
-        ' | Vid $' + msg.vidAddr.toString(16).toUpperCase().padStart(4, '0');
+    romLabelRight.textContent = heatMeta.romdis ? 'RAM $FFFF' : 'ROM $FFFF';
+    status.textContent = 'Frame ' + heatMeta.frameCounter +
+        ' | Mode ' + heatMeta.vidMode +
+        ' | Vid $' + heatMeta.vidAddr.toString(16).toUpperCase().padStart(4, '0');
 }
 
 function addrFromMouse(canvas, e, baseAddr, width, height) {

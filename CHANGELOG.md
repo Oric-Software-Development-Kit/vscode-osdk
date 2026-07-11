@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.0.10
+
+### Heatmap Delta Streaming (Screen View ~50 fps)
+- The viz stream now sends the memory heatmap as **per-frame access deltas** (run-lists) instead of three full 64 KB arrays every frame, and the heatmap webview decays locally and applies the deltas — matching Oricutron's viz protocol v2. This removes the ~192 KB/frame that was throttling the pipeline, so the **Oric Screen View runs at ~50 fps** instead of ~16
+- The webview coalesces its canvas redraw with `requestAnimationFrame` (decay + delta-apply still run on every frame, since deltas are non-droppable), so a slow or backgrounded panel can't back up
+- The frame parser handles the v2 variable-length format (with a corrupt-length guard) and still accepts legacy v0/v1 full-array frames
+
 ## 0.0.9
 
 ### Breakpoint Line Snapping
