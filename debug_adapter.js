@@ -1605,7 +1605,12 @@ const handlers = {
             supportsFunctionBreakpoints: true,
             supportsReadMemoryRequest: true,
             supportsWriteMemoryRequest: true,
-            supportsDisassembleRequest: true,
+            // Off on purpose: this extension provides its own "Oric Disassembly"
+            // webview (via the custom disassembleRange request). Advertising the
+            // standard disassemble capability makes VS Code auto-open ITS built-in
+            // Disassembly view whenever execution stops at a source-less address
+            // (e.g. ROM/BASIC), which duplicates our panel and is intrusive.
+            supportsDisassembleRequest: false,
             supportsSteppingGranularity: true,
             supportsInstructionBreakpoints: true,
             supportsEvaluateForHovers: false,

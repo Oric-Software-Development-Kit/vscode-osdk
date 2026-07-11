@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.11
+
+### No More Auto-Opening Built-in Disassembly View
+- The adapter no longer advertises `supportsDisassembleRequest`, so VS Code stops auto-opening (and re-opening on every launch) its built-in **Disassembly** view when execution stops at a source-less address such as the BASIC ROM. This extension provides its own "Oric Disassembly" panel (via a custom request), which is unaffected
+
 ## 0.0.10
 
 ### Heatmap Delta Streaming (Screen View ~50 fps)
