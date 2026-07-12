@@ -105,6 +105,11 @@ function buildResolver(text, opts) {
     return na === nb;
   }
 
+  // A build intermediate under a TMP/ folder (e.g. TMP\main, TMP\linked.s) is
+  // ephemeral: it only exists during a build and its contents won't match what's
+  // running afterwards. Treat such paths as non-existent — never a source location.
+  const isTmp = (f) => !!f && /[\\/]tmp[\\/]/i.test(String(f));
+
   // --- parse -------------------------------------------------------------
   // Flat entry lists tagged with { module, uid }. uid (unit) increments on every
   // `#SYM V2` and `#MODULE` header — the granularity that owns a run of lines and
@@ -126,7 +131,12 @@ function buildResolver(text, opts) {
       if (section === 'files') { const fm = t.match(/^(\d+)\s+(.+)$/); if (fm) fileIndex[parseInt(fm[1], 10)] = fm[2]; continue; }
       if (section === 'lines') {
         const lm = t.match(/^([0-9a-fA-F]{4})\s+(\d+):(\d+)$/);
-        if (lm) lines.push({ addr: parseInt(lm[1], 16), file: absFile(fileIndex[parseInt(lm[2], 10)] || null), line: parseInt(lm[3], 10), module, uid });
+        if (lm) {
+          const f = fileIndex[parseInt(lm[2], 10)] || null;
+          // Skip line entries that map to a TMP intermediate — an address with only a
+          // TMP line then resolves to no source (→ disassembly) instead of a fake file.
+          if (!isTmp(f)) lines.push({ addr: parseInt(lm[1], 16), file: absFile(f), line: parseInt(lm[3], 10), module, uid });
+        }
         continue;
       }
       if (section === 'types') continue;
@@ -134,7 +144,14 @@ function buildResolver(text, opts) {
       if (sm) {
         const rest = raw.slice(sm[0].length).trim();
         const cm = rest.match(/^(.+):(\d+)$/);
-        syms.push({ addr: parseInt(sm[1], 16), name: sm[2], module, uid, symFile: cm ? absFile(cm[1]) : null, symLine: cm ? parseInt(cm[2], 10) : null, ord: ord++ });
+        // Skip compiler-generated intermediate labels: a non-C-linkage name (no '_'
+        // prefix) defined only in a TMP intermediate (Lmain132, internal .c→.s labels).
+        // They're noise as frame names / nearest-symbol answers. Real C symbols keep
+        // their '_' prefix; real asm labels live in .s files (not TMP).
+        if (cm && isTmp(cm[1]) && sm[2][0] !== '_') continue;
+        // Drop a TMP decl location so an exact symbol never falls back to a TMP file.
+        const hasSrc = cm && !isTmp(cm[1]);
+        syms.push({ addr: parseInt(sm[1], 16), name: sm[2], module, uid, symFile: hasSrc ? absFile(cm[1]) : null, symLine: hasSrc ? parseInt(cm[2], 10) : null, ord: ord++ });
       }
     }
   })();
