@@ -424,6 +424,7 @@ let zpSymbols  = [];          // [{addr, name, size}] sorted by address
 let typeDefs   = new Map();   // structName -> { size, fields: [{name, type, offset, size}] }
 let varTypes   = new Map();   // asmName -> { type: 'score_entry[24]', base: 'score_entry', count: 24|1, totalSize: 528 }
 let localDefs  = new Map();   // funcAsmName -> [{cname, base:'fp'|'ap', offset, type, baseType, count, size}]
+let enumDefs   = new Map();   // enumName -> { size, byValue: Map<number,string>, isFlags: bool }
 let varRefs    = new Map();   // variablesReference id -> { addr, typeName, count, offset? }
 let nextVarRef = 100;         // next available variablesReference id (1-5 reserved for scopes)
 let displayHex = true;        // true = hex primary, false = decimal primary
@@ -542,14 +543,15 @@ let moduleAllFiles = [];         // union of all #FILES paths (for resolveLibrar
 function makeSymBucket() {
     return {
         symbols: new Map(), addrSym: new Map(), addrSource: new Map(), symSource: new Map(),
-        lineTable: [], typeDefs: new Map(), varTypes: new Map(), localDefs: new Map()
+        lineTable: [], typeDefs: new Map(), varTypes: new Map(), localDefs: new Map(),
+        enumDefs: new Map()
     };
 }
 
 // Compose resident + the given module id into the global symbol maps.
 function applyActiveModule(id) {
     symbols.clear(); addrSym.clear(); addrSource.clear(); symSource.clear();
-    typeDefs.clear(); varTypes.clear(); localDefs.clear();
+    typeDefs.clear(); varTypes.clear(); localDefs.clear(); enumDefs.clear();
     lineTable = []; zpSymbols = [];
 
     const order = [];
@@ -564,6 +566,7 @@ function applyActiveModule(id) {
         for (const [k, v] of b.typeDefs)   typeDefs.set(k, v);
         for (const [k, v] of b.varTypes)   varTypes.set(k, v);
         for (const [k, v] of b.localDefs)  localDefs.set(k, v);
+        for (const [k, v] of b.enumDefs)   enumDefs.set(k, v);
         for (const e of b.lineTable)       lineTable.push(e);
     }
     activeModuleId = id;
@@ -755,6 +758,35 @@ function loadSymbols(file) {
                     const am = typeStr.match(/^(.+)\[(\d+)\]$/);
                     if (am) cur.varTypes.set(asmName, { type: typeStr, base: am[1], count: parseInt(am[2], 10), totalSize });
                     else    cur.varTypes.set(asmName, { type: typeStr, base: typeStr, count: 1, totalSize });
+                    continue;
+                }
+                const em = trimmed.match(/^enum\s+(\S+)\s+(\d+)\s+(.+)$/);
+                if (em) {
+                    const name = em[1];
+                    const size = parseInt(em[2], 10);
+                    const byValue = new Map();     // value -> enumerator name
+                    let allSingleBit = true, nonZero = 0, seenBits = 0, maxVal = 0;
+                    for (const tok of em[3].split(/\s+/)) {
+                        const eq = tok.indexOf('=');
+                        if (eq < 0) continue;
+                        const en = tok.slice(0, eq);
+                        const ev = parseInt(tok.slice(eq + 1), 10);
+                        if (!Number.isFinite(ev)) continue;
+                        if (!byValue.has(ev)) byValue.set(ev, en);  // first name wins on aliases
+                        if (ev !== 0) {
+                            nonZero++;
+                            if (ev > maxVal) maxVal = ev;
+                            // single-bit iff exactly one bit set and not previously used
+                            if ((ev & (ev - 1)) !== 0 || (seenBits & ev)) allSingleBit = false;
+                            seenBits |= ev;
+                        }
+                    }
+                    // Bitmask enum: every nonzero member is a distinct single bit AND the set
+                    // reaches at least 4. The >=4 test disambiguates real flags {1,2,4,8}
+                    // (which skip 3) from a plain sequential enum {0,1,2} whose small values
+                    // happen to be single bits too. A 2-member {1,2} enum stays sequential.
+                    const isFlags = nonZero >= 2 && allSingleBit && maxVal >= 4;
+                    cur.enumDefs.set(name, { size, byValue, isFlags });
                     continue;
                 }
                 const lm = trimmed.match(/^local\s+(\S+)\s+(\S+)\s+(fp|ap)\s+(\d+)\s+(\S+)\s+(\d+)$/);
@@ -1384,8 +1416,40 @@ async function readMem(addr, len) {
     return bytes;
 }
 
+// Numeric part shared by enum display: "$hex|dec|%binary" (no char glyph — an
+// enum byte is a code/flag word, not text).
+function enumNumeric(v, size) {
+    if (size >= 2)
+        return '$' + v.toString(16).toUpperCase().padStart(4, '0') + '|' + v + '|%' + v.toString(2).padStart(16, '0');
+    return '$' + v.toString(16).toUpperCase().padStart(2, '0') + '|' + v + '|%' + v.toString(2).padStart(8, '0');
+}
+
+// Format an enum-typed value symbolically. Sequential enums map value->name;
+// bitmask enums (def.isFlags, detected at parse time) decompose the set bits
+// into "A|B|C". The raw number is always shown too.
+function formatEnum(def, mem, offset, size) {
+    const v = size >= 2 ? ((mem[offset] || 0) | ((mem[offset + 1] || 0) << 8)) : (mem[offset] || 0);
+    const num = enumNumeric(v, size);
+    if (def.isFlags) {
+        if (v === 0) return (def.byValue.get(0) || '0') + ' (' + num + ')';
+        const names = [];
+        let remaining = v;
+        for (let bit = 1; bit <= 0x8000 && remaining; bit <<= 1) {
+            if (v & bit) {
+                names.push(def.byValue.get(bit) || ('bit$' + bit.toString(16).toUpperCase()));
+                remaining &= ~bit;
+            }
+        }
+        return names.join('|') + ' (' + num + ')';
+    }
+    // Sequential enum: single value lookup. Unknown value -> just the number.
+    return def.byValue.has(v) ? def.byValue.get(v) + ' (' + num + ')' : num;
+}
+
 // Format a scalar value from raw bytes for display
 function formatScalar(typeName, mem, offset, size) {
+    const ed = enumDefs.get(typeName);   // case-sensitive: enum tags before lowercasing
+    if (ed) return formatEnum(ed, mem, offset, size);
     const t = typeName.toLowerCase();
     const isSigned = (t === 'char' || t === 'schar' || t === 'int' || t === 'short' || t === 'sint' || t === 'sshort');
     // Uniform "hex|dec|%binary" form, matching the disassembly annotations.
