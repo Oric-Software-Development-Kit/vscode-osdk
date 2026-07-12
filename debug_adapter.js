@@ -231,15 +231,40 @@ function probePort(host, port) {
     });
 }
 
+// Single entry point for launching OSDK batch/command lines. Guarantees the child can
+// run regardless of the machine's cmd config or path style — every OSDK spawn (build,
+// launch script, config harvest) goes through here so we fix these quirks once (DRY):
+//   * bare-name scripts resolve — `cwd` is prepended to PATH (cmd may not search the
+//     current directory: NoDefaultCurrentDirectoryInExePath)
+//   * `START oricutron.exe` resolves — %OSDK%\Oricutron is on PATH
+//   * PUSHD/COPY on %OSDK% work — OSDK and cwd are normalized to backslashes
+//   * builds never hang on an error prompt — OSDKBRIEF defaults to NOPAUSE
+// `command` is a full command line (e.g. 'osdk_build.bat', or 'call x.bat & set').
+// opts: { cwd, env (extra vars, override the defaults), windowsHide }. Returns the child.
+function spawnOsdk(command, opts) {
+    opts = opts || {};
+    const isWin = process.platform === 'win32';
+    const bs = (p) => (p || '').replace(/\//g, '\\');
+    const cwd = bs(opts.cwd || process.cwd());
+    const env = Object.assign({}, process.env, { OSDKBRIEF: 'NOPAUSE' }, opts.env || {});
+    if (isWin) {
+        const osdkRoot = bs(env.OSDK || '');
+        if (osdkRoot) env.OSDK = osdkRoot;                       // backslashes for PUSHD/COPY
+        const oriDir = osdkRoot ? osdkRoot + '\\Oricutron' : '';
+        env.PATH = cwd + ';' + (oriDir ? oriDir + ';' : '') + (process.env.PATH || '');
+        return child_process.spawn('cmd', ['/c', command], { cwd, env, windowsHide: opts.windowsHide !== false });
+    }
+    return child_process.spawn('sh', ['-c', command], { cwd, env, windowsHide: opts.windowsHide !== false });
+}
+
 // Run osdk_config.bat in `cwd` and capture the environment it produces (OSDKADDR,
 // OSDKNAME, ...). Executing it is more robust than parsing the .bat, since values may
 // be built conditionally. Returns an upper-cased key->value map ({} on failure).
 function harvestOsdkConfig(cwd) {
     return new Promise((resolve) => {
         if (process.platform !== 'win32') { resolve({}); return; }
-        const env = Object.assign({}, process.env, { PATH: cwd + ';' + (process.env.PATH || ''), OSDKBRIEF: 'NOPAUSE' });
         let out = '';
-        const child = child_process.spawn('cmd', ['/c', 'call osdk_config.bat >nul 2>nul & set'], { cwd, env, windowsHide: true });
+        const child = spawnOsdk('call osdk_config.bat >nul 2>nul & set', { cwd });
         child.stdout.on('data', d => out += d.toString());
         child.on('error', () => resolve({}));
         child.on('close', () => {
@@ -448,15 +473,21 @@ function checkStale(outputPath, sourceDirs) {
     try { outMtime = fs.statSync(outputPath).mtimeMs; }
     catch (e) { return true; } // output missing → stale
     if (!sourceDirs || sourceDirs.length === 0) return false;
+    // Never count files under the build-output directory as "sources" — the build
+    // writes there, so including it (e.g. sources: ["${workspaceFolder}"]) would make
+    // the project perpetually look stale right after a successful build.
+    const outDir = canonPath(path.dirname(outputPath)) + path.sep;
+    const underOutDir = (p) => canonPath(p).startsWith(outDir);
     for (const dir of sourceDirs) {
         let stat;
         try { stat = fs.statSync(dir); } catch (e) { continue; }
         if (stat.isFile()) {
-            if (stat.mtimeMs > outMtime) return true;
+            if (!underOutDir(dir) && stat.mtimeMs > outMtime) return true;
             continue;
         }
         const files = readdirRecursive(dir);
         for (const f of files) {
+            if (underOutDir(f)) continue;
             try {
                 if (fs.statSync(f).mtimeMs > outMtime) return true;
             } catch (e) { /* skip unreadable */ }
@@ -471,13 +502,7 @@ function checkStale(outputPath, sourceDirs) {
 
 function runBuild(command, cwd) {
     return new Promise((resolve, reject) => {
-        const isWin = process.platform === 'win32';
-        const shell = isWin ? 'cmd' : 'sh';
-        const shellArgs = isWin ? ['/c', command] : ['-c', command];
-        const child = child_process.spawn(shell, shellArgs, {
-            cwd: cwd || process.cwd(),
-            windowsHide: true
-        });
+        const child = spawnOsdk(command, { cwd, windowsHide: true });
         child.stdout.on('data', d => {
             evt('output', { category: 'stdout', output: d.toString() });
         });
@@ -1830,11 +1855,7 @@ const handlers = {
         // needs to live in osdk_config.bat. Oricutron is started detached (START), so
         // it's tracked by port (killByPort) rather than a child handle.
         if (config.launchScript) {
-            // Normalize to backslashes: the batch chain uses %OSDK% in PUSHD/COPY and
-            // cmd chokes on mixed forward slashes ("The syntax of the command is
-            // incorrect"). VS Code already passes Windows paths; this just hardens it.
-            const bs = (p) => (p || '').replace(/\//g, '\\');
-            const scriptCwd = bs(config.cwd || (config.build && config.build.cwd) || process.cwd());
+            const scriptCwd = config.cwd || (config.build && config.build.cwd) || process.cwd();
 
             // Entry breakpoint: explicit gdbBreak wins; otherwise OSDKADDR harvested
             // from osdk_config.bat. Armed via --gdb_break so the emulator halts at the
@@ -1851,27 +1872,15 @@ const handlers = {
                 return;
             }
 
-            // Prepend the project dir (so bare-name CALLs like `osdk_config.bat` resolve)
-            // and the Oricutron dir (so the script's `START oricutron.exe` finds it) —
-            // cmd may be configured not to search the current directory
-            // (NoDefaultCurrentDirectoryInExePath), so we can't rely on cwd.
-            const osdkRoot = bs(process.env.OSDK || '');
-            const oriDir = osdkRoot ? (osdkRoot + '\\Oricutron') : '';
-            const childEnv = Object.assign({}, process.env, {
-                PATH: scriptCwd + ';' + (oriDir ? oriDir + ';' : '') + (process.env.PATH || ''),
-                OSDK: osdkRoot,                 // backslash form so the batch's PUSHD/COPY work
-                OSDKGDBPORT: String(port),
-                OSDKBRIEF: 'NOPAUSE'
-            });
-            if (initBreakAddr >= 0) childEnv.OSDKGDBBREAK = initBreakAddr.toString(16);
+            const launchEnv = { OSDKGDBPORT: String(port) };
+            if (initBreakAddr >= 0) launchEnv.OSDKGDBBREAK = initBreakAddr.toString(16);
 
             log('Launching via ' + config.launchScript + ' (cwd ' + scriptCwd + ', gdb port ' + port +
                 (initBreakAddr >= 0 ? ', entry $' + initBreakAddr.toString(16) : '') + ')');
-            const runner = child_process.spawn('cmd', ['/c', config.launchScript], {
-                cwd: scriptCwd, env: childEnv, windowsHide: false
-            });
-            // The script uses START to detach Oricutron, so it returns promptly; its
-            // exit is NOT the emulator terminating, so don't wire 'terminated' to it.
+            // spawnOsdk handles PATH (cwd + Oricutron dir), %OSDK% backslashes, NOPAUSE.
+            // The script uses START to detach Oricutron, so it returns promptly; its exit
+            // is NOT the emulator terminating, so don't wire 'terminated' to it.
+            const runner = spawnOsdk(config.launchScript, { cwd: scriptCwd, env: launchEnv });
             if (runner.stdout) runner.stdout.on('data', d => evt('output', { category: 'stdout', output: d.toString() }));
             if (runner.stderr) runner.stderr.on('data', d => evt('output', { category: 'stderr', output: d.toString() }));
             runner.on('error', err => log('Launch script failed to start: ' + err.message));
