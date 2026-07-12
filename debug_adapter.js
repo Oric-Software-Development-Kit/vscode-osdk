@@ -231,6 +231,49 @@ function probePort(host, port) {
     });
 }
 
+// Run osdk_config.bat in `cwd` and capture the environment it produces (OSDKADDR,
+// OSDKNAME, ...). Executing it is more robust than parsing the .bat, since values may
+// be built conditionally. Returns an upper-cased key->value map ({} on failure).
+function harvestOsdkConfig(cwd) {
+    return new Promise((resolve) => {
+        if (process.platform !== 'win32') { resolve({}); return; }
+        const env = Object.assign({}, process.env, { PATH: cwd + ';' + (process.env.PATH || ''), OSDKBRIEF: 'NOPAUSE' });
+        let out = '';
+        const child = child_process.spawn('cmd', ['/c', 'call osdk_config.bat >nul 2>nul & set'], { cwd, env, windowsHide: true });
+        child.stdout.on('data', d => out += d.toString());
+        child.on('error', () => resolve({}));
+        child.on('close', () => {
+            const map = {};
+            for (const line of out.split(/\r?\n/)) {
+                const m = line.match(/^([^=]+)=(.*)$/);
+                if (m) map[m[1].toUpperCase()] = m[2];
+            }
+            resolve(map);
+        });
+    });
+}
+
+// Kill the process(es) listening on `port` (used when the emulator was started
+// detached by a launch script, so we have no child handle). Best-effort.
+function killByPort(port) {
+    try {
+        if (process.platform === 'win32') {
+            const out = child_process.execSync('netstat -ano -p tcp', { windowsHide: true }).toString();
+            const pids = new Set();
+            for (const line of out.split(/\r?\n/)) {
+                const m = line.match(/^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)/i);
+                if (m && parseInt(m[1], 10) === port) pids.add(m[2]);
+            }
+            for (const pid of pids)
+                try { child_process.execSync('taskkill /pid ' + pid + ' /T /F', { windowsHide: true, stdio: 'ignore' }); } catch (_) { /* gone */ }
+        } else {
+            const pids = child_process.execSync('lsof -ti tcp:' + port + ' -s tcp:LISTEN', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim().split(/\s+/).filter(Boolean);
+            for (const pid of pids)
+                try { process.kill(parseInt(pid, 10), 'SIGTERM'); } catch (_) { /* gone */ }
+        }
+    } catch (_) { /* nothing listening / tool missing */ }
+}
+
 function onGdbData(data) {
     rxBuf += data;
     while (rxBuf.length > 0) {
@@ -376,6 +419,9 @@ let tempStepBp = -1;           // address of temp breakpoint for source-level st
 let continueAfterStep = false; // true when single-stepping past a BP before continuing (F5)
 let turboWarpActive = false;   // true while a "Turbo Run" is warping toward a stop
 let turboPrevWarp = false;     // warp state to restore when the turbo run stops
+let scriptLaunched = false;    // true when Oricutron was started via a launch script (detached; kill by port)
+let initBreakAddr = -1;        // address of the --gdb_break entry breakpoint to drop on connect (-1 = none)
+let awaitingEntry = false;     // true after configurationDone continue, until the entry breakpoint is hit
 
 // ----------------------------------------------------------------
 // Build staleness check (pure Node.js, cross-platform)
@@ -899,6 +945,25 @@ async function onStopReply(payload) {
     varRefs.clear();
     nextVarRef = 100;
     clearGdbReadCache();
+
+    // Script-launch entry: we continued through boot/CLOAD and have now hit the
+    // --gdb_break at the program entry. Drop that bootstrap breakpoint, then either
+    // report the entry stop (stopOnEntry) or continue to the user's breakpoints.
+    if (awaitingEntry && regs && regs.pc === initBreakAddr) {
+        awaitingEntry = false;
+        const bp = initBreakAddr;
+        initBreakAddr = -1;
+        await gdbCmd('z0,' + bp.toString(16) + ',1');
+        if (!config.stopOnEntry) {
+            log('Reached entry; running to first breakpoint');
+            running = true;
+            regs = null;
+            gdbWrite('c'); // no 'stopped' event — the entry bp is just a bootstrap
+            return;
+        }
+        log('Stopped at program entry ($' + bp.toString(16) + ')');
+        // fall through to emit the stop
+    }
 
     // Module-load watch, phase 2: the dobp=FALSE single step we issued in phase 1
     // has now COMMITTED the write to _osdk_dbg_module, so the byte holds the NEW id.
@@ -1758,8 +1823,62 @@ const handlers = {
             }
         }
 
-        // --- Step 2: Launch Oricutron ---
-        if (config.emulatorPath) {
+        // --- Step 2a: Launch via OSDK script (preferred) ---
+        // Run the project's execute script (e.g. osdk_execute.bat), which launches
+        // Oricutron the OSDK way — auto-CLOAD, correct cwd, tape+symbols copied. We
+        // inject the gdb port and the entry breakpoint via the environment, so nothing
+        // needs to live in osdk_config.bat. Oricutron is started detached (START), so
+        // it's tracked by port (killByPort) rather than a child handle.
+        if (config.launchScript) {
+            // Normalize to backslashes: the batch chain uses %OSDK% in PUSHD/COPY and
+            // cmd chokes on mixed forward slashes ("The syntax of the command is
+            // incorrect"). VS Code already passes Windows paths; this just hardens it.
+            const bs = (p) => (p || '').replace(/\//g, '\\');
+            const scriptCwd = bs(config.cwd || (config.build && config.build.cwd) || process.cwd());
+
+            // Entry breakpoint: explicit gdbBreak wins; otherwise OSDKADDR harvested
+            // from osdk_config.bat. Armed via --gdb_break so the emulator halts at the
+            // program entry and waits for us regardless of connect timing.
+            const osdkEnv = await harvestOsdkConfig(scriptCwd);
+            let entry = (config.gdbBreak || osdkEnv.OSDKADDR || '').toString().trim().replace(/^\$/, '').replace(/^0x/i, '');
+            initBreakAddr = /^[0-9a-fA-F]+$/.test(entry) ? parseInt(entry, 16) & 0xffff : -1;
+            if (initBreakAddr < 0)
+                log('No entry address (OSDKADDR/gdbBreak) — launching without an initial breakpoint; may miss the entry.');
+
+            if (await probePort(config.host || 'localhost', port)) {
+                respond(req, {}, false, 'gdb port ' + port + ' is already in use — another debug ' +
+                    'session/emulator is likely running. Close it and retry.');
+                return;
+            }
+
+            // Prepend the project dir (so bare-name CALLs like `osdk_config.bat` resolve)
+            // and the Oricutron dir (so the script's `START oricutron.exe` finds it) —
+            // cmd may be configured not to search the current directory
+            // (NoDefaultCurrentDirectoryInExePath), so we can't rely on cwd.
+            const osdkRoot = bs(process.env.OSDK || '');
+            const oriDir = osdkRoot ? (osdkRoot + '\\Oricutron') : '';
+            const childEnv = Object.assign({}, process.env, {
+                PATH: scriptCwd + ';' + (oriDir ? oriDir + ';' : '') + (process.env.PATH || ''),
+                OSDK: osdkRoot,                 // backslash form so the batch's PUSHD/COPY work
+                OSDKGDBPORT: String(port),
+                OSDKBRIEF: 'NOPAUSE'
+            });
+            if (initBreakAddr >= 0) childEnv.OSDKGDBBREAK = initBreakAddr.toString(16);
+
+            log('Launching via ' + config.launchScript + ' (cwd ' + scriptCwd + ', gdb port ' + port +
+                (initBreakAddr >= 0 ? ', entry $' + initBreakAddr.toString(16) : '') + ')');
+            const runner = child_process.spawn('cmd', ['/c', config.launchScript], {
+                cwd: scriptCwd, env: childEnv, windowsHide: false
+            });
+            // The script uses START to detach Oricutron, so it returns promptly; its
+            // exit is NOT the emulator terminating, so don't wire 'terminated' to it.
+            if (runner.stdout) runner.stdout.on('data', d => evt('output', { category: 'stdout', output: d.toString() }));
+            if (runner.stderr) runner.stderr.on('data', d => evt('output', { category: 'stderr', output: d.toString() }));
+            runner.on('error', err => log('Launch script failed to start: ' + err.message));
+            scriptLaunched = true;
+        }
+        // --- Step 2b: Launch Oricutron directly ---
+        else if (config.emulatorPath) {
             // VS Code sends noDebug inside arguments for Ctrl+F5
             const isNoDebug = config.noDebug || false;
             // Guard: if something already listens on the gdb port, a stale emulator
@@ -1852,6 +1971,16 @@ const handlers = {
         // are caught from the very first run. Queued ahead of the continue below
         // (whenGdbIdle waits for the Z2 to complete first).
         armModuleWatch();
+
+        // Script-launch: on connect we're paused at boot (pause-on-connect), NOT yet at
+        // the entry. Continue so the emulator runs through the auto-CLOAD and hits the
+        // --gdb_break at the program entry; onStopReply then drops that breakpoint and
+        // applies stopOnEntry (user breakpoints were already armed in setBreakpoints).
+        if (scriptLaunched && initBreakAddr >= 0) {
+            awaitingEntry = true;
+            whenGdbIdle(() => { log('Running to program entry ($' + initBreakAddr.toString(16) + ')'); running = true; gdbWrite('c'); });
+            return;
+        }
 
         // Turbo Run To on launch: warp through startup to a target symbol
         if (config.turboRunTo) {
@@ -1965,6 +2094,12 @@ const handlers = {
                 }
             } catch (e) { /* already exited */ }
             launchedProcess = null;
+        }
+        // Script-launched Oricutron is detached (START), so there's no child handle —
+        // kill whatever now owns the gdb port instead.
+        if (scriptLaunched) {
+            killByPort(config.port || 6502);
+            scriptLaunched = false;
         }
         respond(req);
         evt('terminated');

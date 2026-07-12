@@ -1075,11 +1075,10 @@ const VIZ_VIDRAM_MAIN    = 8000;
 const VIZ_VIDRAM_BOTTOM  = 120;
 const VIZ_FRAME_SIZE_V1  = VIZ_FRAME_SIZE_V0 + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN + VIZ_VIDRAM_BOTTOM; // 258512
 const VIZ_MAGIC          = 0x4349564F;  // "OVIC" as uint32 LE
-// Viz server port = gdb port + this offset. Kept well clear of +1..+N so it can't
-// collide with the "Claude agent uses base gdb port + 1/+2/..." convention (a human
-// on 6502 would otherwise put viz on 6503, clashing with an agent's gdb on 6503).
+// Viz server port = gdb port + this offset, so the two sit adjacent in a port
+// scanner. Auto-picked gdb ports verify gdb+offset is free too, so no collision.
 // MUST match viz_init() in Oricutron's viz_stream.c.
-const VIZ_PORT_OFFSET    = 16;
+const VIZ_PORT_OFFSET    = 1;
 
 function vizLog(msg) {
     if (vizOutputChannel) vizOutputChannel.appendLine('[VIZ] ' + msg);
@@ -1116,6 +1115,42 @@ function vizCancelReconnect() {
         clearTimeout(vizReconnectTimer);
         vizReconnectTimer = null;
     }
+}
+
+// Find a free TCP port for the GDB stub so a project can be debugged with no port
+// configured anywhere — nothing has to live in osdk_config.bat. The adapter spawns
+// Oricutron with --gdb_port <this> and connects to it; the viz stream lives at
+// <this>+VIZ_PORT_OFFSET, so we require that neighbour to be free too. Resolves to 0
+// only if no suitable port turns up, letting the adapter fall back to its default.
+function findFreeGdbPort() {
+    const net = require('net');
+    function ephemeral() {
+        return new Promise((resolve, reject) => {
+            const srv = net.createServer();
+            srv.unref();
+            srv.on('error', reject);
+            srv.listen(0, '127.0.0.1', () => {
+                const p = srv.address().port;
+                srv.close(() => resolve(p));
+            });
+        });
+    }
+    function isFree(p) {
+        return new Promise((resolve) => {
+            const srv = net.createServer();
+            srv.unref();
+            srv.on('error', () => resolve(false));
+            srv.listen(p, '127.0.0.1', () => srv.close(() => resolve(true)));
+        });
+    }
+    return (async () => {
+        for (let attempt = 0; attempt < 20; attempt++) {
+            let p;
+            try { p = await ephemeral(); } catch (_) { continue; }
+            if (p + VIZ_PORT_OFFSET <= 65535 && await isFree(p + VIZ_PORT_OFFSET)) return p;
+        }
+        return 0;
+    })();
 }
 
 function vizConnect(host, port) {
@@ -3333,7 +3368,7 @@ function activate(context) {
     // --- Debug configuration validation ---
     context.subscriptions.push(
         vscode.debug.registerDebugConfigurationProvider('oric-debug', {
-            resolveDebugConfiguration(folder, config, token) {
+            async resolveDebugConfiguration(folder, config, token) {
                 // Warn if user has attach config but likely wants launch
                 if (config.request === 'attach' && config.emulatorPath) {
                     vscode.window.showWarningMessage(
@@ -3342,17 +3377,42 @@ function activate(context) {
                 }
                 // Warn if launch config is missing required fields
                 if (config.request === 'launch') {
-                    if (!config.emulatorPath) {
-                        vscode.window.showErrorMessage(
-                            'Launch config is missing "emulatorPath". Set it to the Oricutron executable path.');
-                        return undefined; // abort launch
-                    }
-                    if (!config.diskImage) {
-                        vscode.window.showErrorMessage(
-                            'Launch config is missing "diskImage". Set it to the .dsk or .tap file.');
-                        return undefined;
+                    if (config.launchScript) {
+                        // Script-launch relies on the OSDK toolchain (osdk_execute.bat,
+                        // %OSDK%\Oricutron, libraries). Bail early with a clear message
+                        // if the SDK isn't installed/configured.
+                        if (!process.env.OSDK) {
+                            vscode.window.showErrorMessage(
+                                'The OSDK environment variable is not set — the Oric SDK does not appear to be ' +
+                                'installed/configured. Set %OSDK% to your OSDK folder (and restart VS Code) to debug.');
+                            return undefined;
+                        }
+                    } else {
+                        if (!config.emulatorPath) {
+                            vscode.window.showErrorMessage(
+                                'Launch config is missing "emulatorPath" (or "launchScript"). Set it to the Oricutron executable path.');
+                            return undefined; // abort launch
+                        }
+                        if (!config.diskImage) {
+                            vscode.window.showErrorMessage(
+                                'Launch config is missing "diskImage". Set it to the .dsk or .tap file.');
+                            return undefined;
+                        }
                     }
                 }
+                // Auto-pick a free GDB port when none is configured (missing or 0).
+                // Nothing needs to be set in osdk_config.bat: the adapter spawns
+                // Oricutron with --gdb_port <this> and the viz stream uses <this>+16.
+                // An explicit non-zero port is always respected. Attach configs keep
+                // whatever port they name (they connect to an already-running stub).
+                if (config.request === 'launch' && !config.port) {
+                    config.port = await findFreeGdbPort();
+                    if (config.port)
+                        vizLog('Auto-selected free GDB port ' + config.port + ' (viz at ' + (config.port + VIZ_PORT_OFFSET) + ')');
+                    else
+                        vizLog('Could not auto-select a GDB port; adapter will use its default');
+                }
+
                 // Log verbosity precedence: a persisted per-project choice wins;
                 // otherwise an explicit launch.json value; otherwise Normal (1).
                 const persistedLevel = context.workspaceState.get(LOG_LEVEL_KEY);
