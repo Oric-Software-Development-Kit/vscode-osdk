@@ -442,6 +442,10 @@ let launchedProcess = null;     // child_process handle if we launched Oricutron
 let sourceLineCache = {};       // filePath -> string[] (lazy-loaded source, 0-based)
 let tempStepBp = -1;           // address of temp breakpoint for source-level stepping (-1 = none)
 let continueAfterStep = false; // true when single-stepping past a BP before continuing (F5)
+let stepInInProgress = false;  // true while a source-level Step Into is single-stepping toward a new source line (descends into callees)
+let stepInStartFile = null;    // source file/line where the current Step Into began (compared to detect arrival)
+let stepInStartLine = -1;
+let stepInBudget = 0;          // instruction-step budget so a step into source-less code can't run away
 let turboWarpActive = false;   // true while a "Turbo Run" is warping toward a stop
 let turboPrevWarp = false;     // warp state to restore when the turbo run stops
 let scriptLaunched = false;    // true when Oricutron was started via a launch script (detached; kill by port)
@@ -1018,6 +1022,21 @@ async function onStopReply(payload) {
         return; // don't emit stopped event — real stop will come through later
     }
 
+    // Source-level Step Into: keep single-stepping until the source line changes (which
+    // includes stepping into a callee, whose entry has its own line). Bounded so a step
+    // into source-less code can't loop forever — when the budget runs out we stop here.
+    if (stepInInProgress) {
+        const here = regs ? sourceFor(regs.pc) : null;
+        const arrived = here && (here.file !== stepInStartFile || here.line !== stepInStartLine);
+        if (!arrived && stepInBudget-- > 0) {
+            running = true;
+            regs = null;
+            gdbWrite('s'); // keep stepping — no 'stopped' event yet
+            return;
+        }
+        stepInInProgress = false; // arrived at a new line (or budget exhausted) — fall through and stop
+    }
+
     const sig = parseInt(payload.substring(1, 3), 16);
 
     // Parse extended stop-reply fields
@@ -1311,11 +1330,22 @@ function sourceFor(addr) {
 // Find the function containing `pc` by looking for the largest symbol address <= pc
 // that appears as a key in localDefs. Returns the function's asm name or null.
 function currentFunction(pc) {
-    let bestName = null;
-    let bestAddr = -1;
+    // A function's code runs from its entry up to the next C-linkage symbol. C symbols
+    // (functions and globals) are '_'-prefixed; compiler-generated intermediate labels
+    // (Lmain132, skip, ...) are not, so bounding by the next '_' symbol gives the
+    // function's real extent. Without this upper bound, a pc inside a locals-less
+    // function (e.g. main, whose ints are register-allocated) was wrongly attributed to
+    // the preceding function-with-locals, showing that function's locals.
+    const endOf = (a) => {
+        let e = 0x10000;
+        for (const [nm, na] of symbols)
+            if (typeof na === 'number' && nm[0] === '_' && na > a && na < e) e = na;
+        return e;
+    };
+    let bestName = null, bestAddr = -1;
     for (const [funcName] of localDefs) {
         const addr = symbols.get(funcName);
-        if (typeof addr === 'number' && addr <= pc && addr > bestAddr) {
+        if (typeof addr === 'number' && addr <= pc && pc < endOf(addr) && addr > bestAddr) {
             bestAddr = addr;
             bestName = funcName;
         }
@@ -1358,31 +1388,23 @@ async function readMem(addr, len) {
 function formatScalar(typeName, mem, offset, size) {
     const t = typeName.toLowerCase();
     const isSigned = (t === 'char' || t === 'schar' || t === 'int' || t === 'short' || t === 'sint' || t === 'sshort');
-    let valStr;
+    // Uniform "hex|dec|%binary" form, matching the disassembly annotations.
     if (size === 1) {
         const v = mem[offset] || 0;
         const sv = (isSigned && v > 127) ? v - 256 : v;
-        const hex = '$' + v.toString(16).toUpperCase().padStart(2, '0');
-        const dec = isSigned ? String(sv) : String(v);
-        const ch = (t === 'char' || t === 'schar' || t === 'uchar') && (v >= 32 && v < 127) ? " '" + String.fromCharCode(v) + "'" : '';
-        valStr = displayHex ? hex + ' (' + dec + ')' + ch : dec + ' (' + hex + ')' + ch;
+        // Show the ASCII glyph for any displayable byte value, whatever the type.
+        const ch = (v >= 32 && v < 127) ? " '" + String.fromCharCode(v) + "'" : '';
+        return '$' + v.toString(16).toUpperCase().padStart(2, '0') + '|' + (isSigned ? sv : v) + '|%' + v.toString(2).padStart(8, '0') + ch;
     } else if (size === 2) {
-        const lo = mem[offset] || 0;
-        const hi = mem[offset + 1] || 0;
-        const w = lo | (hi << 8);
+        const w = (mem[offset] || 0) | ((mem[offset + 1] || 0) << 8);
         const sv = (isSigned && w > 32767) ? w - 65536 : w;
-        const hex = '$' + w.toString(16).toUpperCase().padStart(4, '0');
-        const dec = isSigned ? String(sv) : String(w);
-        valStr = displayHex ? hex + ' (' + dec + ')' : dec + ' (' + hex + ')';
-    } else {
-        // Larger types: show raw hex bytes
-        let hex = '';
-        for (let i = 0; i < size && (offset + i) < mem.length; i++) {
-            hex += (mem[offset + i] || 0).toString(16).toUpperCase().padStart(2, '0') + ' ';
-        }
-        valStr = hex.trim();
+        return '$' + w.toString(16).toUpperCase().padStart(4, '0') + '|' + (isSigned ? sv : w) + '|%' + w.toString(2).padStart(16, '0');
     }
-    return valStr;
+    // Larger types: raw hex bytes.
+    let hex = '';
+    for (let i = 0; i < size && (offset + i) < mem.length; i++)
+        hex += (mem[offset + i] || 0).toString(16).toUpperCase().padStart(2, '0') + ' ';
+    return hex.trim();
 }
 
 // Format a char/uchar byte array as a quoted ASCII string preview.
@@ -1417,6 +1439,43 @@ function formatStructPreview(def, mem, offset) {
         }
     }
     return parts.length > 0 ? '{' + parts.join(', ') + '}' : '{...}';
+}
+
+// Build one DAP variable entry for a typed value living at `addr`. One place so the
+// Globals scope, the Locals scope, and struct-field expansion all behave identically
+// (DRY). Handles scalars, structs, arrays, and pointer-to-struct: a pointer shows its
+// target address and, when it points at a known struct, expands by dereferencing.
+async function buildTypedVar(name, addr, fullType, size) {
+    addr &= 0xFFFF;
+    const hAddr = '$' + addr.toString(16).toUpperCase().padStart(4, '0');
+    // Pointer (`*T`): value is the pointed-to address; expandable to that struct.
+    if (fullType[0] === '*') {
+        const pointed = fullType.slice(1);
+        const m = await readMem(addr, 2);
+        const target = (m[0] | (m[1] << 8)) & 0xFFFF;
+        const tHex = '$' + target.toString(16).toUpperCase().padStart(4, '0');
+        if (typeDefs.has(pointed) && target !== 0) {
+            const ref = nextVarRef++;
+            varRefs.set(ref, { addr: target, typeName: pointed, count: 1 });
+            return { name, value: fullType + ' → ' + tHex + '  @ ' + hAddr, variablesReference: ref };
+        }
+        return { name, value: fullType + ' = ' + tHex + '  @ ' + hAddr, variablesReference: 0 };
+    }
+    const am = fullType.match(/^(.+)\[(\d+)\]$/);
+    const base = am ? am[1] : fullType;
+    const count = am ? parseInt(am[2], 10) : 1;
+    if (typeDefs.has(base) || count > 1) {
+        const ref = nextVarRef++;
+        varRefs.set(ref, { addr, typeName: base, count, totalSize: size });
+        let val = fullType + '  @ ' + hAddr;
+        if (count > 1 && isCharType(base)) {
+            const mem = await readMem(addr, size);
+            val = formatCharArray(mem, 0, count) + '  ' + fullType + '  @ ' + hAddr;
+        }
+        return { name, value: val, variablesReference: ref };
+    }
+    const mem = await readMem(addr, size);
+    return { name, value: formatScalar(base, mem, 0, size) + '  ' + fullType + '  @ ' + hAddr, variablesReference: 0 };
 }
 
 // Exact-match lookup in lineTable: returns {file, line} only if the address
@@ -2224,15 +2283,16 @@ const handlers = {
         }
         if (!regs) { respond(req, { variables: [] }); return; }
 
-        const h = (v, w) => '$' + v.toString(16).toUpperCase().padStart(w, '0');
-
         if (ref === 1) {
+            // A/X/Y hold data → full "hex|dec|%binary['char']" form (formatScalar takes a
+            // byte array). SP/PC are addresses → hex + decimal only (binary/glyph of an
+            // address is noise; decimal helps offset math).
             respond(req, { variables: [
-                { name: 'A',  value: h(regs.a, 2)  + ' (' + regs.a  + ')', variablesReference: 0 },
-                { name: 'X',  value: h(regs.x, 2)  + ' (' + regs.x  + ')', variablesReference: 0 },
-                { name: 'Y',  value: h(regs.y, 2)  + ' (' + regs.y  + ')', variablesReference: 0 },
-                { name: 'SP', value: h(regs.sp, 2) + ' (' + regs.sp + ')', variablesReference: 0 },
-                { name: 'PC', value: h(regs.pc, 4), memoryReference: '0x' + regs.pc.toString(16).padStart(4, '0'), variablesReference: 0 }
+                { name: 'A',  value: formatScalar('uchar', [regs.a], 0, 1), variablesReference: 0 },
+                { name: 'X',  value: formatScalar('uchar', [regs.x], 0, 1), variablesReference: 0 },
+                { name: 'Y',  value: formatScalar('uchar', [regs.y], 0, 1), variablesReference: 0 },
+                { name: 'SP', value: '$' + regs.sp.toString(16).toUpperCase().padStart(2, '0') + '|' + regs.sp, variablesReference: 0 },
+                { name: 'PC', value: '$' + regs.pc.toString(16).toUpperCase().padStart(4, '0') + '|' + regs.pc, memoryReference: '0x' + regs.pc.toString(16).padStart(4, '0'), variablesReference: 0 }
             ]});
         } else if (ref === 2) {
             const f = regs.f;
@@ -2258,13 +2318,8 @@ const handlers = {
                 const a = s.addr;
                 if (a >= zp.length) continue;
                 const hAddr = '$' + a.toString(16).toUpperCase().padStart(2, '0');
-                let val;
-                if (s.size >= 2 && a + 1 < zp.length) {
-                    const w = zp[a] | (zp[a + 1] << 8);
-                    val = '$' + w.toString(16).toUpperCase().padStart(4, '0') + ' (' + w + ')';
-                } else {
-                    val = '$' + zp[a].toString(16).toUpperCase().padStart(2, '0') + ' (' + zp[a] + ')';
-                }
+                const sz = (s.size >= 2 && a + 1 < zp.length) ? 2 : 1;
+                const val = formatScalar('uint', zp, a, sz);
                 vars.push({ name: hAddr + ' ' + s.name, value: val, variablesReference: 0 });
             }
             respond(req, { variables: vars });
@@ -2274,33 +2329,7 @@ const handlers = {
             for (const [asmName, vt] of varTypes) {
                 const addr = symbols.get(asmName);
                 if (typeof addr !== 'number') continue;
-                const hAddr = '$' + addr.toString(16).toUpperCase().padStart(4, '0');
-                const def = typeDefs.get(vt.base);
-                // Expandable if it's a known struct or an array
-                if (def || vt.count > 1) {
-                    const childRef = nextVarRef++;
-                    varRefs.set(childRef, { addr, typeName: vt.base, count: vt.count, totalSize: vt.totalSize });
-                    // For char/uchar array globals, show inline string preview
-                    let gVal = vt.type + '  @ ' + hAddr;
-                    if (vt.count > 1 && isCharType(vt.base)) {
-                        const mem = await readMem(addr, vt.totalSize);
-                        const strPreview = formatCharArray(mem, 0, vt.count);
-                        gVal = strPreview + '  ' + vt.type + '  @ ' + hAddr;
-                    }
-                    vars.push({
-                        name: asmName,
-                        value: gVal,
-                        variablesReference: childRef
-                    });
-                } else {
-                    // Scalar — read and display inline
-                    const mem = await readMem(addr, vt.totalSize);
-                    vars.push({
-                        name: asmName,
-                        value: formatScalar(vt.base, mem, 0, vt.totalSize) + '  ' + vt.type + '  @ ' + hAddr,
-                        variablesReference: 0
-                    });
-                }
+                vars.push(await buildTypedVar(asmName, addr, vt.type, vt.totalSize));
             }
             respond(req, { variables: vars });
         } else if (ref === 5) {
@@ -2325,30 +2354,7 @@ const handlers = {
                     for (const loc of locals) {
                         const baseVal = loc.base === 'ap' ? apVal : fpVal;
                         const addr = (baseVal + loc.offset) & 0xFFFF;
-                        const hAddr = '$' + addr.toString(16).toUpperCase().padStart(4, '0');
-                        const def = typeDefs.get(loc.baseType);
-                        if (def || loc.count > 1) {
-                            const childRef = nextVarRef++;
-                            varRefs.set(childRef, { addr, typeName: loc.baseType, count: loc.count, totalSize: loc.size });
-                            let lVal = loc.type + '  @ ' + hAddr;
-                            if (loc.count > 1 && isCharType(loc.baseType)) {
-                                const mem = await readMem(addr, loc.size);
-                                const strPreview = formatCharArray(mem, 0, loc.count);
-                                lVal = strPreview + '  ' + loc.type + '  @ ' + hAddr;
-                            }
-                            vars.push({
-                                name: loc.cname,
-                                value: lVal,
-                                variablesReference: childRef
-                            });
-                        } else {
-                            const mem = await readMem(addr, loc.size);
-                            vars.push({
-                                name: loc.cname,
-                                value: formatScalar(loc.type, mem, 0, loc.size) + '  ' + loc.type + '  @ ' + hAddr,
-                                variablesReference: 0
-                            });
-                        }
+                        vars.push(await buildTypedVar(loc.cname, addr, loc.type, loc.size));
                     }
                 }
             }
@@ -2396,37 +2402,11 @@ const handlers = {
                     });
                 }
             } else if (def) {
-                // Single struct — show fields
-                const mem = await readMem(info.addr + (info.offset || 0), def.size);
+                // Single struct — show fields. buildTypedVar handles nested struct,
+                // array, pointer-to-struct, and scalar fields uniformly.
                 for (const f of def.fields) {
-                    const fieldAddr = info.addr + (info.offset || 0) + f.offset;
-                    const hAddr = '$' + fieldAddr.toString(16).toUpperCase().padStart(4, '0');
-                    const fDef = typeDefs.get(f.type.replace(/\[\d+\]$/, ''));
-                    const am = f.type.match(/^(.+)\[(\d+)\]$/);
-                    if (fDef || am) {
-                        // Nested struct or array field — expandable
-                        const childRef = nextVarRef++;
-                        const baseName = am ? am[1] : f.type;
-                        const cnt = am ? parseInt(am[2], 10) : 1;
-                        varRefs.set(childRef, { addr: info.addr, typeName: baseName, count: cnt, offset: (info.offset || 0) + f.offset });
-                        // For char/uchar array fields, show inline string preview
-                        let fVal = f.type + '  @ ' + hAddr;
-                        if (am && isCharType(am[1]) && f.size > 0) {
-                            const strPreview = formatCharArray(mem, f.offset, f.size);
-                            fVal = strPreview + '  ' + f.type + '  @ ' + hAddr;
-                        }
-                        vars.push({
-                            name: f.name,
-                            value: fVal,
-                            variablesReference: childRef
-                        });
-                    } else {
-                        vars.push({
-                            name: f.name,
-                            value: formatScalar(f.type, mem, f.offset, f.size) + '  ' + f.type + '  @ ' + hAddr,
-                            variablesReference: 0
-                        });
-                    }
+                    const fieldAddr = (info.addr + (info.offset || 0) + f.offset) & 0xFFFF;
+                    vars.push(await buildTypedVar(f.name, fieldAddr, f.type, f.size));
                 }
             } else {
                 respond(req, { variables: [] }); return;
@@ -2608,25 +2588,23 @@ const handlers = {
         resumeMode = 'step';
         const granularity = (req.arguments && req.arguments.granularity) || 'statement';
         const src = regs ? sourceFor(regs.pc) : null;
-        // Source-level step-in: same as next for C lines (we don't have C-level call info)
+        // Source-level Step Into: single-step at the instruction level until we reach a
+        // source line different from this one. A `jsr` steps INTO its target, whose entry
+        // maps to the callee's own source line — so we descend into called functions
+        // (puts/printf/AsmTick, ...) instead of stepping over them. If the line has no
+        // call, we simply arrive at the next line in the same function. The budget bounds
+        // a descent into source-less code (e.g. ROM) so it can't run away. onStopReply
+        // drives the loop and emits the stop when the line changes (or the budget runs out).
         if (granularity === 'statement' && src && /\.[cC]$/i.test(src.file)) {
-            const nextAddr = findNextSourceLineAddr(regs.pc, src.file, src.line);
-            if (nextAddr >= 0) {
-                await armAddr(nextAddr); // ref-counted; released on the next stop
-                tempStepBp = nextAddr;
-                const onBp = isBreakpointAt(regs.pc);
-                regs = null;
-                respond(req);
-                running = true;
-                if (onBp) {
-                    continueAfterStep = true;
-                    gdbWrite('s');
-                } else {
-                    gdbWrite('c');
-                }
-                evt('continued', { threadId: 1, allThreadsContinued: true });
-                return;
-            }
+            stepInInProgress = true;
+            stepInStartFile = src.file;
+            stepInStartLine = src.line;
+            stepInBudget = 1000;
+            regs = null;
+            respond(req);
+            running = true;
+            gdbWrite('s');
+            return;
         }
         regs = null;
         respond(req);
