@@ -2470,6 +2470,28 @@ window.addEventListener('message', e => {
 let disasmPanel = null;
 let disasmCenterAddr = null;
 
+// "Instruction-step mode": F10/F11 do instruction steps (keybindings gate on
+// `oricInstructionStepMode`). Driven by which view the user last SELECTED: clicking the
+// Oric Disassembly enters instruction mode, clicking a source editor returns to
+// statement mode. The catch is VS Code's reveal-on-stop, which also focuses the source
+// editor after every step — so we IGNORE editor-focus changes that land within a short
+// window after a stop (lastStopMs); only a genuine user click flips the mode. This lets
+// continued instruction-stepping survive the auto-reveal while source stepping stays
+// source-level.
+const REVEAL_ON_STOP_MS = 500; // focus changes within this window after a stop = auto-reveal, not a click
+let instrStepMode = false;
+let lastStopMs = 0;
+let stepModeStatusBar = null; // created in activate(); reflects/toggles the mode
+function setInstrStepMode(on) {
+    on = !!on;
+    if (on === instrStepMode) return;
+    instrStepMode = on;
+    vscode.commands.executeCommand('setContext', 'oricInstructionStepMode', on);
+    if (stepModeStatusBar) {
+        stepModeStatusBar.text = on ? '$(debug-step-into) Step: Instruction' : '$(debug-step-over) Step: Statement';
+    }
+}
+
 // ----------------------------------------------------------------
 // Oric Symbols Panel (searchable/sortable symbol browser)
 // ----------------------------------------------------------------
@@ -2643,7 +2665,13 @@ function createDisasmPanel() {
         { enableScripts: true, retainContextWhenHidden: true }
     );
     disasmPanel.webview.html = disasmPanelHtml();
-    disasmPanel.onDidDispose(() => { disasmPanel = null; });
+    disasmPanel.onDidDispose(() => { disasmPanel = null; setInstrStepMode(false); });
+    // Selecting the disassembly enters instruction mode. We only flip to instruction on
+    // activation here; returning to statement mode happens when the user clicks a source
+    // editor (onDidChangeActiveTextEditor), NOT when the panel merely loses focus — so
+    // VS Code's reveal-on-stop can't knock us out of instruction stepping.
+    disasmPanel.onDidChangeViewState(e => { if (e.webviewPanel.active) setInstrStepMode(true); });
+    setInstrStepMode(true); // the user just opened it
     setupDisasmMessageHandler(disasmPanel);
 
     const session = vscode.debug.activeDebugSession;
@@ -3862,7 +3890,9 @@ function activate(context) {
             disasmPanel = panel;
             panel.webview.options = { enableScripts: true, retainContextWhenHidden: true };
             panel.webview.html = disasmPanelHtml();
-            panel.onDidDispose(() => { disasmPanel = null; });
+            panel.onDidDispose(() => { disasmPanel = null; setInstrStepMode(false); });
+            panel.onDidChangeViewState(e => { if (e.webviewPanel.active) setInstrStepMode(true); });
+            if (panel.active) setInstrStepMode(true);
             setupDisasmMessageHandler(panel);
             const session = vscode.debug.activeDebugSession;
             if (session && session.type === 'oric-debug') refreshDisasmPanel(session);
@@ -3964,6 +3994,27 @@ function activate(context) {
     context.subscriptions.push(logLevelStatusBar);
     context.subscriptions.push(vscode.debug.onDidTerminateDebugSession(() => logLevelStatusBar.hide()));
 
+    // Step granularity (Statement vs Instruction). Reflects the mode set by clicking a
+    // source editor vs the Oric Disassembly; also clickable to toggle directly.
+    stepModeStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 88);
+    stepModeStatusBar.command = 'oric-debug.toggleStepMode';
+    stepModeStatusBar.tooltip = 'F10/F11 step granularity — click to toggle (or select a source / the Oric Disassembly)';
+    stepModeStatusBar.text = '$(debug-step-over) Step: Statement';
+    context.subscriptions.push(stepModeStatusBar);
+    context.subscriptions.push(vscode.commands.registerCommand('oric-debug.toggleStepMode', () => setInstrStepMode(!instrStepMode)));
+    context.subscriptions.push(vscode.debug.onDidTerminateDebugSession(() => { stepModeStatusBar.hide(); setInstrStepMode(false); }));
+    context.subscriptions.push(vscode.debug.onDidStartDebugSession(s => { if (s.type === 'oric-debug') stepModeStatusBar.show(); }));
+
+    // Clicking a source editor returns to statement stepping — but ignore the automatic
+    // focus change VS Code makes on reveal-on-stop (within REVEAL_ON_STOP_MS of a stop),
+    // which isn't a real user selection.
+    context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(editor => {
+        if (editor && editor.document && editor.document.uri.scheme === 'file'
+            && (Date.now() - lastStopMs) > REVEAL_ON_STOP_MS) {
+            setInstrStepMode(false);
+        }
+    }));
+
     // Keep the disassembly view's breakpoint dots in sync with VS Code's model —
     // whether a breakpoint changed via the source gutter, the Breakpoints panel,
     // the disasm gutter, or (via inbound promotion) Oricutron itself.
@@ -3978,13 +4029,23 @@ function activate(context) {
                 return {
                     onDidSendMessage(msg) {
                         if (msg.type === 'event' && msg.event === 'stopped') {
+                            // Record the stop time so the imminent reveal-on-stop focus
+                            // change (source editor) isn't mistaken for a user click that
+                            // would flip step mode.
+                            lastStopMs = Date.now();
                             // Drop the previous line's annotation at once so it can't
                             // flicker there during the post-step navigation churn; the
                             // fresh one is applied when refreshAll's resolve returns.
                             clearInstrDecoration();
                             setTimeout(() => refreshAll(), 50);
-                            // Skip source-file navigation when the disassembly panel is focused
-                            if (!isDisasmFocused()) pendingNavigate = true;
+                            // While instruction-stepping (the disassembly panel is visible,
+                            // tracked by the oricInstructionStepMode context key) don't yank
+                            // the user to a source editor on each stop — that focus theft is
+                            // what broke instruction-stepping. Source navigation resumes when
+                            // they leave the disassembly view.
+                            if (!instrStepMode) {
+                                pendingNavigate = true;
+                            }
                             // Auto-open custom disassembly panel on first stop of session
                             if (!disassemblyAutoOpened) {
                                 disassemblyAutoOpened = true;

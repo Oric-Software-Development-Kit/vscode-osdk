@@ -164,6 +164,10 @@
                 "title": "Oric: Active Module"
             },
             {
+                "command": "oric-debug.toggleStepMode",
+                "title": "Oric: Toggle Step Granularity (Statement / Instruction)"
+            },
+            {
                 "command": "oric-debug.selectLogLevel",
                 "title": "Oric: Debug Log Level"
             },
@@ -200,12 +204,12 @@
             {
                 "command": "oric-debug.stepOverInstruction",
                 "key": "f10",
-                "when": "activeWebviewPanelId == 'oricDisassembly' && debugType == 'oric-debug' && debugState == 'stopped'"
+                "when": "oricInstructionStepMode && debugType == 'oric-debug' && debugState == 'stopped'"
             },
             {
                 "command": "oric-debug.stepIntoInstruction",
                 "key": "f11",
-                "when": "activeWebviewPanelId == 'oricDisassembly' && debugType == 'oric-debug' && debugState == 'stopped'"
+                "when": "oricInstructionStepMode && debugType == 'oric-debug' && debugState == 'stopped'"
             }
         ],
         "menus": {
