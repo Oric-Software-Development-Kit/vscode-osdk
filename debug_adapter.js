@@ -114,6 +114,8 @@ function evt(name, body) {
 
 // Log levels: 0 = errors only, 1 = normal (default), 2 = verbose/debug
 let logLevel = 1;
+let PROFILE = false;          // per-request timing + gdb round-trip counts (toggle: `profile on` in the Debug Console)
+let gdbRoundTrips = 0;        // monotonic count of gdb commands issued (each is a TCP round-trip to Oricutron)
 const LOG_LEVEL_NAMES = ['Errors', 'Normal', 'Verbose'];
 
 function log(msg) {
@@ -189,6 +191,7 @@ const CONSOLE_HELP = [
     'Display',
     '  hex   dec                 number base for this console',
     '  loglevel [0|1|2]          log verbosity (Errors/Normal/Verbose); no arg = show current',
+    '  profile [on|off]          per-request timing + gdb read counts in the log',
     '',
     'Monitor passthrough',
     '  ! <cmd>                   run a raw Oricutron monitor command',
@@ -229,6 +232,10 @@ function gdbConnect(host, port) {
             moduleWatchPending = false;
             resolve();
         });
+        // Disable Nagle's algorithm. The RSP protocol is a stream of tiny request/ack
+        // packets; with Nagle on, each command stalls ~40ms behind the peer's delayed
+        // ACK, so every memory read cost ~50ms of pure latency (dominating every stop).
+        s.setNoDelay(true);
         s.setEncoding('latin1');
         s.on('data', onGdbData);
         s.on('error', err => {
@@ -428,6 +435,7 @@ function whenGdbIdle(cb) {
  *  Commands are serialized: if a command is already in flight,
  *  this one queues behind it. */
 function gdbCmd(cmd) {
+    gdbRoundTrips++;   // profiling: count every command (each is a TCP round-trip to the emulator)
     return new Promise(resolve => {
         if (!sock) { resolve(null); return; }
         if (pendingResolve) {
@@ -506,6 +514,17 @@ function renderSpec(name) {
 }
 let varRefs    = new Map();   // variablesReference id -> { addr, typeName, count, offset? }
 let nextVarRef = 100;         // next available variablesReference id (1-5 reserved for scopes)
+let refByKey   = new Map();   // identity string -> stable variablesReference
+// Allocate a variablesReference that stays STABLE across stops for the same logical
+// node (keyed by address/type/offset). VS Code tracks tree expansion by reference id,
+// so reusing the id lets the Variables/Watch tree keep its expanded/collapsed state
+// while stepping instead of collapsing every struct/array on each stop.
+function stableRef(key, payload) {
+    let ref = refByKey.get(key);
+    if (ref === undefined) { ref = nextVarRef++; refByKey.set(key, ref); }
+    varRefs.set(ref, payload);
+    return ref;
+}
 let displayHex = true;        // true = hex primary, false = decimal primary
 let configDone = false;
 let pendingStop = null;       // deferred stopped event body
@@ -676,7 +695,7 @@ function applyActiveModule(id) {
     buildSymInfo();
 
     resolveLibrarySources(moduleAllFiles);
-    varRefs.clear(); nextVarRef = 100;
+    varRefs.clear(); refByKey.clear(); nextVarRef = 100;
 }
 
 // Build the single per-symbol registry (symInfo) and the zero-page view list from it.
@@ -795,7 +814,7 @@ function loadSymbols(file) {
     symbols.clear(); addrSym.clear(); addrSource.clear(); symSource.clear();
     lineTable = []; zpSymbols = [];
     typeDefs.clear(); varTypes.clear(); localDefs.clear();
-    evalFailCache.clear(); varRefs.clear(); nextVarRef = 100;
+    evalFailCache.clear(); varRefs.clear(); refByKey.clear(); nextVarRef = 100;
 
     moduleBuckets = new Map(); moduleNames = new Map(); moduleFiles = new Map();
     moduleAllFiles = []; activeModuleId = null; moduleReported = false;
@@ -1148,8 +1167,10 @@ function parseStopRegs(payload) {
 async function onStopReply(payload) {
     running = false;
     regs = parseStopRegs(payload);
-    varRefs.clear();
-    nextVarRef = 100;
+    // NOTE: do NOT clear varRefs / reset nextVarRef here. Refs are identity-stable
+    // (see stableRef) and must persist across stops so VS Code keeps the Variables/
+    // Watch tree expanded while stepping. They are only reset on symbol reload /
+    // module switch (where the symbol set actually changes).
     clearGdbReadCache();
 
     // Script-launch entry: we continued through boot/CLOAD and have now hit the
@@ -1796,8 +1817,8 @@ async function formatAnnotated(ann, addr, size) {
         const mem = await readMem(addr, sz);
         let count = 0;
         for (let p = 0; p < sz * 8; p++) if (mem[p >> 3] & (1 << (p & 7))) count++;
-        const ref = nextVarRef++;
-        varRefs.set(ref, { kind: 'bitset', addr: addr & 0xFFFF, size: sz, enumName: ann.enumName });
+        const ref = stableRef('bit:' + (addr & 0xFFFF) + ':' + ann.enumName + ':' + sz,
+                              { kind: 'bitset', addr: addr & 0xFFFF, size: sz, enumName: ann.enumName });
         return { value: '{' + count + ' set}', ref, type: ann.enumName || 'bitset' };
     }
     return null;
@@ -1835,8 +1856,8 @@ async function buildTypedVar(name, addr, fullType, size, ann) {
         const target = (m[0] | (m[1] << 8)) & 0xFFFF;
         const tHex = '$' + target.toString(16).toUpperCase().padStart(4, '0');
         if (typeDefs.has(pointed) && target !== 0) {
-            const ref = nextVarRef++;
-            varRefs.set(ref, { addr: target, typeName: pointed, count: 1 });
+            const ref = stableRef('ptr:' + target + ':' + pointed,
+                                  { addr: target, typeName: pointed, count: 1 });
             return { name, value: fullType + ' → ' + tHex + '  @ ' + hAddr, variablesReference: ref };
         }
         return { name, value: fullType + ' = ' + tHex + '  @ ' + hAddr, variablesReference: 0 };
@@ -1845,8 +1866,8 @@ async function buildTypedVar(name, addr, fullType, size, ann) {
     const base = am ? am[1] : fullType;
     const count = am ? parseInt(am[2], 10) : 1;
     if (typeDefs.has(base) || count > 1) {
-        const ref = nextVarRef++;
-        varRefs.set(ref, { addr, typeName: base, count, totalSize: size });
+        const ref = stableRef('st:' + addr + ':' + base + ':' + count,
+                              { addr, typeName: base, count, totalSize: size });
         let val = fullType + '  @ ' + hAddr;
         if (count > 1 && isCharType(base)) {
             const mem = await readMem(addr, size);
@@ -2162,7 +2183,14 @@ function handleDap(msg) {
     if (!dapQuietCmds.has(msg.command)) logVerbose('[DAP] ← ' + msg.command);
     const h = handlers[msg.command];
     if (h) {
-        Promise.resolve(h(msg)).catch(e => {
+        const t0 = PROFILE ? Date.now() : 0;
+        const rt0 = PROFILE ? gdbRoundTrips : 0;
+        Promise.resolve(h(msg)).then(() => {
+            if (PROFILE) {
+                const dt = Date.now() - t0, rt = gdbRoundTrips - rt0;
+                if (dt >= 2 || rt > 0) log('[profile] ' + msg.command + ': ' + dt + 'ms, ' + rt + ' gdb reads');
+            }
+        }).catch(e => {
             log('Handler error (' + msg.command + '): ' + e.message);
             respond(msg, {}, false, 'Internal error: ' + e.message);
         });
@@ -2641,17 +2669,21 @@ const handlers = {
     scopes(req) {
         warnIfStale();
         const scopes = [
-            { name: 'Registers', variablesReference: 1, expensive: false },
+            { name: 'Registers', variablesReference: 1, expensive: false, presentationHint: 'registers' },
             { name: 'Flags',     variablesReference: 2, expensive: false },
         ];
         if (zpSymbols.length > 0) {
             scopes.push({ name: 'Zero Page', variablesReference: 3, expensive: false });
         }
         if (varTypes.size > 0) {
-            scopes.push({ name: 'Globals', variablesReference: 4, expensive: true });
+            // expensive:false so VS Code keeps the scope's expanded/collapsed state
+            // across stops instead of re-collapsing it every step. (VS Code treats an
+            // "expensive" scope as not-worth-keeping-open.) Values are only re-read
+            // while the scope is actually expanded, so the user controls the cost.
+            scopes.push({ name: 'Globals', variablesReference: 4, expensive: false });
         }
         if (localDefs.size > 0) {
-            scopes.push({ name: 'Locals', variablesReference: 5, expensive: true });
+            scopes.push({ name: 'Locals', variablesReference: 5, expensive: false, presentationHint: 'locals' });
         }
         respond(req, { scopes: scopes });
     },
@@ -2775,8 +2807,9 @@ const handlers = {
                 for (let i = 0; i < info.count; i++) {
                     const elemAddr = info.addr + (info.offset || 0) + i * def.size;
                     const hAddr = '$' + elemAddr.toString(16).toUpperCase().padStart(4, '0');
-                    const childRef = nextVarRef++;
-                    varRefs.set(childRef, { addr: info.addr, typeName: info.typeName, count: 1, offset: (info.offset || 0) + i * def.size });
+                    const childOffset = (info.offset || 0) + i * def.size;
+                    const childRef = stableRef('st:' + info.addr + ':' + info.typeName + ':1:' + childOffset,
+                                               { addr: info.addr, typeName: info.typeName, count: 1, offset: childOffset });
                     // Show first field as preview
                     const preview = formatStructPreview(def, mem, i * def.size);
                     vars.push({
@@ -3324,6 +3357,17 @@ const handlers = {
             if (m[1] !== undefined) applyLogLevel(parseInt(m[1], 10));
             respond(req, {
                 result: 'Log level: ' + logLevel + ' (' + LOG_LEVEL_NAMES[logLevel] + ')',
+                variablesReference: 0
+            });
+            return;
+        }
+
+        // Profiling:  profile         (show state)
+        //             profile on|off  (per-request timing + gdb read counts in the log)
+        if ((m = expr.match(/^profile(?:\s+(on|off))?$/i))) {
+            if (m[1] !== undefined) { PROFILE = m[1].toLowerCase() === 'on'; if (PROFILE) gdbRoundTrips = 0; }
+            respond(req, {
+                result: 'Profiling: ' + (PROFILE ? 'ON — each request logs "<cmd>: <ms>ms, <n> gdb reads"' : 'off'),
                 variablesReference: 0
             });
             return;

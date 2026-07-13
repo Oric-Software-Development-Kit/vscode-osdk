@@ -80,7 +80,52 @@ Current honest state (things to fix, not copy):
   toolchain, not a choice to replicate; the debug adapter, resolver, annotations and
   all rendering are already platform-neutral and must stay that way.
 
-## 7. Staleness self-check
+## 7. Reactivity is a feature — a slow debugger is unusable
+
+Stepping must feel instant. For serious work a laggy debugger is worse than none:
+the user stops trusting it and stops using it. Treat per-stop latency as a
+first-class design constraint, not a "later" optimization.
+
+The dominant cost is **round-trips**, not compute. Every `gdbCmd` is a TCP
+round-trip to Oricutron; a single stop can issue dozens (stack walk + each
+expanded variable + disassembly + annotations). Rules:
+
+- **Minimize round-trips.** Read the widest contiguous span you need in one `m`
+  request rather than N small reads; rely on the per-stop read cache
+  (`clearGdbReadCache()` each stop, `readMem` dedups within a stop). Before adding a
+  per-stop read, ask "does this already sit in a range something else reads?"
+- **Only fetch what's shown.** VS Code re-requests `variables` for every *expanded*
+  node on each stop, so cost scales with what's open. Don't auto-read large scopes
+  the user hasn't expanded; don't refresh a hidden panel (`readAllSymbols` early-returns
+  when the Symbols panel isn't visible — keep that guard shape for new panels).
+- **`TCP_NODELAY` on every socket** (adapter *and* the Oricutron stub). RSP is tiny
+  request/ack packets; with Nagle on, each exchange stalls ~40ms behind the peer's
+  delayed ACK.
+- **Sockets, not polling intervals.** The emulator must wake the instant a command
+  arrives (`select()` on the client socket — `gdb_stub_wait_readable`), never gate GDB
+  on a frame/event-poll timer. A prior `SDL_WaitEventTimeout(50)` in the paused loop
+  made *every* command cost ~50ms → a step was ~1s. **But never busy-spin:** block with
+  a timeout so an idle-paused session (or one with no client) stays cheap.
+- **Don't force needless re-reads.** UI churn that collapses/rebuilds the tree makes VS
+  Code re-fetch everything (see §8): stable `variablesReference`s and non-`expensive`
+  scopes keep state *and* cut reads.
+
+If you profile (`profile on` in the Debug Console → per-request ms + gdb-read counts),
+optimize the request with the most reads first; a timing that's a clean multiple of some
+interval (e.g. ~50ms) is a latency/poll bug, not real work.
+
+## 8. Stable tree identity across stops
+
+VS Code keys Variables/Watch tree expansion on `variablesReference` and on stack-frame
+identity, and it will not keep an `expensive` scope open. So, to stop the tree
+re-collapsing every step (which also forces a full re-read — see §7):
+- **Stable refs:** the reference for a logical node (struct/array/pointer/bitset) must be
+  the same across stops. Allocate via `stableRef(key, payload)` keyed by address/type/
+  offset — never a fresh counter per stop. Reset only on symbol reload / module switch.
+- **Scopes are `expensive: false`** so VS Code preserves their expanded/collapsed state;
+  set the right `presentationHint` (`locals`/`registers`).
+
+## 9. Staleness self-check
 
 The adapter is `node debug_adapter.js` spawned per session, so a session restart loads
 current code — but if you edit the file mid-session, the running process is stale.
