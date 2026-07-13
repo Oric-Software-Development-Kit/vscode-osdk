@@ -3789,6 +3789,14 @@ const handlers = {
         const h2 = v => '$' + (v & 0xFF).toString(16).toUpperCase().padStart(2, '0');
         const h4 = v => (v & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
         const sym = addr => addrSym.get(addr);
+        // An address operand as "label|$hhhh" (or just "$hhhh" when unnamed). The '|'
+        // reads as "same location, shown another way" — consistent with the value
+        // notation below. `wide` picks 16-bit ($hhhh) vs zero-page ($hh) formatting.
+        const symAddr = (addr, wide) => {
+            const hex = wide ? '$' + h4(addr) : h2(addr);
+            const s = sym(addr);
+            return s ? s + '|' + hex : hex;
+        };
         // Byte value shown three ways: hex | decimal | binary (e.g. $63|99|%01100011)
         const fmtVal = v => h2(v) + '|' + (v & 0xFF) + '|%' + (v & 0xFF).toString(2).padStart(8, '0');
 
@@ -3812,34 +3820,29 @@ const handlers = {
                 }
                 case 'z': { // zero page
                     const val = await readByte(lo);
-                    const s = sym(lo);
-                    annotation = '(' + (s || h2(lo)) + ')=' + fmtVal(val);
+                    annotation = '(' + symAddr(lo, false) + ')=' + fmtVal(val);
                     break;
                 }
                 case 'x': { // zp,X
                     const ea = (lo + regs.x) & 0xFF;
                     const val = await readByte(ea);
-                    const s = sym(lo);
-                    annotation = '(' + (s || h2(lo)) + '+X:' + h2(regs.x) + '=' + h2(ea) + ')=' + fmtVal(val);
+                    annotation = '(' + symAddr(lo, false) + '+X:' + h2(regs.x) + '=' + h2(ea) + ')=' + fmtVal(val);
                     break;
                 }
                 case 'y': { // zp,Y
                     const ea = (lo + regs.y) & 0xFF;
                     const val = await readByte(ea);
-                    const s = sym(lo);
-                    annotation = '(' + (s || h2(lo)) + '+Y:' + h2(regs.y) + '=' + h2(ea) + ')=' + fmtVal(val);
+                    annotation = '(' + symAddr(lo, false) + '+Y:' + h2(regs.y) + '=' + h2(ea) + ')=' + fmtVal(val);
                     break;
                 }
                 case 'a': { // absolute
                     const addr = (hi << 8) | lo;
                     // JSR/JMP don't need value annotation
                     if (mne === 'JSR' || mne === 'JMP') {
-                        const s = sym(addr);
-                        if (s) annotation = s;
+                        if (sym(addr)) annotation = symAddr(addr, true);
                     } else {
                         const val = await readByte(addr);
-                        const s = sym(addr);
-                        annotation = '(' + (s || '$' + h4(addr)) + ')=' + fmtVal(val);
+                        annotation = '(' + symAddr(addr, true) + ')=' + fmtVal(val);
                     }
                     break;
                 }
@@ -3861,16 +3864,14 @@ const handlers = {
                     const ptr = (lo + regs.x) & 0xFF;
                     const ea = await readWord(ptr);
                     const val = await readByte(ea);
-                    const s = sym(lo);
-                    annotation = '(' + (s || h2(lo)) + '+X:' + h2(regs.x) + '=' + h2(ptr) + ')=$' + h4(ea) + ' =' + fmtVal(val);
+                    annotation = '(' + symAddr(lo, false) + '+X:' + h2(regs.x) + '=' + h2(ptr) + ')=$' + h4(ea) + ' =' + fmtVal(val);
                     break;
                 }
                 case ')': { // (zp),Y indirect Y
                     const ptr = await readWord(lo);
                     const ea = (ptr + regs.y) & 0xFFFF;
                     const val = await readByte(ea);
-                    const s = sym(lo);
-                    annotation = '(*(' + (s || h2(lo)) + ')=$' + h4(ptr) + '+Y:' + h2(regs.y) + ')=$' + h4(ea) + ' =' + fmtVal(val);
+                    annotation = '(*(' + symAddr(lo, false) + ')=$' + h4(ptr) + '+Y:' + h2(regs.y) + ')=$' + h4(ea) + ' =' + fmtVal(val);
                     break;
                 }
                 case 'n': { // indirect (JMP only)
@@ -3882,7 +3883,6 @@ const handlers = {
                 case 'r': { // relative (branches)
                     const offset = lo < 128 ? lo : lo - 256;
                     const target = (pc + 2 + offset) & 0xFFFF;
-                    const s = sym(target);
                     // Determine branch taken/not-taken from flags
                     const f = regs.f;
                     let taken = false;
@@ -3896,7 +3896,7 @@ const handlers = {
                         case 0xD0: taken = !(f & 0x02); break; // BNE: Z=0
                         case 0xF0: taken = !!(f & 0x02); break; // BEQ: Z=1
                     }
-                    annotation = (s || '$' + h4(target)) + (taken ? ' [taken]' : ' [not taken]');
+                    annotation = symAddr(target, true) + (taken ? ' [taken]' : ' [not taken]');
                     break;
                 }
                 // I (implied), A (accumulator): no memory operand
