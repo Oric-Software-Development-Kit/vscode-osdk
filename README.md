@@ -123,6 +123,33 @@ All 6502 addressing modes are supported: immediate, zero page, zp+X, zp+Y, absol
 
 ---
 
+## Type Annotations (comment-based)
+
+Add lightweight annotations inside ordinary comments to tell the debugger how to interpret a
+value. They are pure comments — `//` in C (`.h`/`.c`), `;` in assembler (`.s`) — so they never
+change the built program and every compiler/assembler ignores them. They work on **C globals, C
+struct fields, and assembler data labels** (`.byt`/`.dsb`); the extension scans your headers and
+sources for them at session start.
+
+| Annotation | Shows | Example |
+|---|---|---|
+| `@bool` | `true` / `false` (0 = false, non-zero = true) | `unsigned char music_enabled; // @bool` |
+| `@enum <E>` | the enumerator name for the value | `unsigned char layout; // @enum KeyboardLayout` |
+| `@bitset <E>` | the set bits decoded to a list of enum names | `_gAchievements .dsb 7 ; @bitset achievement` |
+| `@ptr16` | the 16-bit pointer and what it currently points to | `sourcePtr = tmp0 ; @ptr16` |
+| `@bcd` / `@bcd-be` / `@bcd-le` | packed BCD decoded to a readable number | `current_score_bcd .dsb 2 ; @bcd-be` |
+
+Notes:
+- `@enum` / `@bitset` name a C `enum` type (the OSDK compiler emits enum info under `-g1`, and XA
+  supports `enum {}` in shared C/asm headers). `@bitset` decodes bit *P* as byte `P>>3`, bit `1<<(P&7)`.
+- `@bcd-be` (default, and the plain `@bcd` alias) = most-significant byte at the lowest address;
+  `@bcd-le` = least-significant first. An explicit width may follow, e.g. `@bcd-be 3` for a 3-byte value.
+- Annotated values render consistently in the Watch/Variables views, the Symbol Browser, and inline
+  in the disassembly — each shows the decoded value plus a short type token (e.g. `bool`, the enum
+  name, `bcd-be`).
+
+---
+
 ## Code Navigation
 
 ### Hover Information
@@ -216,12 +243,72 @@ Type these commands in the VS Code Debug Console during a debug session:
 | `symbolName` | Look up a symbol by typing its name | `_main` |
 | `hex` / `dec` | Set the number base for console output | `hex` |
 | `loglevel [0\|1\|2]` | Show or set log verbosity (Errors/Normal/Verbose) | `loglevel 1` |
+| `profile [on\|off]` | Per-request timing + gdb read counts in the log (find slow stops) | `profile on` |
 | `! <cmd>` | Run a raw Oricutron monitor command | `! = tmp0+2` |
 | `help` (or `?`) | Show the full command reference | `help` |
 
 The status bar (bottom left, during a session) shows the active **Module** and the
 current **Log** level. Click either one to change it — the log-level picker is the
 quickest way to silence verbose GDB/DAP tracing without editing `launch.json`.
+
+---
+
+## Setting Up OSDK for Full Debugging
+
+For the extension to give you C-source stepping, typed variables, and inspectable locals, the
+OSDK build must emit debug info and an enriched symbol file. Configure this once in your
+project's `osdk_config.bat` / build scripts.
+
+### Compiler settings — `OSDKCOMP=-O1 -g1`
+
+```bat
+SET OSDKCOMP=-O1 -g1
+```
+
+- **`-g1`** makes the C compiler emit source-line info, struct/type records (`#TYPES`), and
+  local/parameter names — the basis for source breakpoints, typed globals, and the Locals scope.
+- **`-O1` (not `-O2`)** is required to inspect function **body locals**. At `-O2` the compiler
+  register-allocates body locals off the stack, so they have no address the debugger can read
+  (parameters still show at `-O2`, but in-function locals do not). Use `-O1` for full local
+  visibility.
+
+### Symbol file — build with `xa -S build\symbols_ext`
+
+The assembler must produce the **V2** symbol file (see *Symbol File Format* below): `#SYM V2` +
+`#FILES` + `#LINES` + `#TYPES`. Have your build run `xa -S build\symbols_ext` and point
+`symbolFile` at `build/symbols_ext`. Assembler code always maps to real source; C code needs the
+`-g1` above. (Without a V2 file you still get address/label-level debugging, just not C-source
+stepping or typed locals.)
+
+### Recommended launch config — `launchScript` (the OSDK way)
+
+Rather than hand-wiring the emulator path and a fixed port, let the extension run your project's
+`osdk_execute.bat`; it auto-picks a free gdb port, injects it via the environment, and halts at
+the program entry (`OSDKADDR`) so timing is race-free:
+
+```json
+{
+    "type": "oric-debug",
+    "request": "launch",
+    "name": "Build & Debug (Oric)",
+    "launchScript": "osdk_execute.bat",
+    "cwd": "${workspaceFolder}",
+    "symbolFile": "${workspaceFolder}/build/symbols_ext",
+    "stopOnEntry": false,
+    "build": {
+        "command": "osdk_build.bat",
+        "cwd": "${workspaceFolder}",
+        "output": "${workspaceFolder}/build/YOURGAME.tap",
+        "sources": ["${workspaceFolder}/main.c", "${workspaceFolder}/code"]
+    }
+}
+```
+
+(The `emulatorPath` + `diskImage` style shown under *Setup* below still works and is fine for
+attach or non-OSDK setups.)
+
+To give the debugger richer type information about individual values, use the comment-based
+**[Type Annotations](#type-annotations-comment-based)** described above.
 
 ---
 
