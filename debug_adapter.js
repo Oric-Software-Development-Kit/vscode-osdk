@@ -458,7 +458,8 @@ let config     = {};
 let bpId       = 1;
 let bps        = new Map();   // id -> { id, addr, name } (function breakpoints)
 let ibps       = new Map();   // id -> { id, addr }       (instruction breakpoints)
-let zpSymbols  = [];          // [{addr, name, size}] sorted by address
+let zpSymbols  = [];          // [{addr, name, size}] sorted by address (derived from symInfo)
+let symInfo    = new Map();   // name -> { name, addr, size, ann, type, group } — single source of truth for per-symbol info
 let typeDefs   = new Map();   // structName -> { size, fields: [{name, type, offset, size}] }
 let varTypes   = new Map();   // asmName -> { type: 'score_entry[24]', base: 'score_entry', count: 24|1, totalSize: 528 }
 let localDefs  = new Map();   // funcAsmName -> [{cname, base:'fp'|'ap', offset, type, baseType, count, size}]
@@ -477,6 +478,32 @@ function resolveEnum(name) { return enumDefs.get(name) || allEnumDefs.get(name);
 // underscore the C compiler / assembler add. One place so every view resolves the
 // same way.
 function annForSymbol(name) { return name ? annBySymbol.get(name.replace(/^_+/, '')) : undefined; }
+// The byte width an annotation pins down, or 0 if it implies none (bool/enum default
+// to a single byte at the caller). One place so symbol sizing and value rendering agree.
+function annWidth(ann) {
+    if (!ann || typeof ann.kind !== 'string') return 0;
+    if (ann.kind === 'ptr16') return 2;
+    if (ann.kind.indexOf('bcd') === 0) return ann.size || 2;
+    if (ann.kind === 'bitset') { const ed = resolveEnum(ann.enumName); return ann.size || (ed ? bitsetBytes(ed) : 0); }
+    return 0;
+}
+// Per-symbol info lookup, tolerant of the leading underscore. Single source of truth
+// for a symbol's address, size, annotation and type — every view resolves through it.
+function infoForSymbol(name) {
+    if (!name) return undefined;
+    return symInfo.get(name) || symInfo.get('_' + name) ||
+           (name[0] === '_' ? symInfo.get(name.slice(1)) : undefined);
+}
+// The (type, size, ann) to hand buildTypedVar for a named symbol, from the registry.
+// One place so Watch / zero-page / Globals render a symbol identically.
+function renderSpec(name) {
+    const info = infoForSymbol(name);
+    const ann = info ? info.ann : (annForSymbol(name) || null);
+    if (info && info.type) return { type: info.type, size: info.size, ann };   // .ctype-typed var
+    if (ann) return { type: 'uchar', size: info ? info.size : (annWidth(ann) || 1), ann };
+    const size = info ? Math.min(info.size, 2) : 2;                             // plain: word/byte default
+    return { type: size >= 2 ? 'uint' : 'uchar', size, ann: null };
+}
 let varRefs    = new Map();   // variablesReference id -> { addr, typeName, count, offset? }
 let nextVarRef = 100;         // next available variablesReference id (1-5 reserved for scopes)
 let displayHex = true;        // true = hex primary, false = decimal primary
@@ -646,18 +673,45 @@ function applyActiveModule(id) {
         lineTable = deduped;
     }
 
-    // Build sorted zero-page symbol list with inferred sizes
-    const zpAddrs = [];
-    for (const [a, n] of addrSym) { if (a <= 0xFF) zpAddrs.push({ addr: a, name: n }); }
-    zpAddrs.sort((a, b) => a.addr - b.addr);
-    for (let i = 0; i < zpAddrs.length; i++) {
-        const next = i + 1 < zpAddrs.length ? zpAddrs[i + 1].addr : zpAddrs[i].addr + 2;
-        const size = Math.min(next - zpAddrs[i].addr, 2);
-        zpSymbols.push({ addr: zpAddrs[i].addr, name: zpAddrs[i].name, size: size });
-    }
+    buildSymInfo();
 
     resolveLibrarySources(moduleAllFiles);
     varRefs.clear(); nextVarRef = 100;
+}
+
+// Build the single per-symbol registry (symInfo) and the zero-page view list from it.
+// Size priority: explicit .ctype type width > annotation width > address-gap inference.
+// Called whenever the composed symbol set changes so every view reads one size.
+function buildSymInfo() {
+    symInfo.clear();
+    const arr = [];
+    for (const [name, addr] of symbols) arr.push({ name, addr });
+    arr.sort((a, b) => a.addr - b.addr);
+    for (let i = 0; i < arr.length; i++) {
+        const { name, addr } = arr[i];
+        // Gap to the next DISTINCT address (skip same-address aliases), capped for display.
+        let ni = i + 1;
+        while (ni < arr.length && arr[ni].addr === addr) ni++;
+        const next = ni < arr.length ? arr[ni].addr : addr + 2;
+        const gap = Math.min(Math.max(next - addr, 1), 8);
+        const ann = annForSymbol(name) || null;
+        const vt = varTypes.get(name);
+        const size = vt ? vt.totalSize : (annWidth(ann) || gap);
+        symInfo.set(name, {
+            name, addr, size, ann,
+            type: vt ? vt.type : null,
+            group: addr <= 0xFF ? 'zp' : (addr < 0xC000 ? 'ram' : 'high')
+        });
+    }
+    // Zero-page view list = the master symbol at each zp address, sized from the registry.
+    zpSymbols = [];
+    for (const [a, n] of addrSym) {
+        if (a <= 0xFF) {
+            const info = symInfo.get(n);
+            zpSymbols.push({ addr: a, name: n, size: info ? info.size : 1 });
+        }
+    }
+    zpSymbols.sort((a, b) => a.addr - b.addr);
 }
 
 // Modules for the manual-override UI.
@@ -942,6 +996,11 @@ function loadSymbols(file) {
         for (const [k, v] of enumDefs) allEnumDefs.set(k, v);
         for (const b of moduleBuckets.values())
             for (const [k, v] of b.enumDefs) if (!allEnumDefs.has(k)) allEnumDefs.set(k, v);
+
+        // Rebuild the symbol registry now that annotations and the enum union are
+        // available — the applyActiveModule() above ran before parseAnnotations, so its
+        // symInfo had no annotation widths (bcd/bitset) to size symbols with.
+        buildSymInfo();
 
         const modNote = moduleNames.size > 0
             ? (' [' + moduleNames.size + ' modules, active=' + (activeModuleId !== null ? moduleNames.get(activeModuleId) : '(none)') + ']') : '';
@@ -1605,7 +1664,7 @@ function parseAnnotations(files) {
   annByField.clear();
   annBySymbol.clear();
   try {
-    const ANN = /@(bool|enum|bitset|ptr16)\b\s*(\w+)?/;   // matched within the comment portion
+    const ANN = /@(bool|enum|bitset|ptr16|bcd(?:-[bl]e)?)\b\s*(\w+)?/;   // matched within the comment portion
     const seen = new Set();
     for (const f of files) {
         let key; try { key = canonPath(f); } catch (e) { key = String(f); }
@@ -1635,6 +1694,15 @@ function parseAnnotations(files) {
             const m = comment.match(ANN);
             if (m) {
                 const directive = { kind: m[1], enumName: m[2] || null };
+                // @bcd[-be|-le] carries an optional byte width (e.g. "@bcd-be 3");
+                // the trailing token is a count, not an enum name. Multi-byte BCD
+                // fields can't be sized reliably from symbol-address gaps (an
+                // inherited symbol may sit inside the field), so the width is
+                // self-described here and defaults to 2.
+                if (m[1].indexOf('bcd') === 0) {
+                    directive.enumName = null;
+                    if (m[2] && /^\d+$/.test(m[2])) directive.size = parseInt(m[2], 10);
+                }
                 let name = null;
                 if (isAsm) {
                     const t = code.match(/^\s*([A-Za-z_.][\w.]*)/);
@@ -1677,21 +1745,40 @@ async function ptr16Str(baseAddr) {
     return s;
 }
 
-// Render a value using a comment annotation (@bool/@enum/@bitset/@ptr16). Returns
-// { value, ref? } or null. bitset returns an expandable ref (children = set bits).
+// Render a value using a comment annotation (@bool/@enum/@bitset/@ptr16/@bcd).
+// Returns { value, ref? } or null. bitset returns an expandable ref (children = set bits).
 async function formatAnnotated(ann, addr, size) {
     if (ann.kind === 'ptr16') {
-        return { value: await ptr16Str(addr) };
+        return { value: await ptr16Str(addr), type: 'ptr16' };
+    }
+    if (ann.kind === 'bcd' || ann.kind === 'bcd-be' || ann.kind === 'bcd-le') {
+        // Packed BCD: two decimal digits per byte, concatenated most-significant-first
+        // -> the human-readable number. Byte order: @bcd-be / @bcd (default) = MSB at
+        // the lowest address; @bcd-le = LSB at the lowest address. A nibble outside 0-9
+        // (invalid BCD) shows as its hex letter so it stands out. Raw bytes shown in
+        // address order for reference.
+        // Width: the annotation's own count wins; otherwise at least 2 bytes, since
+        // the size handed in (from symbol-gap inference / Watch) is unreliable here.
+        const sz = ann.size || Math.max(size || 0, 2);
+        const mem = await readMem(addr, sz);
+        const le = ann.kind === 'bcd-le';
+        let digits = '', raw = '';
+        for (let k = 0; k < sz; k++) {
+            const b = mem[le ? (sz - 1 - k) : k] || 0;
+            digits += (b >> 4).toString(16) + (b & 0x0f).toString(16);
+        }
+        for (let i = 0; i < sz; i++) raw += (i ? ' $' : '$') + (mem[i] || 0).toString(16).toUpperCase().padStart(2, '0');
+        return { value: digits + '  (' + raw + ')', type: ann.kind };
     }
     if (ann.kind === 'bool') {
         const v = (await readMem(addr, 1))[0] || 0;
-        return { value: (v ? 'true' : 'false') + '  ($' + v.toString(16).toUpperCase().padStart(2, '0') + '|' + v + ')' };
+        return { value: (v ? 'true' : 'false') + '  ($' + v.toString(16).toUpperCase().padStart(2, '0') + '|' + v + ')', type: 'bool' };
     }
     if (ann.kind === 'enum') {
         const ed = resolveEnum(ann.enumName);
         const sz = size || 1;
         const mem = await readMem(addr, sz);
-        return { value: ed ? formatEnum(ed, mem, 0, sz) : formatScalar('uchar', mem, 0, sz) };
+        return { value: ed ? formatEnum(ed, mem, 0, sz) : formatScalar('uchar', mem, 0, sz), type: ann.enumName || 'enum' };
     }
     if (ann.kind === 'bitset') {
         const ed = resolveEnum(ann.enumName);
@@ -1701,7 +1788,7 @@ async function formatAnnotated(ann, addr, size) {
         for (let p = 0; p < sz * 8; p++) if (mem[p >> 3] & (1 << (p & 7))) count++;
         const ref = nextVarRef++;
         varRefs.set(ref, { kind: 'bitset', addr: addr & 0xFFFF, size: sz, enumName: ann.enumName });
-        return { value: '{' + count + ' set}', ref };
+        return { value: '{' + count + ' set}', ref, type: ann.enumName || 'bitset' };
     }
     return null;
 }
@@ -1724,7 +1811,12 @@ async function buildTypedVar(name, addr, fullType, size, ann) {
     // Comment annotation (@bool/@enum/@bitset) overrides the default rendering.
     if (ann) {
         const a = await formatAnnotated(ann, addr, size);
-        if (a) return { name, value: a.value + '  @ ' + hAddr, variablesReference: a.ref || 0 };
+        // Show the detected type token (e.g. "bcd-be", "bool", the enum name) the same
+        // way the scalar path shows fullType, so annotated values read consistently.
+        if (a) {
+            const t = a.type ? '  ' + a.type : '';
+            return { name, value: a.value + t + '  @ ' + hAddr, variablesReference: a.ref || 0 };
+        }
     }
     // Pointer (`*T`): value is the pointed-to address; expandable to that struct.
     if (fullType[0] === '*') {
@@ -2591,9 +2683,9 @@ const handlers = {
             const vars = [];
             for (const s of zpSymbols) {
                 const a = s.addr;
-                const sz = s.size >= 2 ? 2 : 1;
                 const hAddr = '$' + a.toString(16).toUpperCase().padStart(2, '0');
-                const v = await buildTypedVar(s.name, a, sz === 2 ? 'uint' : 'uchar', sz, annForSymbol(s.name));
+                const spec = renderSpec(s.name);
+                const v = await buildTypedVar(s.name, a, spec.type, spec.size, spec.ann);
                 v.name = hAddr + ' ' + s.name;
                 vars.push(v);
             }
@@ -2615,9 +2707,8 @@ const handlers = {
                 if (typeof addr !== 'number') { asmName = cName; addr = symbols.get(asmName); }
                 if (typeof addr !== 'number' || shown.has(asmName)) continue;
                 shown.add(asmName);
-                let size = 1;
-                if (ann.kind === 'bitset') { const ed = resolveEnum(ann.enumName); size = ed ? bitsetBytes(ed) : 1; }
-                vars.push(await buildTypedVar(asmName, addr, 'uchar', size, ann));
+                const spec = renderSpec(asmName);
+                vars.push(await buildTypedVar(asmName, addr, spec.type, spec.size, spec.ann));
             }
             respond(req, { variables: vars });
         } else if (ref === 5) {
@@ -3380,16 +3471,11 @@ const handlers = {
         }
         if (a !== undefined) {
             // Watch/hover render goes through the SAME path as every scope view
-            // (buildTypedVar) so annotations, enum types, structs, arrays and
-            // pointers all behave identically. Pick type/size from the .ctype var
-            // if present, else the annotation, else default to a 16-bit word.
-            const ann = annForSymbol(symName);
-            const vt = varTypes.get(symName);
-            let type, size;
-            if (vt) { type = vt.type; size = vt.totalSize; }
-            else if (ann) { type = 'uchar'; size = ann.kind === 'bitset' ? 0 : 1; }
-            else { type = 'uint'; size = 2; }
-            const v = await buildTypedVar(symName, a, type, size, ann);
+            // (buildTypedVar) with the SAME (type,size,ann) the registry hands every
+            // other view (renderSpec), so annotations, enum types, structs, arrays and
+            // pointers all behave identically.
+            const spec = renderSpec(symName);
+            const v = await buildTypedVar(symName, a, spec.type, spec.size, spec.ann);
             respond(req, {
                 result: v.value,
                 variablesReference: v.variablesReference,
@@ -3608,31 +3694,17 @@ const handlers = {
             return;
         }
 
-        // Build sorted list of all symbols with addresses and sizes
+        // Build sorted list of all symbols with addresses and sizes — sizes and groups
+        // come straight from the single symbol registry (symInfo), so the browser shows
+        // the same size every other view uses.
         const allAddrs = [];
         for (const [name, addr] of symbols) {
-            allAddrs.push({ name, addr });
+            const info = symInfo.get(name);
+            allAddrs.push({ name, addr,
+                            size: info ? info.size : 1,
+                            group: info ? info.group : (addr <= 0xFF ? 'zp' : (addr < 0xC000 ? 'ram' : 'high')) });
         }
         allAddrs.sort((a, b) => a.addr - b.addr);
-
-        // Infer sizes from gaps (cap at 8 for display, min 1)
-        // For ZP symbols, reuse zpSymbols sizes if available
-        const zpSizeMap = new Map();
-        for (const zs of zpSymbols) zpSizeMap.set(zs.addr, zs.size);
-
-        for (let i = 0; i < allAddrs.length; i++) {
-            const s = allAddrs[i];
-            if (s.addr <= 0xFF && zpSizeMap.has(s.addr)) {
-                s.size = zpSizeMap.get(s.addr);
-            } else {
-                // Skip aliases (same address) to find next distinct address
-                let ni = i + 1;
-                while (ni < allAddrs.length && allAddrs[ni].addr === s.addr) ni++;
-                const next = ni < allAddrs.length ? allAddrs[ni].addr : s.addr + 2;
-                s.size = Math.min(Math.max(next - s.addr, 1), 8);
-            }
-            s.group = s.addr <= 0xFF ? 'zp' : (s.addr < 0xC000 ? 'ram' : 'high');
-        }
 
         // Collect unique 256-byte pages that need reading
         const pages = new Set();
@@ -3682,12 +3754,17 @@ const handlers = {
         for (let i = 0; i < allAddrs.length; ) {
             const s = allAddrs[i];
             const names = [s.name];
+            // Group size = the largest among aliases at this address. An annotated
+            // symbol (e.g. @bcd, size 2) may share its address with an inherited
+            // 1-byte symbol; the wider, annotation-derived size is the correct one.
+            let maxSize = s.size;
             let j = i + 1;
             while (j < allAddrs.length && allAddrs[j].addr === s.addr) {
                 names.push(allAddrs[j].name);
+                if (allAddrs[j].size > maxSize) maxSize = allAddrs[j].size;
                 j++;
             }
-            merged.push({ names, addr: s.addr, size: s.size, group: s.group });
+            merged.push({ names, addr: s.addr, size: maxSize, group: s.group });
             i = j;
         }
 
@@ -3731,8 +3808,18 @@ const handlers = {
             }
             const src = exactLineSource(s.addr) || nonArtifactSource(s.addr);
             const vt = varTypes.get(s.names[0]);
+            // Annotated value rendered through the SAME path as Watch (formatAnnotated),
+            // so a @bcd/@enum/@bool/@bitset symbol shows the decoded value + type token
+            // instead of the browser's raw little-endian byte read.
+            let display = null;
+            const mAnn = annForSymbol(s.names[0]);
+            if (mAnn) {
+                const fa = await formatAnnotated(mAnn, s.addr, s.size);
+                if (fa) display = fa.value + (fa.type ? '  ' + fa.type : '');
+            }
             result.push({ name: s.names[0], aliases: s.names.slice(1),
                           addr: s.addr, size: vt ? vt.totalSize : s.size, value, group: s.group,
+                          display,
                           source: src ? { file: src.file, line: src.line } : null,
                           nameSources,
                           typeInfo: vt ? { type: vt.type, base: vt.base, count: vt.count,
@@ -3852,21 +3939,33 @@ const handlers = {
             return m[0] | (m[1] << 8);
         }
 
-        // Source-aware @ptr16: a local alias equated to a zp scratch (e.g.
-        // "sourcePtr = tmp0  ; @ptr16") doesn't reach the symbol table and the same
-        // name is reused for different tmp's across functions -- so read the intent
-        // from the SOURCE line at this PC. If the operand names a @ptr16 alias, show
-        // the whole 16-bit word at its base for both +0 and +1 (not the single byte).
-        let ptrHint = null;
+        // Source-aware annotation on a "name+off" operand. A local alias equated to a
+        // zp scratch (e.g. "sourcePtr = tmp0 ; @ptr16") doesn't reach the symbol table,
+        // and a multi-byte value (e.g. "current_score_bcd ; @bcd-be") touched one byte
+        // at a time reads as a lone byte -- so read the intent from the SOURCE line at
+        // this PC and render the whole annotated value at its base, not the single byte.
+        let annHint = null;
         {
             const s = sourceFor(pc);   // PC -> source line via lineTable (works for any instruction, not just symbol addresses)
             const srcLine = s ? getSourceLine(s.file, s.line) : null;
             const mo = srcLine && srcLine.match(/([A-Za-z_][\w.]*)\s*\+\s*(\d+)/);
             if (mo) {
-                const ann = annBySymbol.get(mo[1].replace(/^_+/, ''));
-                if (ann && ann.kind === 'ptr16') ptrHint = { name: mo[1], off: parseInt(mo[2], 10) };
+                const ann = annForSymbol(mo[1]);
+                if (ann && (ann.kind === 'ptr16' || ann.kind.indexOf('bcd') === 0))
+                    annHint = { name: mo[1], off: parseInt(mo[2], 10), ann };
             }
         }
+        // Render an annHint at its base address: "(alias|canon|$base[+off])=value type".
+        // ptr16 shows the whole word (identical for +0/+1); bcd shows the full number and
+        // marks which byte this instruction touches via +off.
+        const annHintStr = async (base, wide) => {
+            const canon = sym(base);
+            const addrTok = wide ? '$' + h4(base) : h2(base);
+            const label = annHint.name + (canon && canon !== annHint.name ? '|' + canon : '') + '|' + addrTok;
+            if (annHint.ann.kind === 'ptr16') return '(' + label + ')=' + await ptr16Str(base);
+            const a = await formatAnnotated(annHint.ann, base, annWidth(annHint.ann) || 2);
+            return '(' + label + '+' + annHint.off + ')=' + a.value + (a.type ? '  ' + a.type : '');
+        };
 
         let annotation = '';
         try {
@@ -3876,13 +3975,8 @@ const handlers = {
                     break;
                 }
                 case 'z': { // zero page
-                    if (ptrHint) {
-                        const base = (lo - ptrHint.off) & 0xFF;
-                        const canon = sym(base);   // the underlying symbol (e.g. tmp0), if any
-                        // (alias | canonical symbol | address) — three notations for the
-                        // same location — then the 16-bit value and what it points to.
-                        const label = ptrHint.name + (canon && canon !== ptrHint.name ? '|' + canon : '') + '|' + h2(base);
-                        annotation = '(' + label + ')=' + await ptr16Str(base);
+                    if (annHint) {
+                        annotation = await annHintStr((lo - annHint.off) & 0xFF, false);
                         break;
                     }
                     const val = await readByte(lo);
@@ -3906,6 +4000,8 @@ const handlers = {
                     // JSR/JMP don't need value annotation
                     if (mne === 'JSR' || mne === 'JMP') {
                         if (sym(addr)) annotation = symAddr(addr, true);
+                    } else if (annHint) {
+                        annotation = await annHintStr((addr - annHint.off) & 0xFFFF, true);
                     } else {
                         const val = await readByte(addr);
                         annotation = '(' + symAddr(addr, true) + ')=' + fmtVal(val);
