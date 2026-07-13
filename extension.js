@@ -389,8 +389,21 @@ function createMemoryPanel(context) {
         vscode.ViewColumn.Beside,
         { enableScripts: true, retainContextWhenHidden: true }
     );
+    wireMemoryPanel(panel, []);
+    return panel;
+}
 
+// Wire up a memory panel (message handling, registration, html) and seed it with
+// any restored entries. Shared by createMemoryPanel and the reload serializer so
+// both behave identically (DRY).
+function wireMemoryPanel(panel, initialEntries) {
     const state = { entries: [], results: [] };
+    for (const e of (initialEntries || [])) {
+        if (!e || !e.expression) continue;
+        const entry = { expression: e.expression, rows: e.rows || 8, format: e.format || 'hex' };
+        state.entries.push(entry);
+        state.results.push({ ...entry, address: null, data: '', error: null });
+    }
 
     panel.webview.onDidReceiveMessage(msg => {
         if (msg.type === 'add' && msg.expression) {
@@ -411,6 +424,21 @@ function createMemoryPanel(context) {
                 state.entries.splice(msg.index, 1);
                 state.results.splice(msg.index, 1);
                 postResults(panel, state);
+            }
+        } else if (msg.type === 'edit' && typeof msg.index === 'number' && msg.expression) {
+            // Change an existing entry's expression in place (no remove/re-add).
+            if (msg.index >= 0 && msg.index < state.entries.length) {
+                const expr = msg.expression.trim();
+                if (expr) {
+                    state.entries[msg.index].expression = expr;
+                    const session = vscode.debug.activeDebugSession;
+                    if (session && session.type === 'oric-debug') {
+                        evaluateOne(session, state, msg.index).then(() => postResults(panel, state));
+                    } else {
+                        state.results[msg.index] = { ...state.entries[msg.index], address: null, data: '', error: null };
+                        postResults(panel, state);
+                    }
+                }
             }
         } else if (msg.type === 'configure' && typeof msg.index === 'number') {
             if (msg.index >= 0 && msg.index < state.entries.length) {
@@ -436,7 +464,13 @@ function createMemoryPanel(context) {
     const panelEntry = { panel, state };
     memoryPanels.push(panelEntry);
     panel.webview.html = memoryPanelHtml();
-    return panel;
+    // Render restored entries (and evaluate them if a session is live).
+    const session = vscode.debug.activeDebugSession;
+    if (state.entries.length && session && session.type === 'oric-debug') {
+        Promise.all(state.entries.map((_, i) => evaluateOne(session, state, i))).then(() => postResults(panel, state));
+    } else {
+        postResults(panel, state);
+    }
 }
 
 async function evaluateOne(session, state, index) {
@@ -482,6 +516,9 @@ body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(
 .entry-hdr { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px; gap: 6px; }
 .entry-hdr .left { display: flex; align-items: center; gap: 4px; flex-shrink: 1; min-width: 0; }
 .entry-hdr .expr { color: var(--vscode-debugTokenExpression-name, #9cdcfe); font-weight: bold; white-space: nowrap; }
+.expr-input { background: transparent; color: var(--vscode-debugTokenExpression-name, #9cdcfe); font-weight: bold; font-family: inherit; font-size: inherit; border: 1px solid transparent; border-radius: 3px; padding: 1px 4px; min-width: 60px; max-width: 320px; }
+.expr-input:hover { border-color: var(--vscode-input-border, #444); }
+.expr-input:focus { outline: none; border-color: var(--vscode-focusBorder); background: var(--vscode-input-background); color: var(--vscode-input-foreground); }
 .entry-hdr .addr { color: var(--vscode-debugTokenExpression-number, #b5cea8); white-space: nowrap; }
 .entry-hdr .controls { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 .rows-input { width: 38px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #444); padding: 1px 3px; font-family: inherit; font-size: 0.9em; text-align: center; }
@@ -583,6 +620,9 @@ function formatDump(address, hexData, rows, format) {
 }
 
 function renderResults(results) {
+    // Persist the entry list so the panel's expressions survive a window reload
+    // (the WebviewPanelSerializer receives this state).
+    vscode.setState({ entries: (results || []).map(r => ({ expression: r.expression, rows: r.rows, format: r.format })) });
     if (!results || results.length === 0) {
         entriesDiv.innerHTML = '<div class="empty">Add an expression to view memory</div>';
         return;
@@ -601,7 +641,7 @@ function renderResults(results) {
 
         html += '<div class="entry">';
         html += '<div class="entry-hdr">';
-        html += '<span class="left"><span class="expr">' + escapeHtml(r.expression) + '</span><span class="addr">' + addrStr + '</span></span>';
+        html += '<span class="left"><input class="expr-input" data-idx="' + i + '" data-orig="' + escapeHtml(r.expression) + '" value="' + escapeHtml(r.expression) + '" spellcheck="false" title="Edit expression, Enter to apply (e.g. messagePtr \\u2192 *messagePtr)"><span class="addr">' + addrStr + '</span></span>';
         html += '<span class="controls">';
         html += '<input type="number" class="rows-input" data-idx="' + i + '" value="' + r.rows + '" min="1" max="128" title="Number of rows">';
         html += '<span class="rows-label">rows</span>';
@@ -631,6 +671,21 @@ function renderResults(results) {
         el.addEventListener('change', () => {
             vscode.postMessage({ type: 'configure', index: parseInt(el.dataset.idx), rows: parseInt(el.value) || 8 });
         });
+    });
+    // Edit an entry's expression in place (Enter or blur applies + re-evaluates).
+    document.querySelectorAll('.expr-input').forEach(el => {
+        const commit = () => {
+            const v = el.value.trim();
+            if (v && v !== el.dataset.orig) {
+                el.dataset.orig = v;
+                vscode.postMessage({ type: 'edit', index: parseInt(el.dataset.idx), expression: v });
+            }
+        };
+        el.addEventListener('keydown', e => {
+            if (e.key === 'Enter') { e.preventDefault(); el.blur(); }
+            else if (e.key === 'Escape') { el.value = el.dataset.orig; el.blur(); }
+        });
+        el.addEventListener('blur', commit);
     });
 }
 
@@ -3819,6 +3874,12 @@ function activate(context) {
             panel.webview.html = heatmapPanelHtml();
             panel.onDidDispose(() => { heatmapPanel = null; vizUnregisterConsumer(heatmapConsumer); });
             vizRegisterConsumer(heatmapConsumer);
+        }
+    });
+    vscode.window.registerWebviewPanelSerializer('oricMemory', {
+        async deserializeWebviewPanel(panel, state) {
+            panel.webview.options = { enableScripts: true, retainContextWhenHidden: true };
+            wireMemoryPanel(panel, state && state.entries);   // restores the saved expressions
         }
     });
     vscode.window.registerWebviewPanelSerializer('oricScreenView', {
