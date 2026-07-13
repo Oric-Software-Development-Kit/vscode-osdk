@@ -2688,6 +2688,7 @@ function refreshSymbolsPanel(session) {
             const newKeys = new Set();
             for (const s of resp.symbols) {
                 const entry = { addr: s.addr, size: s.size, value: s.value, group: s.group,
+                                display: s.display,
                                 source: s.source, aliases: s.aliases, nameSources: s.nameSources };
                 symbolCache.set(s.name, entry);
                 newKeys.add(s.name);
@@ -3099,7 +3100,7 @@ table {
 col.col-name  { width: auto; }
 col.col-addr  { width: 60px; }
 col.col-size  { width: 38px; }
-col.col-value { width: 120px; }
+col.col-value { width: 170px; }
 col.col-group { width: 44px; }
 th {
     position: sticky; top: 33px; z-index: 5;
@@ -3123,7 +3124,7 @@ tr:nth-child(even) td {
 .alias { color: var(--vscode-descriptionForeground, #888); font-size: 0.9em; }
 .addr { color: var(--vscode-descriptionForeground, #888); }
 .sz   { color: var(--vscode-descriptionForeground, #888); }
-.val  { color: var(--vscode-debugTokenExpression-number, #b5cea8); }
+.val  { color: var(--vscode-debugTokenExpression-number, #b5cea8); overflow: hidden; text-overflow: ellipsis; }
 .val.mod { color: #e04040; }
 .grp  { color: var(--vscode-descriptionForeground, #888); font-size: 0.9em; }
 .dim  { color: var(--vscode-descriptionForeground, #888); padding: 16px 8px; }
@@ -3188,6 +3189,8 @@ function h(v, w) { return '$' + v.toString(16).toUpperCase().padStart(w, '0'); }
 
 function fmtValue(sym) {
     if (sym.defineValue !== undefined) return sym.defineValue;
+    // Annotated value pre-rendered by the adapter (same path as Watch) — @bcd/@enum/etc.
+    if (sym.display) return sym.display;
     if (sym.typeInfo) return sym.typeInfo.type;
     const v = sym.value;
     if (!v || v.length === 0) return '?';
@@ -3277,7 +3280,7 @@ function render() {
             + '<td class="name">' + nameHtml + '</td>'
             + '<td class="addr">' + (s.addr >= 0 ? h(s.addr, 4) : '\u2014') + '</td>'
             + '<td class="sz">' + (s.size > 0 ? s.size : '\u2014') + '</td>'
-            + '<td class="val' + mod + '"' + (s.defineComment ? ' title="' + s.defineComment.replace(/"/g, '&quot;') + '"' : '') + '>' + fmtValue(s) + '</td>'
+            + '<td class="val' + mod + '" title="' + (s.defineComment || fmtValue(s)).replace(/"/g, '&quot;') + '">' + fmtValue(s) + '</td>'
             + '<td class="grp">' + groupLabel(s.group) + '</td>'
             + '</tr>';
     }
