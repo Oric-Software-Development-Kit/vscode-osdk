@@ -73,6 +73,25 @@ function plausible(base, addr) {
   return off <= NEAR_SPAN;
 }
 
+// Smallest value in sorted `arr` strictly greater than `val` (or -1).
+function nextAddr(arr, val) {
+  let lo = 0, hi = arr.length - 1, best = -1;
+  while (lo <= hi) { const mid = (lo + hi) >> 1; if (arr[mid] > val) { best = arr[mid]; hi = mid - 1; } else lo = mid + 1; }
+  return best;
+}
+
+// Does the symbol at `sa` own `addr`? The distance gate (NEAR_SPAN) exists to stop a DATA
+// symbol from being attributed to a far address. CODE is different: a PC is always inside some
+// function, that function has a definite start, and C functions can be large (>1KB) — so a code
+// owner has NO distance cap; the enclosing function owns everything up to the next symbol.
+// ZP/stack keeps the same-page rule regardless.
+function symOwns(symAddrs, sa, addr, isCode) {
+  if (addr < sa) return false;
+  if (sa < 0x0400) return (sa >> 8) === (addr >> 8);   // ZP/stack: same page only
+  if (isCode) { const nxt = nextAddr(symAddrs, sa); return nxt < 0 || addr < nxt; }
+  return (addr - sa) <= NEAR_SPAN;                      // data: keep the distance gate
+}
+
 function buildResolver(text, opts) {
   opts = opts || {};
   const readSourceLine = opts.readSourceLine || (() => null);
@@ -301,9 +320,15 @@ function buildResolver(text, opts) {
       // Source: winning exact line here (finding #1a: don't discard it), else nearest below.
       if (linesHere.length) srcLine = winningLineNoOwner(linesHere, v);
       else { const la = floorAddr(v.lineAddrs, addr); if (la >= 0 && plausible(la, addr)) srcLine = winningLineNoOwner(v.linesByAddr.get(la), v); }
-      // Name: nearest symbol below, gated by plausibility (finding #1b, §5.7).
+      // Name: nearest symbol below (finding #1b, §5.7). If the PC is in code, the enclosing
+      // function owns it with no distance cap; the NEAR_SPAN gate only applies to data owners.
+      // "In code" = an asm mnemonic line OR any C source line: a C statement isn't a 6502
+      // mnemonic and C emits many instructions per line (so #LINES entries are >3 bytes apart),
+      // meaning neither classifyLine nor the Δ≤3 run test recognizes it — but a #LINES entry
+      // into a C file at a PC IS compiled code.
       const sa = floorAddr(v.symAddrs, addr);
-      if (sa >= 0 && plausible(sa, addr)) owner = pickSym(v.symsByAddr.get(sa), srcLine);
+      const inCode = !!srcLine && (lineKind(srcLine, v) === 'code' || /\.[ch]$/i.test(srcLine.file || ''));
+      if (sa >= 0 && symOwns(v.symAddrs, sa, addr, inCode)) owner = pickSym(v.symsByAddr.get(sa), srcLine);
     }
 
     if (!owner && !srcLine) return rec; // truly unknown
