@@ -13,6 +13,29 @@ const fs = require('fs');
 const path = require('path');
 const child_process = require('child_process');
 
+// Staleness self-check: capture this adapter file's mtime at process start (the
+// version node actually compiled). If the file on disk later becomes newer, the
+// running code is stale — you edited debug_adapter.js but this session is still
+// running the old process. warnIfStale() surfaces that (a fresh session respawns
+// node and reloads the file, so restarting the debug session is the fix).
+let ADAPTER_LOADED_MTIME = 0;
+try { ADAPTER_LOADED_MTIME = fs.statSync(__filename).mtimeMs; } catch (_) { /* ignore */ }
+let staleWarned = false;
+function warnIfStale() {
+    if (staleWarned) return;
+    try {
+        const cur = fs.statSync(__filename).mtimeMs;
+        if (cur > ADAPTER_LOADED_MTIME) {
+            staleWarned = true;
+            log('⚠️  STALE ADAPTER: debug_adapter.js on disk (' +
+                new Date(cur).toISOString().replace('T', ' ').slice(0, 19) +
+                ') is NEWER than the running process (loaded ' +
+                new Date(ADAPTER_LOADED_MTIME).toISOString().replace('T', ' ').slice(0, 19) +
+                '). Your edits are NOT active — stop and restart the debug session (Shift+F5 then F5).');
+        }
+    } catch (_) { /* ignore */ }
+}
+
 // Canonical key for comparing filesystem paths. Resolve to absolute (normalizes
 // separators for the host OS) and fold case ONLY on case-insensitive filesystems
 // (Windows, macOS) — on Linux, case is significant, so leaving it restricts the
@@ -96,6 +119,21 @@ const LOG_LEVEL_NAMES = ['Errors', 'Normal', 'Verbose'];
 function log(msg) {
     evt('output', { category: 'console', output: msg + '\n' });
 }
+
+// Report an error where it CANNOT be missed: the DAP 'important' category (VS Code
+// surfaces it prominently in the Debug Console) plus a stderr mirror (captured even
+// if the DAP channel is down). Never let an error fail silently. Returns nothing.
+function logError(context, err) {
+    const detail = err && err.stack ? err.stack : (err && err.message) || String(err);
+    const msg = '❌ ERROR [' + context + ']: ' + detail;
+    try { evt('output', { category: 'important', output: msg + '\n' }); } catch (_) { /* ignore */ }
+    try { process.stderr.write(msg + '\n'); } catch (_) { /* ignore */ }
+}
+
+// Last-resort nets: anything that escapes a try/catch still gets reported instead
+// of the adapter dying (or hanging) silently.
+process.on('uncaughtException',  e => logError('uncaughtException', e));
+process.on('unhandledRejection', e => logError('unhandledRejection', e));
 
 function logVerbose(msg) {
     if (logLevel >= 2) log(msg);
@@ -425,6 +463,20 @@ let typeDefs   = new Map();   // structName -> { size, fields: [{name, type, off
 let varTypes   = new Map();   // asmName -> { type: 'score_entry[24]', base: 'score_entry', count: 24|1, totalSize: 528 }
 let localDefs  = new Map();   // funcAsmName -> [{cname, base:'fp'|'ap', offset, type, baseType, count, size}]
 let enumDefs   = new Map();   // enumName -> { size, byValue: Map<number,string>, isFlags: bool }
+// Comment-based debug annotations (extension-only, byte-neutral). Parsed from
+// header (.h, "// @...") and assembler (.s, "; @...") source. Two association
+// levels: by C-struct field, and by symbol name (C globals & asm data labels).
+let annByField  = new Map();  // "structName.fieldName" -> { kind:'bool'|'enum'|'bitset', enumName? }
+let annBySymbol = new Map();  // symbolName (no leading _) -> { kind, enumName? }
+// Union of every module's enum defs. Annotation resolution (@enum/@bitset) must
+// work regardless of which module is active (the enum defs are identical across
+// modules), including when no module is active yet (resident-only at boot).
+let allEnumDefs = new Map();
+function resolveEnum(name) { return enumDefs.get(name) || allEnumDefs.get(name); }
+// Annotation lookup for a symbol (C global or asm label), tolerant of the leading
+// underscore the C compiler / assembler add. One place so every view resolves the
+// same way.
+function annForSymbol(name) { return name ? annBySymbol.get(name.replace(/^_+/, '')) : undefined; }
 let varRefs    = new Map();   // variablesReference id -> { addr, typeName, count, offset? }
 let nextVarRef = 100;         // next available variablesReference id (1-5 reserved for scopes)
 let displayHex = true;        // true = hex primary, false = decimal primary
@@ -858,11 +910,23 @@ function loadSymbols(file) {
         });
         applyActiveModule(defaultId);
 
+        // Parse comment-based debug annotations (@bool/@enum/@bitset) from all
+        // header (.h) and assembler (.s) source files referenced by the build.
+        parseAnnotations(moduleAllFiles);
+
+        // Union of every module's enum defs, so annotation resolution (@enum/@bitset)
+        // works regardless of which module is active — including resident-only at boot.
+        allEnumDefs.clear();
+        for (const [k, v] of enumDefs) allEnumDefs.set(k, v);
+        for (const b of moduleBuckets.values())
+            for (const [k, v] of b.enumDefs) if (!allEnumDefs.has(k)) allEnumDefs.set(k, v);
+
         const modNote = moduleNames.size > 0
             ? (' [' + moduleNames.size + ' modules, active=' + (activeModuleId !== null ? moduleNames.get(activeModuleId) : '(none)') + ']') : '';
         log('Loaded ' + symbols.size + ' symbols, ' + lineTable.length + ' line entries, ' +
             typeDefs.size + ' types, ' + varTypes.size + ' typed vars, ' +
-            localDefs.size + ' funcs with locals from ' + file + modNote);
+            localDefs.size + ' funcs with locals, ' +
+            annBySymbol.size + ' annot-symbols, ' + annByField.size + ' annot-fields from ' + file + modNote);
     } catch (e) {
         log('Could not load symbols: ' + e.message);
     }
@@ -1448,7 +1512,7 @@ function formatEnum(def, mem, offset, size) {
 
 // Format a scalar value from raw bytes for display
 function formatScalar(typeName, mem, offset, size) {
-    const ed = enumDefs.get(typeName);   // case-sensitive: enum tags before lowercasing
+    const ed = resolveEnum(typeName);   // case-sensitive: enum tags before lowercasing
     if (ed) return formatEnum(ed, mem, offset, size);
     const t = typeName.toLowerCase();
     const isSigned = (t === 'char' || t === 'schar' || t === 'int' || t === 'short' || t === 'sint' || t === 'sshort');
@@ -1505,13 +1569,124 @@ function formatStructPreview(def, mem, offset) {
     return parts.length > 0 ? '{' + parts.join(', ') + '}' : '{...}';
 }
 
-// Build one DAP variable entry for a typed value living at `addr`. One place so the
-// Globals scope, the Locals scope, and struct-field expansion all behave identically
-// (DRY). Handles scalars, structs, arrays, and pointer-to-struct: a pointer shows its
-// target address and, when it points at a known struct, expands by dereferencing.
-async function buildTypedVar(name, addr, fullType, size) {
+// Number of bytes a bitset over `ed` spans (highest enumerator value determines it).
+function bitsetBytes(ed) {
+    let max = 0;
+    for (const k of ed.byValue.keys()) if (k > max) max = k;
+    return (max >> 3) + 1;
+}
+
+// Parse comment-based debug annotations from all source files (.h uses "// @...",
+// .s uses "; @..."). Rebuilds annByField (C struct members) and annBySymbol
+// (C globals & asm data labels). Directives: @bool, @enum <E>, @bitset <E>.
+function parseAnnotations(files) {
+  annByField.clear();
+  annBySymbol.clear();
+  try {
+    const ANN = /@(bool|enum|bitset)\b\s*(\w+)?/;   // matched within the comment portion
+    const seen = new Set();
+    for (const f of files) {
+        let key; try { key = canonPath(f); } catch (e) { key = String(f); }
+        if (seen.has(key)) continue;
+        seen.add(key);
+        let lines;
+        try { lines = fs.readFileSync(f, 'utf8').split(/\r?\n/); }
+        catch (e) { continue; }
+        const isAsm = /\.(s|asm)$/i.test(f);
+        let inStruct = false, structName = null, pending = [];
+        for (const line of lines) {
+            // Enter a C struct/union body (name may be trailing on the '}' line).
+            if (!isAsm && !inStruct && /\b(typedef\s+)?(struct|union)\b/.test(line)
+                && !/;/.test(line.replace(/\/\/.*$/, ''))) {
+                inStruct = true; pending = [];
+                const nm = line.match(/(?:struct|union)\s+([A-Za-z_]\w*)\s*\{/);
+                structName = nm ? nm[1] : null;
+            }
+            // Split code from comment. C comment = "//"; asm also allows ";".
+            let ci = line.indexOf('//');
+            if (isAsm) {
+                const s = line.indexOf(';');
+                if (s >= 0 && (ci < 0 || s < ci)) ci = s;
+            }
+            const code = ci >= 0 ? line.slice(0, ci) : line;
+            const comment = ci >= 0 ? line.slice(ci) : '';
+            const m = comment.match(ANN);
+            if (m) {
+                const directive = { kind: m[1], enumName: m[2] || null };
+                let name = null;
+                if (isAsm) {
+                    const t = code.match(/^\s*([A-Za-z_.][\w.]*)/);
+                    name = t ? t[1] : null;
+                } else {
+                    const c = code.replace(/[=;].*$/, '').replace(/\[.*$/, '');
+                    const ids = c.match(/[A-Za-z_]\w*/g);
+                    name = ids ? ids[ids.length - 1] : null;
+                }
+                if (name) {
+                    if (!isAsm && inStruct) pending.push({ field: name, directive });
+                    else annBySymbol.set(name.replace(/^_+/, ''), directive);
+                }
+            }
+            // Close a C struct: flush buffered field annotations under its name.
+            if (!isAsm && inStruct && /\}/.test(line)) {
+                const nm = line.match(/\}\s*([A-Za-z_]\w*)\s*;/);
+                if (nm) structName = nm[1];
+                if (structName) for (const p of pending) annByField.set(structName + '.' + p.field, p.directive);
+                inStruct = false; structName = null; pending = [];
+            }
+        }
+    }
+  } catch (e) {
+    logError('parseAnnotations', e);
+  }
+}
+
+// Render a value using a comment annotation (@bool/@enum/@bitset). Returns
+// { value, ref? } or null. bitset returns an expandable ref (children = set bits).
+async function formatAnnotated(ann, addr, size) {
+    if (ann.kind === 'bool') {
+        const v = (await readMem(addr, 1))[0] || 0;
+        return { value: (v ? 'true' : 'false') + '  ($' + v.toString(16).toUpperCase().padStart(2, '0') + '|' + v + ')' };
+    }
+    if (ann.kind === 'enum') {
+        const ed = resolveEnum(ann.enumName);
+        const sz = size || 1;
+        const mem = await readMem(addr, sz);
+        return { value: ed ? formatEnum(ed, mem, 0, sz) : formatScalar('uchar', mem, 0, sz) };
+    }
+    if (ann.kind === 'bitset') {
+        const ed = resolveEnum(ann.enumName);
+        const sz = size || (ed ? bitsetBytes(ed) : 1);
+        const mem = await readMem(addr, sz);
+        let count = 0;
+        for (let p = 0; p < sz * 8; p++) if (mem[p >> 3] & (1 << (p & 7))) count++;
+        const ref = nextVarRef++;
+        varRefs.set(ref, { kind: 'bitset', addr: addr & 0xFFFF, size: sz, enumName: ann.enumName });
+        return { value: '{' + count + ' set}', ref };
+    }
+    return null;
+}
+
+// ============================================================================
+// THE single render path for "a named value at an address". EVERY view MUST go
+// through here — Globals, Locals, Zero-page, Watch/evaluate, struct-field and
+// array-element expansion, and any future scope ("auto", etc.). Do NOT format a
+// variable's value inline in a handler: that path drift is what silently broke
+// annotations in the Watch window. Handles scalars, enums, structs, arrays,
+// pointer-to-struct, and comment annotations (@bool/@enum/@bitset via `ann`).
+// Look up `ann` with annForSymbol(name) for symbols or annByField for fields;
+// resolve enums with resolveEnum() so it works regardless of the active module.
+// (Registers/Flags are CPU state, not memory-typed values — they legitimately
+// render separately.) See CORE-CONCEPTS.md → "One render path".
+// ============================================================================
+async function buildTypedVar(name, addr, fullType, size, ann) {
     addr &= 0xFFFF;
     const hAddr = '$' + addr.toString(16).toUpperCase().padStart(4, '0');
+    // Comment annotation (@bool/@enum/@bitset) overrides the default rendering.
+    if (ann) {
+        const a = await formatAnnotated(ann, addr, size);
+        if (a) return { name, value: a.value + '  @ ' + hAddr, variablesReference: a.ref || 0 };
+    }
     // Pointer (`*T`): value is the pointed-to address; expandable to that struct.
     if (fullType[0] === '*') {
         const pointed = fullType.slice(1);
@@ -2323,6 +2498,7 @@ const handlers = {
     // -- Scopes / Variables ---------------------------------------
 
     scopes(req) {
+        warnIfStale();
         const scopes = [
             { name: 'Registers', variablesReference: 1, expensive: false },
             { name: 'Flags',     variablesReference: 2, expensive: false },
@@ -2370,30 +2546,39 @@ const handlers = {
                 { name: 'C (Carry)',     value: (f & 0x01) ? '1' : '0', variablesReference: 0 }
             ]});
         } else if (ref === 3) {
-            // Zero page variables — read all 256 bytes, map symbols to values
+            // Zero page variables — same render path as every other view (annotations,
+            // enum types, etc. all apply), just with a zero-page-address-prefixed label.
             if (zpSymbols.length === 0) { respond(req, { variables: [] }); return; }
-            const zpReply = await gdbCmd('m0,100');
-            if (!zpReply || zpReply[0] === 'E') { respond(req, { variables: [] }); return; }
-            const zp = [];
-            for (let i = 0; i < zpReply.length && i < 512; i += 2)
-                zp.push(parseInt(zpReply.substring(i, i + 2), 16));
             const vars = [];
             for (const s of zpSymbols) {
                 const a = s.addr;
-                if (a >= zp.length) continue;
+                const sz = s.size >= 2 ? 2 : 1;
                 const hAddr = '$' + a.toString(16).toUpperCase().padStart(2, '0');
-                const sz = (s.size >= 2 && a + 1 < zp.length) ? 2 : 1;
-                const val = formatScalar('uint', zp, a, sz);
-                vars.push({ name: hAddr + ' ' + s.name, value: val, variablesReference: 0 });
+                const v = await buildTypedVar(s.name, a, sz === 2 ? 'uint' : 'uchar', sz, annForSymbol(s.name));
+                v.name = hAddr + ' ' + s.name;
+                vars.push(v);
             }
             respond(req, { variables: vars });
         } else if (ref === 4) {
             // Globals — typed variables from #TYPES section
             const vars = [];
+            const shown = new Set();
             for (const [asmName, vt] of varTypes) {
                 const addr = symbols.get(asmName);
                 if (typeof addr !== 'number') continue;
-                vars.push(await buildTypedVar(asmName, addr, vt.type, vt.totalSize));
+                shown.add(asmName);
+                vars.push(await buildTypedVar(asmName, addr, vt.type, vt.totalSize, annForSymbol(asmName)));
+            }
+            // Annotated symbols with no .ctype var (e.g. assembler .dsb globals):
+            // surface them so a "; @bitset achievement" on an asm label shows too.
+            for (const [cName, ann] of annBySymbol) {
+                let asmName = '_' + cName, addr = symbols.get(asmName);
+                if (typeof addr !== 'number') { asmName = cName; addr = symbols.get(asmName); }
+                if (typeof addr !== 'number' || shown.has(asmName)) continue;
+                shown.add(asmName);
+                let size = 1;
+                if (ann.kind === 'bitset') { const ed = resolveEnum(ann.enumName); size = ed ? bitsetBytes(ed) : 1; }
+                vars.push(await buildTypedVar(asmName, addr, 'uchar', size, ann));
             }
             respond(req, { variables: vars });
         } else if (ref === 5) {
@@ -2418,14 +2603,28 @@ const handlers = {
                     for (const loc of locals) {
                         const baseVal = loc.base === 'ap' ? apVal : fpVal;
                         const addr = (baseVal + loc.offset) & 0xFFFF;
-                        vars.push(await buildTypedVar(loc.cname, addr, loc.type, loc.size));
+                        vars.push(await buildTypedVar(loc.cname, addr, loc.type, loc.size, annForSymbol(loc.cname)));
                     }
                 }
             }
             respond(req, { variables: vars });
         } else if (varRefs.has(ref)) {
-            // Expand a typed variable (struct fields or array elements)
+            // Expand a typed variable (struct fields, array elements, or a bitset)
             const info = varRefs.get(ref);
+            // @bitset expansion: one child per set bit, named by the enum member.
+            if (info.kind === 'bitset') {
+                const ed = resolveEnum(info.enumName);
+                const mem = await readMem(info.addr, info.size);
+                const vars = [];
+                for (let p = 0; p < info.size * 8; p++) {
+                    if (mem[p >> 3] & (1 << (p & 7))) {
+                        const nm = (ed && ed.byValue.get(p)) || ('bit ' + p);
+                        vars.push({ name: nm, value: 'set  (bit ' + p + ')', variablesReference: 0 });
+                    }
+                }
+                if (vars.length === 0) vars.push({ name: '(none set)', value: '', variablesReference: 0 });
+                respond(req, { variables: vars }); return;
+            }
             const def = typeDefs.get(info.typeName);
             const vars = [];
 
@@ -2470,7 +2669,8 @@ const handlers = {
                 // array, pointer-to-struct, and scalar fields uniformly.
                 for (const f of def.fields) {
                     const fieldAddr = (info.addr + (info.offset || 0) + f.offset) & 0xFFFF;
-                    vars.push(await buildTypedVar(f.name, fieldAddr, f.type, f.size));
+                    const ann = annByField.get(info.typeName + '.' + f.name);
+                    vars.push(await buildTypedVar(f.name, fieldAddr, f.type, f.size, ann));
                 }
             } else {
                 respond(req, { variables: [] }); return;
@@ -3140,34 +3340,22 @@ const handlers = {
             a = symbols.get(symName);
         }
         if (a !== undefined) {
+            // Watch/hover render goes through the SAME path as every scope view
+            // (buildTypedVar) so annotations, enum types, structs, arrays and
+            // pointers all behave identically. Pick type/size from the .ctype var
+            // if present, else the annotation, else default to a 16-bit word.
+            const ann = annForSymbol(symName);
             const vt = varTypes.get(symName);
-            if (vt) {
-                const def = typeDefs.get(vt.base);
-                if (def || vt.count > 1) {
-                    const childRef = nextVarRef++;
-                    varRefs.set(childRef, { addr: a, typeName: vt.base, count: vt.count, totalSize: vt.totalSize });
-                    respond(req, {
-                        result: vt.type + '  @ $' + a.toString(16).toUpperCase().padStart(4, '0'),
-                        variablesReference: childRef
-                    });
-                } else {
-                    const mem = await readMem(a, vt.totalSize);
-                    respond(req, {
-                        result: formatScalar(vt.base, mem, 0, vt.totalSize) + '  ' + vt.type + '  @ $' + a.toString(16).toUpperCase().padStart(4, '0'),
-                        variablesReference: 0
-                    });
-                }
-            } else {
-                // No type info — read 1 or 2 bytes based on ZP vs RAM
-                const size = a <= 0xFF ? 2 : 2;
-                const mem = await readMem(a, size);
-                const w = mem[0] | (mem[1] << 8);
-                respond(req, {
-                    result: '$' + w.toString(16).toUpperCase().padStart(4, '0') + ' (' + w + ')  @ $' + a.toString(16).toUpperCase().padStart(4, '0'),
-                    variablesReference: 0,
-                    memoryReference: '0x' + a.toString(16)
-                });
-            }
+            let type, size;
+            if (vt) { type = vt.type; size = vt.totalSize; }
+            else if (ann) { type = 'uchar'; size = ann.kind === 'bitset' ? 0 : 1; }
+            else { type = 'uint'; size = 2; }
+            const v = await buildTypedVar(symName, a, type, size, ann);
+            respond(req, {
+                result: v.value,
+                variablesReference: v.variablesReference,
+                memoryReference: '0x' + a.toString(16)
+            });
             return;
         }
 
