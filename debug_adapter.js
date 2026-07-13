@@ -1475,19 +1475,6 @@ function fmtOp(mode, lo, hi, pc, symMap) {
 
 // Resolve address to source location — prefers line table (instruction-level),
 // falls back to symbol-based addrSource (label-level)
-// Check if a symbol at symAddr is a plausible source mapping for targetAddr.
-// Pages 0-3 ($0000-$03FF) are ZP/stack/page2/IO — a symbol there can never
-// be a valid reference for code outside that page.  For the rest of memory
-// ($0400+) allow up to 1KB offset within the same general region.
-function isPlausibleMapping(symAddr, targetAddr) {
-    const offset = targetAddr - symAddr;
-    if (offset < 0) return false;
-    // Symbol in pages 0-3: only valid if target is on the exact same page
-    if (symAddr < 0x0400) return (symAddr >> 8) === (targetAddr >> 8);
-    // Symbol in main/ROM memory: allow up to 1KB
-    return offset <= 1024;
-}
-
 // Lazy-load source file, return line string (1-based) or null.
 function getSourceLine(filePath, line) {
     if (!sourceLineCache[filePath]) {
@@ -1502,27 +1489,12 @@ function getSourceLine(filePath, line) {
     return null;
 }
 
+// Address -> source {file,line} through the single-source-of-truth resolver (owner-
+// reconciled nearest line; absolute paths). Returns null when no plausible line maps to
+// `addr`. One authority — no separate lineTable/addrSource walk (see SPEC §6).
 function sourceFor(addr) {
-    // Binary search the line table for largest address <= addr
-    if (lineTable.length > 0) {
-        let lo = 0, hi = lineTable.length - 1, best = -1;
-        while (lo <= hi) {
-            const mid = (lo + hi) >> 1;
-            if (lineTable[mid].addr <= addr) { best = mid; lo = mid + 1; }
-            else { hi = mid - 1; }
-        }
-        if (best >= 0 && isPlausibleMapping(lineTable[best].addr, addr))
-            return lineTable[best];
-    }
-    // Fall back to symbol-based source map
-    const exact = addrSource.get(addr);
-    if (exact) return exact;
-    let bestAddr = -1, bestSrc = null;
-    for (const [a, src] of addrSource) {
-        if (a <= addr && a > bestAddr) { bestAddr = a; bestSrc = src; }
-    }
-    if (bestSrc && !isPlausibleMapping(bestAddr, addr)) return null;
-    return bestSrc;
+    const r = resolverInstance ? resolverInstance.resolve(addr & 0xFFFF) : null;
+    return r && r.source ? { file: r.source.file, line: r.source.line } : null;
 }
 
 // Find the function containing `pc` by looking for the largest symbol address <= pc
@@ -1993,15 +1965,14 @@ async function armTurbo(addr) {
 }
 
 // Resolve address to nearest symbol label
+// Address -> display label through the single resolver: exact symbol name, else nearest
+// symbol "name+$off", else "$hhhh". One authority (no separate addrSym walk); the resolver's
+// owner rule keeps this consistent with the call stack / disassembly / annotations.
 function labelFor(addr) {
-    const exact = addrSym.get(addr);
-    if (exact) return exact;
-    let bestAddr = -1, bestName = null;
-    for (const [a, n] of addrSym) {
-        if (a <= addr && a > bestAddr) { bestAddr = a; bestName = n; }
-    }
-    if (bestName && isPlausibleMapping(bestAddr, addr))
-        return bestName + '+$' + (addr - bestAddr).toString(16).toUpperCase();
+    addr &= 0xFFFF;
+    const r = resolverInstance ? resolverInstance.resolve(addr) : null;
+    if (r && r.symbol)
+        return r.symbol.offset ? r.symbol.name + '+$' + r.symbol.offset.toString(16).toUpperCase() : r.symbol.name;
     return '$' + addr.toString(16).toUpperCase().padStart(4, '0');
 }
 
