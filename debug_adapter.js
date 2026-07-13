@@ -612,7 +612,17 @@ function applyActiveModule(id) {
 
     for (const b of order) {
         for (const [n, a] of b.symbols)    symbols.set(n, a);
-        for (const [a, n] of b.addrSym)    if (!addrSym.has(a)) addrSym.set(a, n);
+        for (const [a, n] of b.addrSym) {
+            // Same rule as the within-bucket parse: first definition wins, except a
+            // real-source symbol overrides an inherited one recorded from linked.s.
+            const bSrc = b.addrSource.get(a);
+            const prevSrc = addrSource.get(a);
+            const overrideArtifact = prevSrc && isBuildArtifact(prevSrc.file) && bSrc && !isBuildArtifact(bSrc.file);
+            if (!addrSym.has(a) || overrideArtifact) {
+                addrSym.set(a, n);
+                if (bSrc) addrSource.set(a, bSrc);
+            }
+        }
         for (const [a, s] of b.addrSource) if (!addrSource.has(a)) addrSource.set(a, s);
         for (const [n, s] of b.symSource)  symSource.set(n, s);
         for (const [k, v] of b.typeDefs)   typeDefs.set(k, v);
@@ -864,15 +874,27 @@ function loadSymbols(file) {
                 const a = parseInt(m[1], 16);
                 const n = m[2];
                 cur.symbols.set(n, a);
-                if (!cur.addrSym.has(a)) cur.addrSym.set(a, n);
+                let src = null;
                 if (isV2) {
                     const rest = line.substring(m[0].length).trim();
                     const cm = rest.match(/^(.+):(\d+)$/);
                     if (cm) {
-                        const src = { file: cm[1], line: parseInt(cm[2], 10) };
+                        src = { file: cm[1], line: parseInt(cm[2], 10) };
                         cur.symSource.set(n, src);
-                        if (!cur.addrSource.has(a)) cur.addrSource.set(a, src);
                     }
+                }
+                // addr->name: keep the first definition, but let a real-source symbol
+                // override one recorded from a build artifact (linked.s). Inherited
+                // symbols reach a module via the linked parent image, so a module's own
+                // (real-source) redefinition at the same address correctly shadows the
+                // inherited one. Keep addrSource in sync with the winning symbol.
+                const prevSrc = cur.addrSource.get(a);
+                const overrideArtifact = prevSrc && isBuildArtifact(prevSrc.file) && src && !isBuildArtifact(src.file);
+                if (!cur.addrSym.has(a) || overrideArtifact) {
+                    cur.addrSym.set(a, n);
+                    if (src) cur.addrSource.set(a, src);
+                } else if (src && !cur.addrSource.has(a)) {
+                    cur.addrSource.set(a, src);
                 }
             }
         }
