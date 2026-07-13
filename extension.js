@@ -3674,8 +3674,20 @@ function activate(context) {
                 return null;
             }
         }),
-        vscode.window.onDidChangeTextEditorSelection(() => {
+        vscode.window.onDidChangeTextEditorSelection(e => {
             restoreHeatmapPcHighlight();
+            // A genuine click or keyboard move in a source editor returns to statement
+            // stepping — even when that editor was already the active one (in which case
+            // onDidChangeActiveTextEditor never fires, which is why clicking a
+            // already-focused .c file previously failed to leave instruction mode).
+            // e.kind distinguishes a real user selection from the programmatic reveal
+            // VS Code performs when the debugger stops.
+            const K = vscode.TextEditorSelectionChangeKind;
+            if (e && (e.kind === K.Mouse || e.kind === K.Keyboard)
+                && e.textEditor && e.textEditor.document
+                && e.textEditor.document.uri.scheme === 'file') {
+                setInstrStepMode(false);
+            }
         })
     );
 
