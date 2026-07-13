@@ -1583,7 +1583,7 @@ function parseAnnotations(files) {
   annByField.clear();
   annBySymbol.clear();
   try {
-    const ANN = /@(bool|enum|bitset)\b\s*(\w+)?/;   // matched within the comment portion
+    const ANN = /@(bool|enum|bitset|ptr16)\b\s*(\w+)?/;   // matched within the comment portion
     const seen = new Set();
     for (const f of files) {
         let key; try { key = canonPath(f); } catch (e) { key = String(f); }
@@ -1641,9 +1641,26 @@ function parseAnnotations(files) {
   }
 }
 
-// Render a value using a comment annotation (@bool/@enum/@bitset). Returns
+// Shared @ptr16 value rendering: the 16-bit word at `baseAddr` and what it points
+// to right now (target symbol if known, else the byte there). Used by both the
+// Watch/scope views (formatAnnotated) and the disassembly operand annotator, so
+// the two stay in one format.
+async function ptr16Str(baseAddr) {
+    const w = await readMem(baseAddr & 0xFFFF, 2);
+    const word = w[0] | (w[1] << 8);
+    let s = '$' + word.toString(16).toUpperCase().padStart(4, '0');
+    const tgt = addrSym.get(word);
+    if (tgt) s += ' →' + tgt;
+    else { const b = await readMem(word, 1); s += ' →$' + (b[0] || 0).toString(16).toUpperCase().padStart(2, '0'); }
+    return s;
+}
+
+// Render a value using a comment annotation (@bool/@enum/@bitset/@ptr16). Returns
 // { value, ref? } or null. bitset returns an expandable ref (children = set bits).
 async function formatAnnotated(ann, addr, size) {
+    if (ann.kind === 'ptr16') {
+        return { value: await ptr16Str(addr) };
+    }
     if (ann.kind === 'bool') {
         const v = (await readMem(addr, 1))[0] || 0;
         return { value: (v ? 'true' : 'false') + '  ($' + v.toString(16).toUpperCase().padStart(2, '0') + '|' + v + ')' };
@@ -3797,8 +3814,10 @@ const handlers = {
             const s = sym(addr);
             return s ? s + '|' + hex : hex;
         };
-        // Byte value shown three ways: hex | decimal | binary (e.g. $63|99|%01100011)
-        const fmtVal = v => h2(v) + '|' + (v & 0xFF) + '|%' + (v & 0xFF).toString(2).padStart(8, '0');
+        // Byte value: reuse the shared scalar formatter so it matches every other view
+        // (hex | decimal | binary | 'char' glyph for printable bytes) instead of a
+        // parallel format that drifted (it was missing the ASCII glyph).
+        const fmtVal = v => formatScalar('uchar', [v & 0xFF], 0, 1);
 
         // Helper to read 1 byte from memory (uses readMem for dedup cache)
         async function readByte(addr) {
@@ -3811,6 +3830,22 @@ const handlers = {
             return m[0] | (m[1] << 8);
         }
 
+        // Source-aware @ptr16: a local alias equated to a zp scratch (e.g.
+        // "sourcePtr = tmp0  ; @ptr16") doesn't reach the symbol table and the same
+        // name is reused for different tmp's across functions -- so read the intent
+        // from the SOURCE line at this PC. If the operand names a @ptr16 alias, show
+        // the whole 16-bit word at its base for both +0 and +1 (not the single byte).
+        let ptrHint = null;
+        {
+            const s = sourceFor(pc);   // PC -> source line via lineTable (works for any instruction, not just symbol addresses)
+            const srcLine = s ? getSourceLine(s.file, s.line) : null;
+            const mo = srcLine && srcLine.match(/([A-Za-z_][\w.]*)\s*\+\s*(\d+)/);
+            if (mo) {
+                const ann = annBySymbol.get(mo[1].replace(/^_+/, ''));
+                if (ann && ann.kind === 'ptr16') ptrHint = { name: mo[1], off: parseInt(mo[2], 10) };
+            }
+        }
+
         let annotation = '';
         try {
             switch (mode) {
@@ -3819,6 +3854,15 @@ const handlers = {
                     break;
                 }
                 case 'z': { // zero page
+                    if (ptrHint) {
+                        const base = (lo - ptrHint.off) & 0xFF;
+                        const canon = sym(base);   // the underlying symbol (e.g. tmp0), if any
+                        // (alias | canonical symbol | address) — three notations for the
+                        // same location — then the 16-bit value and what it points to.
+                        const label = ptrHint.name + (canon && canon !== ptrHint.name ? '|' + canon : '') + '|' + h2(base);
+                        annotation = '(' + label + ')=' + await ptr16Str(base);
+                        break;
+                    }
                     const val = await readByte(lo);
                     annotation = '(' + symAddr(lo, false) + ')=' + fmtVal(val);
                     break;
