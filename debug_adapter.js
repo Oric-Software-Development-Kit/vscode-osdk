@@ -1666,7 +1666,17 @@ function parseAnnotations(files) {
   try {
     const ANN = /@(bool|enum|bitset|ptr16|bcd(?:-[bl]e)?)\b\s*(\w+)?/;   // matched within the comment portion
     const seen = new Set();
-    for (const f of files) {
+    // Struct-field annotations (@bool/@enum/@bitset/@bcd on C struct members) live in
+    // headers, but #FILES lists only compilation units (.c/.s) — no .h. Pull in sibling
+    // .h files from each source directory so header struct annotations are parsed too.
+    const allFiles = [...files];
+    const dirs = new Set();
+    for (const f of files) { try { dirs.add(path.dirname(f)); } catch (e) { /* skip */ } }
+    for (const d of dirs) {
+        let entries; try { entries = fs.readdirSync(d); } catch (e) { continue; }
+        for (const e of entries) if (/\.h$/i.test(e)) allFiles.push(path.join(d, e));
+    }
+    for (const f of allFiles) {
         let key; try { key = canonPath(f); } catch (e) { key = String(f); }
         if (seen.has(key)) continue;
         seen.add(key);
