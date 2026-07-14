@@ -1,0 +1,59 @@
+{
+  "comment": "Inverse-mapping (line->addr) cases, SPEC §5.6. Computed by an INDEPENDENT parse of the Nova symbol file (scratchpad explore_inverse.js) and hand-verified — NOT derived from resolver.cjs. Files are matched by basename inside the test.",
+  "cases": [
+    {
+      "name": "breakpoint intent at an aliased address: kernel.s:734 must bind to $FD40 (kernel data intent, spec §8)",
+      "fn": "addrForLine", "module": null,
+      "file": "kernel.s", "line": 734,
+      "expect": { "addr": "fd40", "line": 734 }
+    },
+    {
+      "name": "same address, other intent: loader.asm:150 also maps to $FD40",
+      "fn": "addrForLine", "module": null,
+      "file": "loader.asm", "line": 150,
+      "expect": { "addr": "fd40", "line": 150 }
+    },
+    {
+      "name": "snap FORWARD from a line before any code (kernel.s:1 -> first entry line 36)",
+      "fn": "addrForLine", "module": null,
+      "file": "kernel.s", "line": 1,
+      "expect": { "addr": "0002", "line": 36 }
+    },
+    {
+      "name": "end of file snaps BACKWARD to the nearest line before (kernel.s:99999 -> 734)",
+      "fn": "addrForLine", "module": null,
+      "file": "kernel.s", "line": 99999,
+      "expect": { "addr": "fd40", "line": 734 }
+    },
+    {
+      "name": "overlay file resolves in ITS module view (megabuilding:835, module 0)",
+      "fn": "addrForLine", "module": 0,
+      "file": "module_megabuilding.s", "line": 835,
+      "expect": { "addr": "2a79", "line": 835 }
+    },
+    {
+      "name": "overlay file is invisible in the resident-only view",
+      "fn": "addrForLine", "module": null,
+      "file": "module_megabuilding.s", "line": 835,
+      "expect": null
+    },
+    {
+      "name": "unknown file yields null",
+      "fn": "addrForLine", "module": null,
+      "file": "no_such_file.s", "line": 10,
+      "expect": null
+    },
+    {
+      "name": "stepping: next different loader.asm line after pc=$FD40/line 150 is $FD43 (the run continues)",
+      "fn": "nextLineAddr", "module": null,
+      "pc": "fd40", "file": "loader.asm", "line": 150,
+      "expect": "fd43"
+    },
+    {
+      "name": "stepping past the file's last entry returns -1 (fall back to instruction step)",
+      "fn": "nextLineAddr", "module": null,
+      "pc": "fffe", "file": "loader.asm", "line": 544,
+      "expect": -1
+    }
+  ]
+}

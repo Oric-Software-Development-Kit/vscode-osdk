@@ -270,9 +270,9 @@ buildResolver(symbolFileText, {
 }) → {
   resolve(addr)            → { addr, symbol:{name,base,offset,aliases:[{name,source}]}|null,
                                source:{file,line}|null, kind, module },
-  addrForLine(file, line)  → addr | -1,
-  nextLineAddr(file, line) → addr | -1,   // run-aware next executable line ≥ line
-  declOf(name)             → { file, line } | null,
+  addrForLine(file, line)      → { addr, line } | null,  // snapped line reported (skip-line needs it)
+  nextLineAddr(pc, file, line) → addr | -1,   // next DIFFERENT line of file strictly after pc (stepping)
+  declOf(name)             → { file, line } | null,   // (Step D, not yet implemented)
   setActiveModule(id),                     // recompose R + overlay; cheap (re-layer, not full reparse)
   aliasedAddresses()       → [addr…],      // for the disagreement log + golden test
 }

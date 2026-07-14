@@ -1888,25 +1888,12 @@ function nonArtifactSource(addr) {
     return null;
 }
 
-// Find the address of the next different source line in the line table.
-// lineTable is sorted by addr. Find entries for the same file with a
-// different line number whose addr > pc. Returns -1 if not found.
+// Address of the next different source line after `pc` (source-level
+// step-over's temp-bp target) — thin wrapper over the resolver's inverse
+// mapping (§5.6). Returns -1 when the file ends (caller falls back to
+// instruction stepping).
 function findNextSourceLineAddr(pc, file, line) {
-    // Binary search for first entry with addr > pc
-    let lo = 0, hi = lineTable.length - 1, startIdx = lineTable.length;
-    while (lo <= hi) {
-        const mid = (lo + hi) >> 1;
-        if (lineTable[mid].addr <= pc) { lo = mid + 1; }
-        else { startIdx = mid; hi = mid - 1; }
-    }
-    // Scan forward for the first entry with a different line in the same file
-    for (let i = startIdx; i < lineTable.length; i++) {
-        const e = lineTable[i];
-        if (e.file === file && e.line !== line) return e.addr;
-        // If we hit a different file, stop looking
-        if (e.file !== file) break;
-    }
-    return -1;
+    return resolverInstance ? resolverInstance.nextLineAddr(pc, file, line) : -1;
 }
 
 // Arm an execution breakpoint (Z0) in the stub, ref-counted so that N logical
@@ -1946,9 +1933,10 @@ function isBreakpointAt(addr) {
 // Snap a requested source line to the nearest executable line of `normFile`
 // (already canonPath'd) in a line table: the next entry at/after reqLine, else
 // the nearest before (end of file). Snapping backward first would collapse
-// distinct lines (the old "two at 489" bug). ONE implementation on purpose —
-// breakpoints, goto and turboRun must agree on where a source line lives, or a
-// jump and a breakpoint on the same line land at different addresses.
+// distinct lines (the old "two at 489" bug). Used ONLY by setBreakpoints,
+// which resolves per-module bucket tables (a shared file binds in each owning
+// overlay); every other consumer goes through the resolver's addrForLine —
+// SAME rule, keep the two in sync until Step F collapses them.
 function snapSrcLine(lt, normFile, reqLine) {
     let afterAddr = -1, afterLine = Infinity;
     let beforeAddr = -1, beforeLine = -1;
@@ -1960,11 +1948,11 @@ function snapSrcLine(lt, normFile, reqLine) {
     return afterAddr >= 0 ? { addr: afterAddr, line: afterLine } : { addr: beforeAddr, line: beforeLine };
 }
 
-// Resolve a source file+line to an address in the ACTIVE composed view.
-// (setBreakpoints resolves per-module instead — a shared file binds in each
-// owning overlay — so it calls snapSrcLine per bucket.)
+// Resolve a source file+line to an address in the ACTIVE composed view —
+// thin wrapper over the resolver's inverse mapping (§5.6).
 function resolveSrcLineAddr(file, reqLine) {
-    return snapSrcLine(lineTable, canonPath(file), reqLine).addr;
+    const r = resolverInstance ? resolverInstance.addrForLine(file, reqLine) : null;
+    return r ? r.addr : -1;
 }
 
 // Arm a Turbo Run: optional one-shot breakpoint at addr, then enable warp,
@@ -2916,13 +2904,13 @@ const handlers = {
             // Disassembly view: the source path IS the address ("0xABCD")
             addr = parseInt(srcPath, 16) & 0xFFFF;
         } else if (srcPath) {
-            // Real source file: file+line -> address via the same snapping
-            // breakpoints and turboRun use. The old code hex-parsed the PATH
-            // here, so "D:\..." became $000D and goto refused it. The snapped
-            // line is reported so callers (skip-line) can detect a backward snap.
-            const snap = snapSrcLine(lineTable, canonPath(srcPath), args.line || 0);
-            addr = snap.addr;
-            if (snap.line > 0 && snap.line !== Infinity) targetLine = snap.line;
+            // Real source file: file+line -> address via the resolver's inverse
+            // mapping (the same snapping rule breakpoints use). The old code
+            // hex-parsed the PATH here, so "D:\..." became $000D and goto
+            // refused it. The snapped line is reported so callers (skip-line)
+            // can detect a backward snap.
+            const snap = resolverInstance ? resolverInstance.addrForLine(srcPath, args.line || 0) : null;
+            if (snap) { addr = snap.addr; if (snap.line > 0) targetLine = snap.line; }
         } else if (args.line) {
             addr = args.line & 0xFFFF; // no path: some views encode the address in `line`
         }

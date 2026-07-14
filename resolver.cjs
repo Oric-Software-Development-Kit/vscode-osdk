@@ -370,10 +370,53 @@ function buildResolver(text, opts) {
     return best;
   }
 
+  // --- Inverse mapping (§5.6): line -> address ----------------------------
+
+  // file+line -> address in the ACTIVE view. Same snapping rule as breakpoint
+  // binding (adapter snapSrcLine — keep the two in sync until Step F collapses
+  // them): the next entry at/after reqLine in that file, else the nearest
+  // before (end of file); snapping backward first would collapse distinct
+  // lines. When the snapped line spans several addresses, the LOWEST one wins
+  // (the line's first instruction). Returns { addr, line } or null (no entries
+  // for that file in this view).
+  function addrForLine(file, reqLine) {
+    let afterAddr = -1, afterLine = Infinity, beforeAddr = -1, beforeLine = -1;
+    for (const l of lines) {
+      if (!inView(l.module, activeModule)) continue;
+      if (!samePathLoose(l.file, file)) continue;
+      if (l.line >= reqLine && (l.line < afterLine || (l.line === afterLine && l.addr < afterAddr)))
+        { afterLine = l.line; afterAddr = l.addr; }
+      if (l.line <= reqLine && (l.line > beforeLine || (l.line === beforeLine && l.addr < beforeAddr)))
+        { beforeLine = l.line; beforeAddr = l.addr; }
+    }
+    if (afterAddr >= 0) return { addr: afterAddr, line: afterLine };
+    if (beforeAddr >= 0) return { addr: beforeAddr, line: beforeLine };
+    return null;
+  }
+
+  // Stepping helper: address of the next DIFFERENT source line of `file`
+  // strictly after `pc` — the temp-breakpoint target for source-level
+  // step-over. Walks line addresses upward; stops (-1) at the first address
+  // with no entry for the file at all (left the function/file — the caller
+  // falls back to instruction stepping).
+  function nextLineAddr(pc, file, line) {
+    const v = view();
+    for (let a = nextAddr(v.lineAddrs, pc); a >= 0; a = nextAddr(v.lineAddrs, a)) {
+      let sawFile = false;
+      for (const l of v.linesByAddr.get(a)) {
+        if (!samePathLoose(l.file, file)) continue;
+        sawFile = true;
+        if (l.line !== line) return a;
+      }
+      if (!sawFile) return -1;
+    }
+    return -1;
+  }
+
   function setActiveModule(id) { activeModule = (id === undefined ? null : id); } // keep explicit: module 0 is falsy but valid
   function aliasedAddresses() { return view().aliased.slice(); } // already sorted ascending
 
-  return { resolve, setActiveModule, aliasedAddresses };
+  return { resolve, addrForLine, nextLineAddr, setActiveModule, aliasedAddresses };
 }
 
 module.exports = { buildResolver };
