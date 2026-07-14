@@ -386,23 +386,27 @@ function buildResolver(text, opts) {
   // agree by construction): the next entry at/after reqLine in that file, else
   // the nearest before (end of file); snapping backward first would collapse
   // distinct lines. When the snapped line spans several addresses, the LOWEST
-  // one wins (the line's first instruction). Returns { addr, line } or null.
-  // By default resolves in the ACTIVE composed view; pass `module` ('R' or an
-  // overlay id) to restrict to that module's own lines — breakpoint binding
-  // resolves a shared file in EACH owning overlay, whatever is active.
+  // one wins (the line's first instruction). Returns { addr, line, kind } or
+  // null. `kind` is the kind of THE SNAPPED LINE ITSELF — at an aliased address
+  // (the $FD40 case: kernel data and loader code share it) this preserves the
+  // REQUESTED file's intent, where resolve(addr).kind reports the canonical
+  // owner's. By default resolves in the ACTIVE composed view; pass `module`
+  // ('R' or an overlay id) to restrict to that module's own lines — breakpoint
+  // binding resolves a shared file in EACH owning overlay, whatever is active
+  // (kind is omitted there; run-membership is a per-view notion).
   function addrForLine(file, reqLine, module) {
-    let afterAddr = -1, afterLine = Infinity, beforeAddr = -1, beforeLine = -1;
+    let after = null, before = null;
     for (const l of lines) {
       if (module !== undefined ? l.module !== module : !inView(l.module, activeModule)) continue;
       if (!samePathLoose(l.file, file)) continue;
-      if (l.line >= reqLine && (l.line < afterLine || (l.line === afterLine && l.addr < afterAddr)))
-        { afterLine = l.line; afterAddr = l.addr; }
-      if (l.line <= reqLine && (l.line > beforeLine || (l.line === beforeLine && l.addr < beforeAddr)))
-        { beforeLine = l.line; beforeAddr = l.addr; }
+      if (l.line >= reqLine && (!after || l.line < after.line || (l.line === after.line && l.addr < after.addr))) after = l;
+      if (l.line <= reqLine && (!before || l.line > before.line || (l.line === before.line && l.addr < before.addr))) before = l;
     }
-    if (afterAddr >= 0) return { addr: afterAddr, line: afterLine };
-    if (beforeAddr >= 0) return { addr: beforeAddr, line: beforeLine };
-    return null;
+    const win = after || before;
+    if (!win) return null;
+    const rec = { addr: win.addr, line: win.line };
+    if (module === undefined) rec.kind = lineKind(win, view());
+    return rec;
   }
 
   // Stepping helper: address of the next DIFFERENT source line of `file`

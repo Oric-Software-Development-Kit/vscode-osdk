@@ -1918,24 +1918,16 @@ function isBreakpointAt(addr) {
     return false;
 }
 
-// Resolve a source file+line to an address in the ACTIVE composed view —
-// thin wrapper over the resolver's inverse mapping (§5.6). Breakpoint binding
-// passes the resolver's module restriction instead (see setBreakpoints).
-function resolveSrcLineAddr(file, reqLine) {
-    const r = resolverInstance ? resolverInstance.addrForLine(file, reqLine) : null;
-    return r ? r.addr : -1;
-}
-
-// Is the line mapped at `addr` executable code? Movement actions (run-to /
-// jump / turbo) on a DATA line are traps: the breakpoint never hits, or the
-// PC lands inside storage. C/H lines always count as code — a C statement is
-// not a 6502 mnemonic and C emits many instructions per line, so both the
-// source-text and run-delta classifiers misread them (same special case as
-// resolve()'s nearest-symbol gate).
-function executableLine(addr, file) {
-    if (!resolverInstance) return true; // no resolver: don't block
+// Is a snapped source line executable code? Movement actions (run-to / jump /
+// turbo) on a DATA line are traps: the breakpoint never hits, or the PC lands
+// inside storage. Judged from the SNAP's own kind — the requested file's
+// intent — NOT resolve(addr).kind: at an aliased address (the $FD40 case) the
+// canonical owner can be another unit's code while this file's line is data.
+// C/H lines always count as code — a C statement is not a 6502 mnemonic and C
+// emits many instructions per line, so both classifiers misread them.
+function executableSnap(snap, file) {
     if (/\.[ch]$/i.test(file || '')) return true;
-    return resolverInstance.resolve(addr & 0xFFFF).kind === 'code';
+    return !!snap && snap.kind === 'code';
 }
 
 // Arm a Turbo Run: optional one-shot breakpoint at addr, then enable warp,
@@ -2892,7 +2884,7 @@ const handlers = {
             const snap = resolverInstance ? resolverInstance.addrForLine(srcPath, args.line || 0) : null;
             // Refuse DATA lines (a .dsb/.byt with a #LINES entry): jumping the
             // PC into storage crashes; the empty target list reads as "no code".
-            if (snap && executableLine(snap.addr, srcPath)) { addr = snap.addr; if (snap.line > 0) targetLine = snap.line; }
+            if (snap && executableSnap(snap, srcPath)) { addr = snap.addr; if (snap.line > 0) targetLine = snap.line; }
         } else if (args.line) {
             addr = args.line & 0xFFFF; // no path: some views encode the address in `line`
         }
@@ -3670,8 +3662,9 @@ const handlers = {
         if (typeof a.addr === 'number') addr = a.addr & 0xffff;
         else if (a.symbol && symbols.has(a.symbol)) addr = symbols.get(a.symbol);
         else if (a.file && typeof a.line === 'number') {
-            addr = resolveSrcLineAddr(a.file, a.line);
-            if (addr >= 0 && !executableLine(addr, a.file)) {
+            const snap = resolverInstance ? resolverInstance.addrForLine(a.file, a.line) : null;
+            addr = snap ? snap.addr : -1;
+            if (snap && !executableSnap(snap, a.file)) {
                 respond(req, {}, false, 'Target line is data, not executable code'); return;
             }
         }
@@ -3705,7 +3698,7 @@ const handlers = {
         const snap = (resolverInstance && a.file && typeof a.line === 'number')
             ? resolverInstance.addrForLine(a.file, a.line) : null;
         if (!snap) { respond(req, { addr: -1, executable: false }); return; }
-        respond(req, { addr: snap.addr, line: snap.line, executable: executableLine(snap.addr, a.file) });
+        respond(req, { addr: snap.addr, line: snap.line, executable: executableSnap(snap, a.file) });
     },
 
     // -- Reset cycle counter (custom request) -------------------------

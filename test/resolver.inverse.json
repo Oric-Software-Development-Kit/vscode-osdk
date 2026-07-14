@@ -2,16 +2,16 @@
   "comment": "Inverse-mapping (line->addr) cases, SPEC §5.6. Computed by an INDEPENDENT parse of the Nova symbol file (scratchpad explore_inverse.js) and hand-verified — NOT derived from resolver.cjs. Files are matched by basename inside the test.",
   "cases": [
     {
-      "name": "breakpoint intent at an aliased address: kernel.s:734 must bind to $FD40 (kernel data intent, spec §8)",
+      "name": "breakpoint intent at an aliased address: kernel.s:734 must bind to $FD40 with the KERNEL file's kind (data — the button-annotator bug: resolve(addr).kind says code, the loader owns the address)",
       "fn": "addrForLine", "module": null,
       "file": "kernel.s", "line": 734,
-      "expect": { "addr": "fd40", "line": 734 }
+      "expect": { "addr": "fd40", "line": 734, "kind": "data" }
     },
     {
-      "name": "same address, other intent: loader.asm:150 also maps to $FD40",
+      "name": "same address, other intent: loader.asm:150 also maps to $FD40 and IS code there",
       "fn": "addrForLine", "module": null,
       "file": "loader.asm", "line": 150,
-      "expect": { "addr": "fd40", "line": 150 }
+      "expect": { "addr": "fd40", "line": 150, "kind": "code" }
     },
     {
       "name": "snap FORWARD from a line before any code (kernel.s:1 -> first entry line 36)",
