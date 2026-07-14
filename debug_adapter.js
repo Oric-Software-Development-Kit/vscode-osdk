@@ -1943,18 +1943,28 @@ function isBreakpointAt(addr) {
     return false;
 }
 
-// Resolve a source file+line to an address using the #LINES table.
-// Prefers the next executable line at/after reqLine, else the nearest before.
-function resolveSrcLineAddr(file, reqLine) {
-    const norm = canonPath(file);
+// Snap a requested source line to the nearest executable line of `normFile`
+// (already canonPath'd) in a line table: the next entry at/after reqLine, else
+// the nearest before (end of file). Snapping backward first would collapse
+// distinct lines (the old "two at 489" bug). ONE implementation on purpose —
+// breakpoints, goto and turboRun must agree on where a source line lives, or a
+// jump and a breakpoint on the same line land at different addresses.
+function snapSrcLine(lt, normFile, reqLine) {
     let afterAddr = -1, afterLine = Infinity;
     let beforeAddr = -1, beforeLine = -1;
-    for (const entry of lineTable) {
-        if (canonPath(entry.file) !== norm) continue;
+    for (const entry of lt) {
+        if (canonPath(entry.file) !== normFile) continue;
         if (entry.line >= reqLine && entry.line < afterLine) { afterLine = entry.line; afterAddr = entry.addr; }
         if (entry.line <= reqLine && entry.line > beforeLine) { beforeLine = entry.line; beforeAddr = entry.addr; }
     }
-    return afterAddr >= 0 ? afterAddr : beforeAddr;
+    return afterAddr >= 0 ? { addr: afterAddr, line: afterLine } : { addr: beforeAddr, line: beforeLine };
+}
+
+// Resolve a source file+line to an address in the ACTIVE composed view.
+// (setBreakpoints resolves per-module instead — a shared file binds in each
+// owning overlay — so it calls snapSrcLine per bucket.)
+function resolveSrcLineAddr(file, reqLine) {
+    return snapSrcLine(lineTable, canonPath(file), reqLine).addr;
 }
 
 // Arm a Turbo Run: optional one-shot breakpoint at addr, then enable warp,
@@ -2896,14 +2906,23 @@ const handlers = {
 
     gotoTargets(req) {
         const args = req.arguments;
-        // In disassembly view, the source path is like "0xABCD"
-        let addr = 0;
-        if (args.source && args.source.path) {
-            const parsed = parseInt(args.source.path, 16);
-            if (!isNaN(parsed)) addr = parsed & 0xFFFF;
+        let addr = -1, targetLine = 0;
+        const srcPath = args.source && args.source.path;
+        if (srcPath && /^0x[0-9A-Fa-f]+$/.test(srcPath.trim())) {
+            // Disassembly view: the source path IS the address ("0xABCD")
+            addr = parseInt(srcPath, 16) & 0xFFFF;
+        } else if (srcPath) {
+            // Real source file: file+line -> address via the same snapping
+            // breakpoints and turboRun use. The old code hex-parsed the PATH
+            // here, so "D:\..." became $000D and goto refused it. The snapped
+            // line is reported so callers (skip-line) can detect a backward snap.
+            const snap = snapSrcLine(lineTable, canonPath(srcPath), args.line || 0);
+            addr = snap.addr;
+            if (snap.line > 0 && snap.line !== Infinity) targetLine = snap.line;
+        } else if (args.line) {
+            addr = args.line & 0xFFFF; // no path: some views encode the address in `line`
         }
-        // Also try line as a fallback (some views encode address there)
-        if (addr === 0 && args.line) addr = args.line & 0xFFFF;
+        if (addr < 0) { respond(req, { targets: [] }); return; }
 
         const id = bpId++;  // unique target ID
         gotoTargetMap.set(id, addr);
@@ -2911,7 +2930,7 @@ const handlers = {
             targets: [{
                 id: id,
                 label: labelFor(addr),
-                line: 0,
+                line: targetLine,
                 column: 0,
                 instructionPointerReference: '0x' + addr.toString(16).padStart(4, '0')
             }]
@@ -3076,23 +3095,10 @@ const handlers = {
             for (const mod of owners) {
                 const bucket = moduleBuckets.get(mod) || moduleBuckets.get('R');
                 const lt = bucket ? bucket.lineTable : lineTable;
-                // Snap forward to the next executable line at/after reqLine (comment/
-                // blank lines have no code); fall back to the nearest before only at
-                // end of file. Snapping backward would collapse distinct lines (the
-                // old "two at 489" bug).
-                let bestAddr = -1, bestLine = -1, beforeAddr = -1, beforeLine = -1;
-                for (const entry of lt) {
-                    if (canonPath(entry.file) !== norm) continue;
-                    if (entry.line >= reqLine) {
-                        if (bestLine < 0 || entry.line < bestLine) { bestLine = entry.line; bestAddr = entry.addr; }
-                    } else if (entry.line > beforeLine) {
-                        beforeLine = entry.line; beforeAddr = entry.addr;
-                    }
-                }
-                if (bestAddr < 0) { bestAddr = beforeAddr; bestLine = beforeLine; }
-                if (bestAddr >= 0) {
-                    bindings.push({ addr: bestAddr, module: mod, armed: false });
-                    if (dispLine < 0 || mod === activeModuleId) dispLine = bestLine; // prefer the active module's snapped line
+                const snap = snapSrcLine(lt, norm, reqLine);
+                if (snap.addr >= 0) {
+                    bindings.push({ addr: snap.addr, module: mod, armed: false });
+                    if (dispLine < 0 || mod === activeModuleId) dispLine = snap.line; // prefer the active module's snapped line
                 }
             }
 
