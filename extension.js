@@ -2701,26 +2701,7 @@ function createSymbolsPanel(context) {
         { enableScripts: true, retainContextWhenHidden: true }
     );
     symbolsPanel.webview.html = symbolsPanelHtml();
-    symbolsPanel.onDidDispose(() => { symbolsPanel = null; });
-
-    // Handle messages from symbols webview
-    symbolsPanel.webview.onDidReceiveMessage(msg => {
-        if (msg.type === 'symbolHover' && typeof msg.addr === 'number') {
-            highlightHeatmapAddr(msg.addr);
-        } else if (msg.type === 'symbolLeave') {
-            restoreHeatmapPcHighlight();
-        } else if (msg.type === 'gotoSymbol' && msg.file && msg.line > 0) {
-            const uri = vscode.Uri.file(msg.file);
-            vscode.workspace.openTextDocument(uri).then(doc => {
-                vscode.window.showTextDocument(doc, { preview: true, viewColumn: vscode.ViewColumn.One }).then(editor => {
-                    const line = msg.line - 1;
-                    const range = new vscode.Range(line, 0, line, 0);
-                    editor.selection = new vscode.Selection(range.start, range.start);
-                    editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
-                });
-            }).catch(() => {});
-        }
-    });
+    setupSymbolsPanel(symbolsPanel);
 
     // Initial data fetch
     const session = vscode.debug.activeDebugSession;
@@ -2738,6 +2719,34 @@ function createSymbolsPanel(context) {
             symbolsPanel.webview.postMessage({ type: 'symbols', data: defines });
         }
     }
+}
+
+// Shared wiring for the symbols panel — fresh create AND serializer restore
+// (one setup path, the two used to drift): dispose tracking, webview messages,
+// and refresh-on-reveal. Data changed while the panel was hidden reaches only
+// the symbolCache; a panel becoming visible must refetch or it shows stale rows.
+function setupSymbolsPanel(panel) {
+    panel.onDidDispose(() => { symbolsPanel = null; });
+    panel.onDidChangeViewState(e => {
+        if (e.webviewPanel.visible) refreshSymbolsPanel(vscode.debug.activeDebugSession);
+    });
+    panel.webview.onDidReceiveMessage(msg => {
+        if (msg.type === 'symbolHover' && typeof msg.addr === 'number') {
+            highlightHeatmapAddr(msg.addr);
+        } else if (msg.type === 'symbolLeave') {
+            restoreHeatmapPcHighlight();
+        } else if (msg.type === 'gotoSymbol' && msg.file && msg.line > 0) {
+            const uri = vscode.Uri.file(msg.file);
+            vscode.workspace.openTextDocument(uri).then(doc => {
+                vscode.window.showTextDocument(doc, { preview: true, viewColumn: vscode.ViewColumn.One }).then(editor => {
+                    const line = msg.line - 1;
+                    const range = new vscode.Range(line, 0, line, 0);
+                    editor.selection = new vscode.Selection(range.start, range.start);
+                    editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+                });
+            }).catch(() => {});
+        }
+    });
 }
 
 function buildDefineEntries() {
@@ -4187,24 +4196,8 @@ function activate(context) {
             symbolsPanel = panel;
             panel.webview.options = { enableScripts: true, retainContextWhenHidden: true };
             panel.webview.html = symbolsPanelHtml();
-            panel.onDidDispose(() => { symbolsPanel = null; });
-            panel.webview.onDidReceiveMessage(msg => {
-                if (msg.type === 'symbolHover' && typeof msg.addr === 'number') {
-                    highlightHeatmapAddr(msg.addr);
-                } else if (msg.type === 'symbolLeave') {
-                    restoreHeatmapPcHighlight();
-                } else if (msg.type === 'gotoSymbol' && msg.file && msg.line > 0) {
-                    const uri = vscode.Uri.file(msg.file);
-                    vscode.workspace.openTextDocument(uri).then(doc => {
-                        vscode.window.showTextDocument(doc, { preview: true, viewColumn: vscode.ViewColumn.One }).then(editor => {
-                            const line = msg.line - 1;
-                            const range = new vscode.Range(line, 0, line, 0);
-                            editor.selection = new vscode.Selection(range.start, range.start);
-                            editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
-                        });
-                    }).catch(() => {});
-                }
-            });
+            setupSymbolsPanel(panel);
+            refreshSymbolsPanel(vscode.debug.activeDebugSession);
         }
     });
     vscode.window.registerWebviewPanelSerializer('oricDisassembly', {
@@ -4474,6 +4467,14 @@ function activate(context) {
                         if (msg.type === 'event' && msg.event === 'oricActiveModule' && msg.body) {
                             moduleStatusBar.text = '$(layers) Module: ' + msg.body.name;
                             moduleStatusBar.show();
+                        }
+                        // Symbols (re)loaded or module switched — the cached symbol
+                        // table is stale NOW, panel visible or not (the hover
+                        // provider reads it too). Clear and refetch; a hidden panel
+                        // repaints on reveal (setupSymbolsPanel's view-state hook).
+                        if (msg.type === 'event' && msg.event === 'oricSymbolsChanged') {
+                            symbolCache.clear();
+                            refreshSymbolsPanel(session);
                         }
                         // Log verbosity changed (initial config, status bar, or console) — reflect it
                         if (msg.type === 'event' && msg.event === 'oricLogLevel' && msg.body) {

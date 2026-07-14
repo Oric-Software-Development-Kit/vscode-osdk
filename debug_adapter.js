@@ -647,6 +647,10 @@ function makeSymBucket() {
 }
 
 // Compose resident + the given module id into the global symbol maps.
+// NOTE: callers that change the composed view at RUNTIME must follow up with
+// evt('oricSymbolsChanged', ...) so the host invalidates its symbol cache
+// (checkModuleSwitch and the setActiveModule request do; the initial
+// loadSymbols call emits once after annotations are parsed).
 function applyActiveModule(id) {
     symbols.clear(); addrSym.clear(); addrSource.clear(); symSource.clear();
     typeDefs.clear(); varTypes.clear(); localDefs.clear(); enumDefs.clear();
@@ -771,6 +775,7 @@ async function checkModuleSwitch(force) {
         await rearmModuleBreakpoints();
         log('Active module -> ' + moduleNames.get(val) + ' (id ' + val + ')');
         evt('oricActiveModule', { id: val, name: moduleNames.get(val) });
+        evt('oricSymbolsChanged', { reason: 'module-switch', module: val });
         moduleReported = true;
     } else if (!moduleReported) {
         // First stop of the session: no switch fired, but the UI has never been
@@ -1020,6 +1025,11 @@ function loadSymbols(file) {
         // available — the applyActiveModule() above ran before parseAnnotations, so its
         // symInfo had no annotation widths (bcd/bitset) to size symbols with.
         buildSymInfo();
+
+        // Tell the host its symbol cache is stale (spec §6 / Step E) — this is the
+        // authoritative "symbols loaded" moment (post-annotations). Runtime module
+        // switches emit the same event from their own paths.
+        evt('oricSymbolsChanged', { reason: 'load', module: activeModuleId });
 
         const modNote = moduleNames.size > 0
             ? (' [' + moduleNames.size + ' modules, active=' + (activeModuleId !== null ? moduleNames.get(activeModuleId) : '(none)') + ']') : '';
@@ -3685,6 +3695,7 @@ const handlers = {
         else { respond(req, {}, false, 'Unknown module id ' + id); return; }
         await rearmModuleBreakpoints();
         respond(req, { active: activeModuleId, name: (activeModuleId !== null ? moduleNames.get(activeModuleId) : null) });
+        evt('oricSymbolsChanged', { reason: 'module-switch', module: activeModuleId });
         // Re-emit a stop so VS Code re-queries stack/scopes/variables with the new symbols.
         if (!running) evt('stopped', { reason: 'module switch', threadId: 1, allThreadsStopped: true });
     },
