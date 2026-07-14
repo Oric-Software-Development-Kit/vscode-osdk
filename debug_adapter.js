@@ -1292,7 +1292,7 @@ async function onStopReply(payload) {
         lastCycleAnnotation = {
             pc: jsrPc,
             cycles: cyclesDelta,
-            symbol: addrSym.get(jsrPc) || null,
+            symbol: symbolAt(jsrPc),
             file: src ? src.file : null,
             line: src ? src.line : 0
         };
@@ -1443,11 +1443,11 @@ function opSize(mode) {
     return 2;
 }
 
-function fmtOp(mode, lo, hi, pc, symMap) {
+function fmtOp(mode, lo, hi, pc) {
     const h2 = v => v.toString(16).toUpperCase().padStart(2, '0');
     const h4 = v => v.toString(16).toUpperCase().padStart(4, '0');
     // Resolve an address to a symbol name, or fall back to hex
-    const s = (addr, w) => (symMap && symMap.get(addr)) || ('$' + (w === 2 ? h2(addr) : h4(addr)));
+    const s = (addr, w) => symbolAt(addr) || ('$' + (w === 2 ? h2(addr) : h4(addr)));
     switch (mode) {
         case 'I': return '';
         case 'A': return 'A';
@@ -1495,6 +1495,15 @@ function getSourceLine(filePath, line) {
 function sourceFor(addr) {
     const r = resolverInstance ? resolverInstance.resolve(addr & 0xFFFF) : null;
     return r && r.source ? { file: r.source.file, line: r.source.line } : null;
+}
+
+// Symbol sitting EXACTLY at `addr` (the resolver's canonical owner among aliases),
+// or null. Operand and instruction labels stay exact-match — nearest-below
+// "name+$off" rendering would turn every plain "$hhhh" operand into offset noise.
+// One authority: replaces direct addrSym reads (SPEC §7 step 4).
+function symbolAt(addr) {
+    const r = resolverInstance ? resolverInstance.resolve(addr & 0xFFFF) : null;
+    return r && r.symbol && r.symbol.offset === 0 ? r.symbol.name : null;
 }
 
 // Find the function containing `pc` by looking for the largest symbol address <= pc
@@ -1742,7 +1751,7 @@ async function ptr16Str(baseAddr) {
     const w = await readMem(baseAddr & 0xFFFF, 2);
     const word = w[0] | (w[1] << 8);
     let s = '$' + word.toString(16).toUpperCase().padStart(4, '0');
-    const tgt = addrSym.get(word);
+    const tgt = symbolAt(word);
     if (tgt) s += ' →' + tgt;
     else { const b = await readMem(word, 1); s += ' →$' + (b[0] || 0).toString(16).toUpperCase().padStart(2, '0'); }
     return s;
@@ -2077,11 +2086,11 @@ async function buildDisasmCache(centerAddr) {
             const sz = opSize(mode);
             const lo = off + 1 < mem.length ? mem[off + 1] : 0;
             const hi = off + 2 < mem.length ? mem[off + 2] : 0;
-            const operand = fmtOp(mode, lo, hi, a, addrSym);
+            const operand = fmtOp(mode, lo, hi, a);
             let bytes = '';
             for (let j = 0; j < sz && off + j < mem.length; j++)
                 bytes += mem[off + j].toString(16).toUpperCase().padStart(2, '0') + ' ';
-            insts.push({ addr: a, bytes: bytes.trimEnd(), text: mne + (operand ? ' ' + operand : ''), sym: addrSym.get(a) });
+            insts.push({ addr: a, bytes: bytes.trimEnd(), text: mne + (operand ? ' ' + operand : ''), sym: symbolAt(a) });
             off += sz;
         } else {
             const bh = mem[off].toString(16).toUpperCase().padStart(2, '0');
@@ -3263,7 +3272,7 @@ const handlers = {
                 const sz = opSize(mode);
                 const lo = off + 1 < mem.length ? mem[off + 1] : 0;
                 const hi = off + 2 < mem.length ? mem[off + 2] : 0;
-                const operand = fmtOp(mode, lo, hi, a, addrSym);
+                const operand = fmtOp(mode, lo, hi, a);
                 let opBytes = '';
                 for (let j = 0; j < sz && off + j < mem.length; j++)
                     opBytes += mem[off + j].toString(16).toUpperCase().padStart(2, '0') + ' ';
@@ -3272,7 +3281,7 @@ const handlers = {
                     instructionBytes: opBytes.trim(),
                     instruction: mne + (operand ? ' ' + operand : '')
                 };
-                const sym = addrSym.get(a);
+                const sym = symbolAt(a);
                 if (sym) instr.symbol = sym;
                 // Attach source location for C files only — VS Code's built-in
                 // disassembly view interleaves source from location/line, which is
@@ -3939,7 +3948,7 @@ const handlers = {
 
         const h2 = v => '$' + (v & 0xFF).toString(16).toUpperCase().padStart(2, '0');
         const h4 = v => (v & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
-        const sym = addr => addrSym.get(addr);
+        const sym = addr => symbolAt(addr);
         // An address operand as "label|$hhhh" (or just "$hhhh" when unnamed). The '|'
         // reads as "same location, shown another way" — consistent with the value
         // notation below. `wide` picks 16-bit ($hhhh) vs zero-page ($hh) formatting.
@@ -4138,7 +4147,7 @@ const handlers = {
             const entry = OPS[opcode];
             if (!entry) {
                 // Illegal opcode — emit as data byte
-                allInsns.push({ address: addr, bytes: [opcode], mnemonic: '???', operand: '$' + opcode.toString(16).toUpperCase().padStart(2, '0'), label: addrSym.get(addr) || null });
+                allInsns.push({ address: addr, bytes: [opcode], mnemonic: '???', operand: '$' + opcode.toString(16).toUpperCase().padStart(2, '0'), label: symbolAt(addr) });
                 addr++;
                 continue;
             }
@@ -4150,8 +4159,8 @@ const handlers = {
             const hi = size > 2 ? mem[off + 2] : 0;
             const bytesArr = [];
             for (let b = 0; b < size; b++) bytesArr.push(mem[off + b]);
-            const operand = fmtOp(mode, lo, hi, addr, addrSym);
-            allInsns.push({ address: addr, bytes: bytesArr, mnemonic: mnem, operand, label: addrSym.get(addr) || null });
+            const operand = fmtOp(mode, lo, hi, addr);
+            allInsns.push({ address: addr, bytes: bytesArr, mnemonic: mnem, operand, label: symbolAt(addr) });
             addr += size;
         }
 
