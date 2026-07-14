@@ -186,6 +186,8 @@ const CONSOLE_HELP = [
     'Symbols & expressions',
     '  sym NAME                  show a symbol’s address',
     '  NAME                      evaluate a symbol / C variable',
+    '  (TYPE)EXPR                view EXPR as TYPE: (uchar*)tmp0, (int)$C000,',
+    '                            (uchar[8])buffer, (save_game_file)ptr — also in Watch',
     '  <expr>                    evaluate via Oricutron (e.g. tmp0+2)',
     '',
     'Display',
@@ -1603,6 +1605,17 @@ function formatEnum(def, mem, offset, size) {
     return def.byValue.has(v) ? def.byValue.get(v) + ' (' + num + ')' : num;
 }
 
+// Byte width of a scalar/enum type name, or 0 when unknown (structs are the
+// callers' job via typeDefs). Shared by the watch cast parser and the pointer
+// dereference in buildTypedVar.
+function scalarSizeOf(t) {
+    const n = String(t).toLowerCase();
+    if (n === 'char' || n === 'uchar' || n === 'schar' || n === 'byte' || n === 'ubyte' || n === 'bool') return 1;
+    if (n === 'int' || n === 'uint' || n === 'short' || n === 'ushort' || n === 'sint' || n === 'sshort' || n === 'word' || n === 'uword') return 2;
+    if (resolveEnum(t)) return 1;
+    return 0;
+}
+
 // Format a scalar value from raw bytes for display
 function formatScalar(typeName, mem, offset, size) {
     const ed = resolveEnum(typeName);   // case-sensitive: enum tags before lowercasing
@@ -1850,6 +1863,13 @@ async function buildTypedVar(name, addr, fullType, size, ann) {
             const ref = stableRef('ptr:' + target + ':' + pointed,
                                   { addr: target, typeName: pointed, count: 1 });
             return { name, value: fullType + ' → ' + tHex + '  @ ' + hAddr, variablesReference: ref };
+        }
+        // Scalar target: dereference one hop and show the pointed-to value,
+        // mirroring the @ptr16 annotation's "→" so pointers read consistently.
+        const psz = scalarSizeOf(pointed);
+        if (psz && target !== 0) {
+            const tm = await readMem(target, psz);
+            return { name, value: fullType + ' → ' + tHex + ' = ' + formatScalar(pointed, tm, 0, psz) + '  @ ' + hAddr, variablesReference: 0 };
         }
         return { name, value: fullType + ' = ' + tHex + '  @ ' + hAddr, variablesReference: 0 };
     }
@@ -3463,6 +3483,39 @@ const handlers = {
                 variablesReference: 0
             });
             evt('stopped', { reason: 'goto', threadId: 1, allThreadsStopped: true });
+            return;
+        }
+
+        // Type cast:  (TYPE)EXPR — view EXPR's address as TYPE, rendered through
+        // the one render path (buildTypedVar) so a cast behaves exactly like a
+        // .ctype-typed variable. TYPE = scalar / enum / struct name, optionally
+        // '*' (pointer) or '[N]' (array). EXPR = symbol (with _ fallback) or a
+        // $hex/0xhex address. Examples: (uchar*)tmp0, (save_game_file)$C000,
+        // (uchar[8])_g_palette, (GamePhase)current_phase.
+        if ((m = expr.match(/^\(\s*([A-Za-z_]\w*)\s*(\*|\[\s*(\d+)\s*\])?\s*\)\s*(\S+)$/))) {
+            const baseType = m[1];
+            const isPtr = m[2] === '*';
+            const count = m[3] ? parseInt(m[3], 10) : 0;
+            const target = m[4];
+            let castAddr = symbols.get(target);
+            if (castAddr === undefined && !target.startsWith('_')) castAddr = symbols.get('_' + target);
+            if (castAddr === undefined) {
+                const hm = target.match(/^(?:\$|0x)?([0-9a-fA-F]{1,4})$/);
+                if (hm) castAddr = parseInt(hm[1], 16);
+            }
+            if (castAddr === undefined) { respond(req, {}, false, 'Cast target not found: ' + target); return; }
+            const elemSize = typeDefs.has(baseType) ? typeDefs.get(baseType).size : scalarSizeOf(baseType);
+            if (!elemSize && !isPtr) { respond(req, {}, false, 'Unknown type: ' + baseType); return; }
+            let fullType, size;
+            if (isPtr)      { fullType = '*' + baseType; size = 2; }
+            else if (count) { fullType = baseType + '[' + count + ']'; size = count * elemSize; }
+            else            { fullType = baseType; size = elemSize; }
+            const v = await buildTypedVar(expr, castAddr & 0xFFFF, fullType, size, undefined);
+            respond(req, {
+                result: v.value,
+                variablesReference: v.variablesReference,
+                memoryReference: '0x' + (castAddr & 0xFFFF).toString(16)
+            });
             return;
         }
 
