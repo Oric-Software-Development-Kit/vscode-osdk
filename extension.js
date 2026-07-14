@@ -2537,6 +2537,20 @@ const REVEAL_ON_STOP_MS = 500; // focus changes within this window after a stop 
 let instrStepMode = false;
 let lastStopMs = 0;
 let stepModeStatusBar = null; // created in activate(); reflects/toggles the mode
+let oricDebugStopped = false; // true between 'stopped' and 'continued' events — gates all line actions
+let lineActionLens = null;    // created in activate(); refreshed on stop/continue/selection change
+
+// Central stopped-state switch: gates the source CodeLens AND the disasm
+// panel's line actions (the webview hides its buttons/menu while the program
+// runs or no session exists — run/jump/skip on a live PC would misfire).
+function setOricDebugStopped(v) {
+    oricDebugStopped = !!v;
+    if (lineActionLens) lineActionLens.refresh();
+    pushDebugStateToDisasm();
+}
+function pushDebugStateToDisasm() {
+    if (disasmPanel) disasmPanel.webview.postMessage({ type: 'debugState', stopped: oricDebugStopped });
+}
 function setInstrStepMode(on) {
     on = !!on;
     if (on === instrStepMode) return;
@@ -2545,6 +2559,70 @@ function setInstrStepMode(on) {
     if (stepModeStatusBar) {
         stepModeStatusBar.text = on ? '$(debug-step-into) Step: Instruction' : '$(debug-step-over) Step: Statement';
     }
+}
+
+// Move the caret to a 1-based line of ctx.uri — ctx is the {uri, lineNumber}
+// shape both the line-number gutter menu and the cursor-line CodeLens pass.
+// The built-in run-to-cursor / jump-to-cursor commands only know the active
+// cursor, so line-targeted actions position it first. Returns false when
+// invoked without a usable target (e.g. from the command palette).
+async function cursorToLine(ctx) {
+    if (!ctx || !ctx.uri || typeof ctx.lineNumber !== 'number') return false;
+    const editor = await vscode.window.showTextDocument(ctx.uri, { preserveFocus: false });
+    const pos = new vscode.Position(ctx.lineNumber - 1, 0);
+    editor.selection = new vscode.Selection(pos, pos);
+    return true;
+}
+
+// The one turboRun request path — cursor-, line- and address-targeted commands
+// all call this so target resolution and error reporting can't drift apart.
+// args.warp === false = run to the target at normal speed (same adapter path,
+// no warp). `what` names the operation in error toasts.
+async function requestTurboRun(args, what = 'Turbo Run') {
+    const session = vscode.debug.activeDebugSession;
+    if (!session || session.type !== 'oric-debug') return;
+    try {
+        await session.customRequest('turboRun', args);
+    } catch (e) {
+        vscode.window.showErrorMessage(what + ' failed: ' + (e && e.message ? e.message : e));
+    }
+}
+
+// The one goto core (source jump/skip AND disassembly jump): ask the adapter
+// for a goto target, validate it, move the PC. Straight DAP instead of the
+// built-in debug.jumpToCursor, which proved unreliable invoked
+// programmatically; the adapter's 'stopped' event makes VS Code reveal the new
+// PC. `validate` returns a warning string to refuse the target, or null.
+async function gotoViaTargets(targetsArgs, validate) {
+    const session = vscode.debug.activeDebugSession;
+    if (!session || session.type !== 'oric-debug') return;
+    try {
+        const res = await session.customRequest('gotoTargets', targetsArgs);
+        const target = res && res.targets && res.targets[0];
+        const warning = validate(target);
+        if (warning) { vscode.window.showWarningMessage(warning); return; }
+        await session.customRequest('goto', { threadId: 1, targetId: target.id });
+    } catch (e) {
+        vscode.window.showErrorMessage('Jump failed: ' + (e && e.message ? e.message : e));
+    }
+}
+
+// Jump/skip on a source line. `afterLine` (skip): the target must lie strictly
+// beyond that line — at end of file the snap falls backward, and skipping must
+// refuse a backward jump rather than re-run earlier code.
+async function gotoSourceLine(uri, line, afterLine) {
+    await gotoViaTargets({ source: { path: uri.fsPath }, line }, target => {
+        if (!target) return afterLine ? 'No executable line after line ' + afterLine : 'No code found for line ' + line;
+        if (afterLine && target.line > 0 && target.line <= afterLine) return 'No executable line after line ' + afterLine;
+        return null;
+    });
+}
+
+// Jump to a raw address (disassembly panel) — the adapter's gotoTargets treats
+// a "0xABCD" source path as the address itself.
+async function gotoAddress(addr) {
+    const hex = '0x' + (addr & 0xFFFF).toString(16).padStart(4, '0');
+    await gotoViaTargets({ source: { path: hex }, line: 0 }, target => target ? null : 'No goto target at ' + hex);
 }
 
 // ----------------------------------------------------------------
@@ -2754,8 +2832,23 @@ function setupDisasmMessageHandler(panel) {
                 // the Breakpoints panel, and Oricutron.
                 toggleBreakpointViaModel(session, msg.address);
             }
+        } else if (msg.type === 'lineAction' && typeof msg.address === 'number') {
+            // Right-click actions on a disassembly row — same operations as the
+            // source-editor gutter menu, address-targeted. 'skip' arrives as a
+            // jump to the FOLLOWING instruction's address (the webview knows it).
+            // The webview hides these while running, but gate here too (a click
+            // can race a resume).
+            if (session && session.type === 'oric-debug' && oricDebugStopped) {
+                const addr = msg.address & 0xFFFF;
+                if (msg.action === 'turbo') requestTurboRun({ addr });
+                else if (msg.action === 'run') requestTurboRun({ addr, warp: false }, 'Run to address');
+                else if (msg.action === 'jump') gotoAddress(addr);
+            }
         }
     });
+    // Tell the (fresh or restored) webview the current run state so it shows or
+    // hides the line actions correctly from the first render.
+    pushDebugStateToDisasm();
 }
 
 // Toggle a breakpoint at `address` by mutating VS Code's breakpoint model (the
@@ -2898,6 +2991,10 @@ body {
 }
 table { width: 100%; border-collapse: collapse; user-select: none; table-layout: fixed; }
 tr { height: 20px; }
+/* Hover highlight marks the row the line actions will target — only while the
+   debuggee is STOPPED (body.dbg-stopped, pushed by the extension); the PC row
+   keeps its own color (:not(.pc-row)). */
+body.dbg-stopped tr:hover:not(.pc-row) { background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.15)); }
 tr.pc-row { background: var(--vscode-editor-selectionBackground, rgba(38,79,120,0.5)); }
 tr.label-row td { border-top: 1px solid var(--vscode-widget-border, #333); padding-top: 6px; }
 td { padding: 0 4px; white-space: nowrap; vertical-align: middle; }
@@ -2919,7 +3016,36 @@ td.label-col { color: var(--vscode-symbolIcon-functionForeground, #75beff); font
 td.mnemonic { color: var(--vscode-symbolIcon-keywordForeground, #c586c0); font-weight: bold; width: 36px; }
 td.operand { color: var(--vscode-foreground); }
 td.pc-arrow { width: 18px; color: var(--vscode-debugIcon-startForeground, #89d185); font-weight: bold; }
+/* Line-action buttons sit right after the operand text (6502 lines are short —
+   far-right buttons were a mile from the instruction). */
+td.operand .acts { margin-left: 16px; }
+td.operand .act {
+    visibility: hidden; cursor: pointer; padding: 0 6px;
+    color: var(--vscode-descriptionForeground, #888);
+    white-space: nowrap;
+}
+body.dbg-stopped tr:hover td.operand .act { visibility: visible; }
+td.operand .act:hover { color: var(--vscode-foreground); }
 .no-session { padding: 20px; color: var(--vscode-descriptionForeground, #888); text-align: center; }
+.ctx-menu {
+    position: fixed; z-index: 100; min-width: 180px;
+    background: var(--vscode-menu-background, #252526);
+    color: var(--vscode-menu-foreground, #ccc);
+    border: 1px solid var(--vscode-menu-border, #454545);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+    padding: 4px 0; user-select: none;
+}
+.ctx-menu .item { padding: 4px 14px; cursor: pointer; white-space: nowrap; }
+.ctx-menu .item:hover {
+    background: var(--vscode-menu-selectionBackground, #094771);
+    color: var(--vscode-menu-selectionForeground, #fff);
+}
+.ctx-menu .addr-hint {
+    padding: 2px 14px 4px; font-size: 0.85em;
+    color: var(--vscode-descriptionForeground, #888);
+    border-bottom: 1px solid var(--vscode-menu-border, #454545);
+    margin-bottom: 3px;
+}
 </style></head><body>
 <div class="toolbar">
     <span style="color:var(--vscode-descriptionForeground,#888)">Go to:</span>
@@ -2932,11 +3058,29 @@ td.pc-arrow { width: 18px; color: var(--vscode-debugIcon-startForeground, #89d18
 <script>
 const vscode = acquireVsCodeApi();
 let lastData = null;
+let debugStopped = false; // pushed by the extension; gates the line actions
 
 // Use mousedown + event delegation for breakpoint gutter clicks.
 // In VS Code webviews the first 'click' after focus acquisition is often
 // swallowed; mousedown fires reliably on every press including the first.
 document.getElementById('content').addEventListener('mousedown', e => {
+    if (e.button !== 0) return; // right-click opens the line-action menu, not a bp toggle
+    // Hover line-action buttons (run/turbo/jump/skip on the row itself)
+    const act = e.target.closest('span.act');
+    if (act) {
+        e.preventDefault();
+        e.stopPropagation();
+        const tr = act.closest('tr');
+        const addr = tr && tr.id && tr.id[0] === 'r' ? parseInt(tr.id.slice(1)) : NaN;
+        if (isNaN(addr)) return;
+        if (act.dataset.action === 'skip') {
+            const next = nextAddrAfter(addr);
+            if (next !== null) vscode.postMessage({ type: 'lineAction', action: 'jump', address: next });
+        } else {
+            vscode.postMessage({ type: 'lineAction', action: act.dataset.action, address: addr });
+        }
+        return;
+    }
     const td = e.target.closest('td.gutter');
     if (!td) return;
     e.preventDefault();
@@ -2949,6 +3093,60 @@ document.getElementById('gotoBtn').addEventListener('click', doGoto);
 document.getElementById('gotoInput').addEventListener('keydown', e => { if (e.key === 'Enter') doGoto(); });
 document.getElementById('followBtn').addEventListener('click', () => vscode.postMessage({ type: 'followPc' }));
 
+// Right-click on an instruction row: run/turbo/jump/skip targeted at that
+// address — the address-based twin of the source editors' line-number menu.
+let ctxMenu = null;
+function closeCtxMenu() { if (ctxMenu) { ctxMenu.remove(); ctxMenu = null; } }
+document.addEventListener('mousedown', e => { if (ctxMenu && !ctxMenu.contains(e.target)) closeCtxMenu(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeCtxMenu(); });
+window.addEventListener('wheel', closeCtxMenu, { passive: true });
+
+// Address of the instruction FOLLOWING addr in the rendered window — the skip
+// target ("jump over one instruction"). Shared by the context menu and the
+// hover buttons. null on the window's last row.
+function nextAddrAfter(addr) {
+    const list = (lastData && lastData.instructions) || [];
+    const i = list.findIndex(ins => ins.address === addr);
+    return i >= 0 && i + 1 < list.length ? list[i + 1].address : null;
+}
+
+document.getElementById('content').addEventListener('contextmenu', e => {
+    if (!debugStopped) return; // no line actions on a running machine
+    const tr = e.target.closest('tr');
+    if (!tr || !tr.id || tr.id[0] !== 'r' || !lastData) return;
+    e.preventDefault();
+    closeCtxMenu();
+    const addr = parseInt(tr.id.slice(1));
+    if (isNaN(addr)) return;
+    const next = nextAddrAfter(addr);
+    const h4 = v => v.toString(16).toUpperCase().padStart(4, '0');
+
+    ctxMenu = document.createElement('div');
+    ctxMenu.className = 'ctx-menu';
+    const items = [
+        ['\\u25B6 Run to Here', 'run', addr],
+        ['\\u26A1 Turbo Run to Here', 'turbo', addr],
+        ['\\u2316 Jump Here', 'jump', addr],
+    ];
+    if (next !== null) items.push(['\\u21B7 Skip Instruction', 'jump', next]);
+    let mh = '<div class="addr-hint">$' + h4(addr) + '</div>';
+    for (let k = 0; k < items.length; k++) mh += '<div class="item" data-k="' + k + '">' + items[k][0] + '</div>';
+    ctxMenu.innerHTML = mh;
+    ctxMenu.addEventListener('mousedown', ev => {
+        const it = ev.target.closest('.item');
+        if (!it) return;
+        ev.preventDefault(); ev.stopPropagation();
+        const [, action, a] = items[+it.dataset.k];
+        vscode.postMessage({ type: 'lineAction', action, address: a });
+        closeCtxMenu();
+    });
+    document.body.appendChild(ctxMenu);
+    // Position: clamp so the menu stays inside the view.
+    const mw = ctxMenu.offsetWidth, mhgt = ctxMenu.offsetHeight;
+    ctxMenu.style.left = Math.min(e.clientX, window.innerWidth - mw - 4) + 'px';
+    ctxMenu.style.top = Math.min(e.clientY, window.innerHeight - mhgt - 4) + 'px';
+});
+
 function doGoto() {
     let v = document.getElementById('gotoInput').value.trim().replace(/^\\$/, '');
     if (/^[0-9a-fA-F]{1,4}$/.test(v)) {
@@ -2960,6 +3158,12 @@ window.addEventListener('message', e => {
     if (e.data.type === 'disasm') {
         lastData = e.data.data;
         render();
+    } else if (e.data.type === 'debugState') {
+        // Stopped/running (pushed by the extension): line actions only make
+        // sense on a stopped machine, so hide them while running / no session.
+        debugStopped = !!e.data.stopped;
+        document.body.classList.toggle('dbg-stopped', debugStopped);
+        if (!debugStopped) closeCtxMenu();
     }
 });
 
@@ -2999,7 +3203,17 @@ function render() {
         html += '<td class="bytes">' + bytesStr + '</td>';
         html += '<td class="label-col">' + (hasLabel ? ins.label : '') + '</td>';
         html += '<td class="mnemonic">' + ins.mnemonic + '</td>';
-        html += '<td class="operand">' + escHtml(ins.operand) + '</td>';
+        // Hover-revealed line actions ride inside the operand cell so they sit
+        // right after the instruction text. Labels are printed, NOT tooltips —
+        // VS Code draws tooltips under the pointer, unreadable with a large
+        // cursor (user accessibility requirement). Skip resolves at click time.
+        html += '<td class="operand">' + escHtml(ins.operand)
+            + '<span class="acts">'
+            + '<span class="act" data-action="run">\\u25B6 run</span>'
+            + '<span class="act" data-action="turbo">\\u26A1 turbo</span>'
+            + '<span class="act" data-action="jump">\\u2316 jump</span>'
+            + '<span class="act" data-action="skip">\\u21B7 skip</span>'
+            + '</span></td>';
         html += '</tr>';
     }
     html += '</table>';
@@ -3816,16 +4030,27 @@ function activate(context) {
         }),
 
         vscode.commands.registerCommand('oric-debug.turboRunToCursor', async () => {
-            const session = vscode.debug.activeDebugSession;
-            if (!session || session.type !== 'oric-debug') return;
             const ed = vscode.window.activeTextEditor;
-            const args = {};
-            if (ed) { args.file = ed.document.uri.fsPath; args.line = ed.selection.active.line + 1; }
-            try {
-                await session.customRequest('turboRun', args);
-            } catch (e) {
-                vscode.window.showErrorMessage('Turbo Run failed: ' + (e && e.message ? e.message : e));
-            }
+            // No editor = plain turbo run (warp + continue, no target breakpoint).
+            await requestTurboRun(ed ? { file: ed.document.uri.fsPath, line: ed.selection.active.line + 1 } : {});
+        }),
+
+        // --- Line-targeted debug actions (line-number gutter menu + CodeLens) ---
+        // Run/jump reuse the built-in cursor commands after positioning the caret
+        // on the requested line; turbo goes straight to the adapter, which takes
+        // an explicit file+line.
+        vscode.commands.registerCommand('oric-debug.runToLine', async (ctx) => {
+            if (await cursorToLine(ctx)) vscode.commands.executeCommand('editor.debug.action.runToCursor');
+        }),
+        vscode.commands.registerCommand('oric-debug.jumpToLine', async (ctx) => {
+            if (ctx && ctx.uri) await gotoSourceLine(ctx.uri, ctx.lineNumber);
+        }),
+        vscode.commands.registerCommand('oric-debug.skipLine', async (ctx) => {
+            // Skip = jump to the first executable line AFTER this one.
+            if (ctx && ctx.uri) await gotoSourceLine(ctx.uri, ctx.lineNumber + 1, ctx.lineNumber);
+        }),
+        vscode.commands.registerCommand('oric-debug.turboRunToLine', async (ctx) => {
+            if (ctx && ctx.uri) await requestTurboRun({ file: ctx.uri.fsPath, line: ctx.lineNumber });
         }),
 
         vscode.commands.registerCommand('oric-debug.selectModule', async () => {
@@ -4099,11 +4324,49 @@ function activate(context) {
         if (session && session.type === 'oric-debug') refreshDisasmPanel(session);
     }));
 
+    // --- Cursor-line action CodeLens: one-click run/turbo/jump, no menu ---
+    // Rendered only on the active editor's cursor line while an Oric session is
+    // STOPPED, so editors are untouched outside debugging. Trial UX chosen by the
+    // user alongside the line-number gutter menu — drop either if it doesn't
+    // survive real use.
+    const lensEmitter = new vscode.EventEmitter();
+    lineActionLens = {
+        onDidChangeCodeLenses: lensEmitter.event,
+        refresh: () => lensEmitter.fire(),
+        provideCodeLenses(document) {
+            if (!oricDebugStopped) return [];
+            const session = vscode.debug.activeDebugSession;
+            if (!session || session.type !== 'oric-debug') return [];
+            const ed = vscode.window.activeTextEditor;
+            if (!ed || ed.document !== document) return [];
+            const line = ed.selection.active.line;
+            const range = new vscode.Range(line, 0, line, 0);
+            const arg = { uri: document.uri, lineNumber: line + 1 };
+            return [
+                new vscode.CodeLens(range, { title: '▶ run to here', command: 'oric-debug.runToLine', arguments: [arg] }),
+                new vscode.CodeLens(range, { title: '⚡ turbo run', command: 'oric-debug.turboRunToLine', arguments: [arg] }),
+                new vscode.CodeLens(range, { title: '⌖ jump here', command: 'oric-debug.jumpToLine', arguments: [arg] }),
+                new vscode.CodeLens(range, { title: '↷ skip line', command: 'oric-debug.skipLine', arguments: [arg] }),
+            ];
+        }
+    };
+    context.subscriptions.push(vscode.languages.registerCodeLensProvider({ scheme: 'file' }, lineActionLens));
+    context.subscriptions.push(vscode.window.onDidChangeTextEditorSelection(() => {
+        if (oricDebugStopped) lineActionLens.refresh();
+    }));
+    context.subscriptions.push(vscode.debug.onDidTerminateDebugSession(() => {
+        setOricDebugStopped(false);
+    }));
+
     context.subscriptions.push(
         vscode.debug.registerDebugAdapterTrackerFactory('oric-debug', {
             createDebugAdapterTracker(session) {
                 return {
                     onDidSendMessage(msg) {
+                        // Running/stopped state for the line actions (CodeLens + disasm panel).
+                        if (msg.type === 'event' && (msg.event === 'stopped' || msg.event === 'continued')) {
+                            setOricDebugStopped(msg.event === 'stopped');
+                        }
                         if (msg.type === 'event' && msg.event === 'stopped') {
                             // Record the stop time so the imminent reveal-on-stop focus
                             // change (source editor) isn't mistaken for a user click that

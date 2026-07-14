@@ -1969,7 +1969,10 @@ function resolveSrcLineAddr(file, reqLine) {
 
 // Arm a Turbo Run: optional one-shot breakpoint at addr, then enable warp,
 // remembering the prior warp state so onStopReply_emit can restore it.
-async function armTurbo(addr) {
+// warp=false arms only the one-shot breakpoint (plain run-to-address at normal
+// speed — the disassembly panel's "Run to Here") on the SAME path, so target
+// handling can't drift between the two.
+async function armTurbo(addr, warp = true) {
     resumeMode = 'run';
     if (addr >= 0) {
         // Ref-counted: safe even if a real breakpoint already sits here — cleanup
@@ -1977,6 +1980,7 @@ async function armTurbo(addr) {
         await armAddr(addr);
         tempStepBp = addr;
     }
+    if (!warp) return;
     const prev = await gdbCmd('qOricWarp');
     turboPrevWarp = (prev === '1');
     await gdbCmd('qOricWarp,1');
@@ -3699,7 +3703,7 @@ const handlers = {
         else if (a.symbol && symbols.has(a.symbol)) addr = symbols.get(a.symbol);
         else if (a.file && typeof a.line === 'number') addr = resolveSrcLineAddr(a.file, a.line);
         if ((a.symbol || a.file) && addr < 0) { respond(req, {}, false, 'Turbo target not found'); return; }
-        await armTurbo(addr);
+        await armTurbo(addr, a.warp !== false); // warp:false = run-to-target at normal speed
         return handlers.continue(req); // responds + issues continue (handles PC-on-BP)
     },
 
