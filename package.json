@@ -259,22 +259,22 @@
                 {
                     "command": "oric-debug.runToLine",
                     "group": "oric@1",
-                    "when": "inDebugMode && debugType == 'oric-debug' && debugState == 'stopped' && resourceScheme == 'file'"
+                    "when": "inDebugMode && debugType == 'oric-debug' && debugState == 'stopped' && resourceScheme == 'file' && editorLineNumber not in oric-debug.pcEditorLines"
                 },
                 {
                     "command": "oric-debug.turboRunToLine",
                     "group": "oric@2",
-                    "when": "inDebugMode && debugType == 'oric-debug' && debugState == 'stopped' && resourceScheme == 'file'"
+                    "when": "inDebugMode && debugType == 'oric-debug' && debugState == 'stopped' && resourceScheme == 'file' && editorLineNumber not in oric-debug.pcEditorLines"
                 },
                 {
                     "command": "oric-debug.jumpToLine",
                     "group": "oric@3",
-                    "when": "inDebugMode && debugType == 'oric-debug' && debugState == 'stopped' && resourceScheme == 'file'"
+                    "when": "inDebugMode && debugType == 'oric-debug' && debugState == 'stopped' && resourceScheme == 'file' && editorLineNumber not in oric-debug.pcEditorLines"
                 },
                 {
                     "command": "oric-debug.skipLine",
                     "group": "oric@4",
-                    "when": "inDebugMode && debugType == 'oric-debug' && debugState == 'stopped' && resourceScheme == 'file'"
+                    "when": "inDebugMode && debugType == 'oric-debug' && debugState == 'stopped' && resourceScheme == 'file' && editorLineNumber in oric-debug.pcEditorLines"
                 }
             ],
             "commandPalette": [

@@ -2539,14 +2539,28 @@ let lastStopMs = 0;
 let stepModeStatusBar = null; // created in activate(); reflects/toggles the mode
 let oricDebugStopped = false; // true between 'stopped' and 'continued' events — gates all line actions
 let lineActionLens = null;    // created in activate(); refreshed on stop/continue/selection change
+let currentStopLoc = null;    // {path, line} of the top stack frame while stopped (null = no source)
 
 // Central stopped-state switch: gates the source CodeLens AND the disasm
 // panel's line actions (the webview hides its buttons/menu while the program
 // runs or no session exists — run/jump/skip on a live PC would misfire).
 function setOricDebugStopped(v) {
     oricDebugStopped = !!v;
+    if (!oricDebugStopped) { currentStopLoc = null; updatePcLineContext(); }
     if (lineActionLens) lineActionLens.refresh();
     pushDebugStateToDisasm();
+}
+
+// Array-valued context key for the line-number gutter menu: the PC line when
+// the ACTIVE editor shows the stopped file, else empty. when-clauses cannot
+// compare two context keys, but `editorLineNumber in oric-debug.pcEditorLines`
+// tests membership in this extension-managed array — that's how the gutter
+// menu offers ONLY "skip" on the PC line and only run/turbo/jump elsewhere.
+function updatePcLineContext() {
+    const ed = vscode.window.activeTextEditor;
+    const match = currentStopLoc && ed && ed.document.uri.scheme === 'file'
+        && canonPath(ed.document.uri.fsPath) === canonPath(currentStopLoc.path);
+    vscode.commands.executeCommand('setContext', 'oric-debug.pcEditorLines', match ? [currentStopLoc.line] : []);
 }
 function pushDebugStateToDisasm() {
     if (disasmPanel) disasmPanel.webview.postMessage({ type: 'debugState', stopped: oricDebugStopped });
@@ -3123,12 +3137,17 @@ document.getElementById('content').addEventListener('contextmenu', e => {
 
     ctxMenu = document.createElement('div');
     ctxMenu.className = 'ctx-menu';
-    const items = [
-        ['\\u25B6 Run to Here', 'run', addr],
-        ['\\u26A1 Turbo Run to Here', 'turbo', addr],
-        ['\\u2316 Jump Here', 'jump', addr],
-    ];
-    if (next !== null) items.push(['\\u21B7 Skip Instruction', 'jump', next]);
+    // Contextual: the PC row only offers "skip"; other rows offer the movement
+    // actions (skip is meaningless when you are not skipping the NEXT thing).
+    const items = [];
+    if (addr === lastData.pc) {
+        if (next !== null) items.push(['\\u21B7 Skip Instruction', 'jump', next]);
+    } else {
+        items.push(['\\u25B6 Run to Here', 'run', addr]);
+        items.push(['\\u26A1 Turbo Run to Here', 'turbo', addr]);
+        items.push(['\\u2316 Jump Here', 'jump', addr]);
+    }
+    if (!items.length) return;
     let mh = '<div class="addr-hint">$' + h4(addr) + '</div>';
     for (let k = 0; k < items.length; k++) mh += '<div class="item" data-k="' + k + '">' + items[k][0] + '</div>';
     ctxMenu.innerHTML = mh;
@@ -3206,14 +3225,16 @@ function render() {
         // Hover-revealed line actions ride inside the operand cell so they sit
         // right after the instruction text. Labels are printed, NOT tooltips —
         // VS Code draws tooltips under the pointer, unreadable with a large
-        // cursor (user accessibility requirement). Skip resolves at click time.
-        html += '<td class="operand">' + escHtml(ins.operand)
-            + '<span class="acts">'
-            + '<span class="act" data-action="run">\\u25B6 run</span>'
+        // cursor (user accessibility requirement). Contextual: the PC row only
+        // offers "skip" (you are already here); other rows offer the movement
+        // actions and no skip. Skip's target resolves at click time.
+        const acts = isPc
+            ? '<span class="act" data-action="skip">\\u21B7 skip</span>'
+            : '<span class="act" data-action="run">\\u25B6 run</span>'
             + '<span class="act" data-action="turbo">\\u26A1 turbo</span>'
-            + '<span class="act" data-action="jump">\\u2316 jump</span>'
-            + '<span class="act" data-action="skip">\\u21B7 skip</span>'
-            + '</span></td>';
+            + '<span class="act" data-action="jump">\\u2316 jump</span>';
+        html += '<td class="operand">' + escHtml(ins.operand)
+            + '<span class="acts">' + acts + '</span></td>';
         html += '</tr>';
     }
     html += '</table>';
@@ -4342,17 +4363,26 @@ function activate(context) {
             const line = ed.selection.active.line;
             const range = new vscode.Range(line, 0, line, 0);
             const arg = { uri: document.uri, lineNumber: line + 1 };
+            // Contextual: ON the PC line only "skip" is meaningful (you are
+            // already here); on any other line skip is meaningless and the
+            // movement actions apply.
+            const onPcLine = currentStopLoc && line + 1 === currentStopLoc.line
+                && canonPath(document.uri.fsPath) === canonPath(currentStopLoc.path);
+            if (onPcLine)
+                return [new vscode.CodeLens(range, { title: '↷ skip line', command: 'oric-debug.skipLine', arguments: [arg] })];
             return [
                 new vscode.CodeLens(range, { title: '▶ run to here', command: 'oric-debug.runToLine', arguments: [arg] }),
                 new vscode.CodeLens(range, { title: '⚡ turbo run', command: 'oric-debug.turboRunToLine', arguments: [arg] }),
                 new vscode.CodeLens(range, { title: '⌖ jump here', command: 'oric-debug.jumpToLine', arguments: [arg] }),
-                new vscode.CodeLens(range, { title: '↷ skip line', command: 'oric-debug.skipLine', arguments: [arg] }),
             ];
         }
     };
     context.subscriptions.push(vscode.languages.registerCodeLensProvider({ scheme: 'file' }, lineActionLens));
     context.subscriptions.push(vscode.window.onDidChangeTextEditorSelection(() => {
         if (oricDebugStopped) lineActionLens.refresh();
+    }));
+    context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(() => {
+        if (oricDebugStopped) updatePcLineContext();
     }));
     context.subscriptions.push(vscode.debug.onDidTerminateDebugSession(() => {
         setOricDebugStopped(false);
@@ -4399,6 +4429,16 @@ function activate(context) {
                              msg.command === 'setInstructionBreakpoints' ||
                              msg.command === 'setFunctionBreakpoints')) {
                             refreshDisasmPanel(session);
+                        }
+                        // Track the stopped location (top frame) for the contextual
+                        // line actions: the PC line offers only "skip", other lines
+                        // offer run/turbo/jump.
+                        if (msg.type === 'response' && msg.command === 'stackTrace' && msg.success) {
+                            const f = msg.body && msg.body.stackFrames && msg.body.stackFrames[0];
+                            currentStopLoc = (f && f.source && f.source.path && f.line > 0)
+                                ? { path: f.source.path, line: f.line } : null;
+                            updatePcLineContext();
+                            if (lineActionLens) lineActionLens.refresh();
                         }
                         // Intercept VS Code's own stackTrace response — the UI
                         // now has frame data, so opening disassembly will work.
