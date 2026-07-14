@@ -2639,6 +2639,20 @@ async function gotoAddress(addr) {
     await gotoViaTargets({ source: { path: hex }, line: 0 }, target => target ? null : 'No goto target at ' + hex);
 }
 
+// True when file:line snaps to executable CODE (adapter lineInfo request).
+// Movement actions on a data line are traps — a run-to breakpoint on a .dsb
+// never hits and a jump moves the PC into storage — so warn instead.
+async function lineExecutable(uri, lineNumber) {
+    const session = vscode.debug.activeDebugSession;
+    if (!session || session.type !== 'oric-debug') return false;
+    try {
+        const r = await session.customRequest('lineInfo', { file: uri.fsPath, line: lineNumber });
+        if (r && r.addr >= 0 && r.executable) return true;
+        vscode.window.showWarningMessage('Line ' + lineNumber + ' is ' + (r && r.addr >= 0 ? 'data, not executable code' : 'not mapped to any code'));
+        return false;
+    } catch (e) { return true; } // request unavailable: don't block
+}
+
 // ----------------------------------------------------------------
 // Oric Symbols Panel (searchable/sortable symbol browser)
 // ----------------------------------------------------------------
@@ -4070,6 +4084,9 @@ function activate(context) {
         // on the requested line; turbo goes straight to the adapter, which takes
         // an explicit file+line.
         vscode.commands.registerCommand('oric-debug.runToLine', async (ctx) => {
+            // jump/turbo are refused adapter-side on data lines; run-to goes
+            // through the built-in breakpoint machinery, so validate here.
+            if (!ctx || !ctx.uri || !(await lineExecutable(ctx.uri, ctx.lineNumber))) return;
             if (await cursorToLine(ctx)) vscode.commands.executeCommand('editor.debug.action.runToCursor');
         }),
         vscode.commands.registerCommand('oric-debug.jumpToLine', async (ctx) => {
@@ -4347,7 +4364,7 @@ function activate(context) {
     lineActionLens = {
         onDidChangeCodeLenses: lensEmitter.event,
         refresh: () => lensEmitter.fire(),
-        provideCodeLenses(document) {
+        async provideCodeLenses(document) {
             if (!oricDebugStopped) return [];
             const session = vscode.debug.activeDebugSession;
             if (!session || session.type !== 'oric-debug') return [];
@@ -4363,6 +4380,13 @@ function activate(context) {
                 && canonPath(document.uri.fsPath) === canonPath(currentStopLoc.path);
             if (onPcLine)
                 return [new vscode.CodeLens(range, { title: '↷ skip line', command: 'oric-debug.skipLine', arguments: [arg] })];
+            // Movement actions only on executable lines — no "run to here" on a
+            // .dsb data declaration (the breakpoint would never hit; a jump
+            // would move the PC into storage).
+            try {
+                const info = await session.customRequest('lineInfo', { file: document.uri.fsPath, line: line + 1 });
+                if (!info || info.addr < 0 || !info.executable) return [];
+            } catch (e) { /* request unavailable: show rather than block */ }
             return [
                 new vscode.CodeLens(range, { title: '▶ run to here', command: 'oric-debug.runToLine', arguments: [arg] }),
                 new vscode.CodeLens(range, { title: '⚡ turbo run', command: 'oric-debug.turboRunToLine', arguments: [arg] }),

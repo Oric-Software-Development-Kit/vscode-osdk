@@ -1943,6 +1943,18 @@ function resolveSrcLineAddr(file, reqLine) {
     return r ? r.addr : -1;
 }
 
+// Is the line mapped at `addr` executable code? Movement actions (run-to /
+// jump / turbo) on a DATA line are traps: the breakpoint never hits, or the
+// PC lands inside storage. C/H lines always count as code — a C statement is
+// not a 6502 mnemonic and C emits many instructions per line, so both the
+// source-text and run-delta classifiers misread them (same special case as
+// resolve()'s nearest-symbol gate).
+function executableLine(addr, file) {
+    if (!resolverInstance) return true; // no resolver: don't block
+    if (/\.[ch]$/i.test(file || '')) return true;
+    return resolverInstance.resolve(addr & 0xFFFF).kind === 'code';
+}
+
 // Arm a Turbo Run: optional one-shot breakpoint at addr, then enable warp,
 // remembering the prior warp state so onStopReply_emit can restore it.
 // warp=false arms only the one-shot breakpoint (plain run-to-address at normal
@@ -2898,7 +2910,9 @@ const handlers = {
             // refused it. The snapped line is reported so callers (skip-line)
             // can detect a backward snap.
             const snap = resolverInstance ? resolverInstance.addrForLine(srcPath, args.line || 0) : null;
-            if (snap) { addr = snap.addr; if (snap.line > 0) targetLine = snap.line; }
+            // Refuse DATA lines (a .dsb/.byt with a #LINES entry): jumping the
+            // PC into storage crashes; the empty target list reads as "no code".
+            if (snap && executableLine(snap.addr, srcPath)) { addr = snap.addr; if (snap.line > 0) targetLine = snap.line; }
         } else if (args.line) {
             addr = args.line & 0xFFFF; // no path: some views encode the address in `line`
         }
@@ -3677,7 +3691,12 @@ const handlers = {
         let addr = -1;
         if (typeof a.addr === 'number') addr = a.addr & 0xffff;
         else if (a.symbol && symbols.has(a.symbol)) addr = symbols.get(a.symbol);
-        else if (a.file && typeof a.line === 'number') addr = resolveSrcLineAddr(a.file, a.line);
+        else if (a.file && typeof a.line === 'number') {
+            addr = resolveSrcLineAddr(a.file, a.line);
+            if (addr >= 0 && !executableLine(addr, a.file)) {
+                respond(req, {}, false, 'Target line is data, not executable code'); return;
+            }
+        }
         if ((a.symbol || a.file) && addr < 0) { respond(req, {}, false, 'Turbo target not found'); return; }
         await armTurbo(addr, a.warp !== false); // warp:false = run-to-target at normal speed
         return handlers.continue(req); // responds + issues continue (handles PC-on-BP)
@@ -3698,6 +3717,17 @@ const handlers = {
         evt('oricSymbolsChanged', { reason: 'module-switch', module: activeModuleId });
         // Re-emit a stop so VS Code re-queries stack/scopes/variables with the new symbols.
         if (!running) evt('stopped', { reason: 'module switch', threadId: 1, allThreadsStopped: true });
+    },
+
+    // -- Line info (custom request): what does file:line map to? ------
+    // The host's line actions use it to hide run/jump/turbo on DATA lines.
+    // Pure table lookup, no emulator I/O.
+    lineInfo(req) {
+        const a = req.arguments || {};
+        const snap = (resolverInstance && a.file && typeof a.line === 'number')
+            ? resolverInstance.addrForLine(a.file, a.line) : null;
+        if (!snap) { respond(req, { addr: -1, executable: false }); return; }
+        respond(req, { addr: snap.addr, line: snap.line, executable: executableLine(snap.addr, a.file) });
     },
 
     // -- Reset cycle counter (custom request) -------------------------
