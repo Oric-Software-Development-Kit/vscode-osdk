@@ -1918,26 +1918,9 @@ function isBreakpointAt(addr) {
     return false;
 }
 
-// Snap a requested source line to the nearest executable line of `normFile`
-// (already canonPath'd) in a line table: the next entry at/after reqLine, else
-// the nearest before (end of file). Snapping backward first would collapse
-// distinct lines (the old "two at 489" bug). Used ONLY by setBreakpoints,
-// which resolves per-module bucket tables (a shared file binds in each owning
-// overlay); every other consumer goes through the resolver's addrForLine —
-// SAME rule, keep the two in sync until Step F collapses them.
-function snapSrcLine(lt, normFile, reqLine) {
-    let afterAddr = -1, afterLine = Infinity;
-    let beforeAddr = -1, beforeLine = -1;
-    for (const entry of lt) {
-        if (canonPath(entry.file) !== normFile) continue;
-        if (entry.line >= reqLine && entry.line < afterLine) { afterLine = entry.line; afterAddr = entry.addr; }
-        if (entry.line <= reqLine && entry.line > beforeLine) { beforeLine = entry.line; beforeAddr = entry.addr; }
-    }
-    return afterAddr >= 0 ? { addr: afterAddr, line: afterLine } : { addr: beforeAddr, line: beforeLine };
-}
-
 // Resolve a source file+line to an address in the ACTIVE composed view —
-// thin wrapper over the resolver's inverse mapping (§5.6).
+// thin wrapper over the resolver's inverse mapping (§5.6). Breakpoint binding
+// passes the resolver's module restriction instead (see setBreakpoints).
 function resolveSrcLineAddr(file, reqLine) {
     const r = resolverInstance ? resolverInstance.addrForLine(file, reqLine) : null;
     return r ? r.addr : -1;
@@ -2123,11 +2106,8 @@ async function buildDisasmCache(centerAddr) {
             const cKey = srcInfo.file + ':' + srcInfo.line;
             if (cKey !== lastCContext) {
                 lastCContext = cKey;
-                const resolvedPath = path.isAbsolute(srcInfo.file) ? srcInfo.file
-                    : config.sourceRoot ? path.resolve(config.sourceRoot, srcInfo.file)
-                    : config.workspaceFolder ? path.resolve(config.workspaceFolder, srcInfo.file)
-                    : srcInfo.file;
-                const cText = getSourceLine(resolvedPath, srcInfo.line);
+                // sourceFor() paths come from the resolver, already absolute (§9)
+                const cText = getSourceLine(srcInfo.file, srcInfo.line);
                 const cLabel = path.basename(srcInfo.file) + ':' + srcInfo.line;
                 const comment = cText != null
                     ? '; --- ' + cLabel + ': ' + cText.trim() + ' ---'
@@ -3087,10 +3067,11 @@ const handlers = {
             let dispLine = -1;
 
             for (const mod of owners) {
-                const bucket = moduleBuckets.get(mod) || moduleBuckets.get('R');
-                const lt = bucket ? bucket.lineTable : lineTable;
-                const snap = snapSrcLine(lt, norm, reqLine);
-                if (snap.addr >= 0) {
+                // Resolve within EACH owning module's own lines (a shared file
+                // sits at a different address per overlay) — the same snapping
+                // rule goto/turbo use, via the resolver's module restriction.
+                const snap = resolverInstance ? resolverInstance.addrForLine(srcPath, reqLine, mod) : null;
+                if (snap) {
                     bindings.push({ addr: snap.addr, module: mod, armed: false });
                     if (dispLine < 0 || mod === activeModuleId) dispLine = snap.line; // prefer the active module's snapped line
                 }
@@ -3288,11 +3269,8 @@ const handlers = {
                 // redundant for assembly (the disassembly IS the assembly source).
                 const instrSrc = sourceFor(a);
                 if (instrSrc && /\.[cC]$/i.test(instrSrc.file)) {
-                    const fp = path.isAbsolute(instrSrc.file) ? instrSrc.file
-                        : config.sourceRoot ? path.resolve(config.sourceRoot, instrSrc.file)
-                        : config.workspaceFolder ? path.resolve(config.workspaceFolder, instrSrc.file)
-                        : instrSrc.file;
-                    instr.location = { name: path.basename(fp), path: fp };
+                    // sourceFor() paths come from the resolver, already absolute (§9)
+                    instr.location = { name: path.basename(instrSrc.file), path: instrSrc.file };
                     instr.line = instrSrc.line;
                 }
                 all.push(instr);

@@ -382,17 +382,18 @@ function buildResolver(text, opts) {
 
   // --- Inverse mapping (§5.6): line -> address ----------------------------
 
-  // file+line -> address in the ACTIVE view. Same snapping rule as breakpoint
-  // binding (adapter snapSrcLine — keep the two in sync until Step F collapses
-  // them): the next entry at/after reqLine in that file, else the nearest
-  // before (end of file); snapping backward first would collapse distinct
-  // lines. When the snapped line spans several addresses, the LOWEST one wins
-  // (the line's first instruction). Returns { addr, line } or null (no entries
-  // for that file in this view).
-  function addrForLine(file, reqLine) {
+  // file+line -> address. THE snapping rule (breakpoints, goto and turboRun all
+  // agree by construction): the next entry at/after reqLine in that file, else
+  // the nearest before (end of file); snapping backward first would collapse
+  // distinct lines. When the snapped line spans several addresses, the LOWEST
+  // one wins (the line's first instruction). Returns { addr, line } or null.
+  // By default resolves in the ACTIVE composed view; pass `module` ('R' or an
+  // overlay id) to restrict to that module's own lines — breakpoint binding
+  // resolves a shared file in EACH owning overlay, whatever is active.
+  function addrForLine(file, reqLine, module) {
     let afterAddr = -1, afterLine = Infinity, beforeAddr = -1, beforeLine = -1;
     for (const l of lines) {
-      if (!inView(l.module, activeModule)) continue;
+      if (module !== undefined ? l.module !== module : !inView(l.module, activeModule)) continue;
       if (!samePathLoose(l.file, file)) continue;
       if (l.line >= reqLine && (l.line < afterLine || (l.line === afterLine && l.addr < afterAddr)))
         { afterLine = l.line; afterAddr = l.addr; }

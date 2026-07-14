@@ -44,6 +44,24 @@
       "expect": null
     },
     {
+      "name": "exact-module restriction (breakpoint binding): kernel.s in module 'R' regardless of active view",
+      "fn": "addrForLine", "module": 3, "moduleArg": "R",
+      "file": "kernel.s", "line": 734,
+      "expect": { "addr": "fd40", "line": 734 }
+    },
+    {
+      "name": "exact-module restriction: overlay file in ITS module id",
+      "fn": "addrForLine", "module": null, "moduleArg": 0,
+      "file": "module_megabuilding.s", "line": 835,
+      "expect": { "addr": "2a79", "line": 835 }
+    },
+    {
+      "name": "exact-module restriction: resident file is NOT in an overlay's own lines",
+      "fn": "addrForLine", "module": null, "moduleArg": 0,
+      "file": "kernel.s", "line": 734,
+      "expect": null
+    },
+    {
       "name": "stepping: next different loader.asm line after pc=$FD40/line 150 is $FD43 (the run continues)",
       "fn": "nextLineAddr", "module": null,
       "pc": "fd40", "file": "loader.asm", "line": 150,

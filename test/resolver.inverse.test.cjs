@@ -69,7 +69,9 @@ for (const c of fixture.cases) {
   let got, shown, ok;
   try {
     if (c.fn === 'addrForLine') {
-      got = resolver.addrForLine(toFull(c.file), c.line);
+      // moduleArg = the exact-module restriction (third parameter); distinct
+      // from c.module, which sets the ACTIVE view.
+      got = resolver.addrForLine(toFull(c.file), c.line, c.moduleArg === undefined ? undefined : c.moduleArg);
       ok = c.expect === null ? got === null
          : !!got && hex(got.addr) === c.expect.addr && got.line === c.expect.line;
       shown = got ? '$' + hex(got.addr) + ' (line ' + got.line + ')' : 'null';

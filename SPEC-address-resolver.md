@@ -270,7 +270,9 @@ buildResolver(symbolFileText, {
 }) → {
   resolve(addr)            → { addr, symbol:{name,base,offset,aliases:[{name,source}]}|null,
                                source:{file,line}|null, kind, module },
-  addrForLine(file, line)      → { addr, line } | null,  // snapped line reported (skip-line needs it)
+  addrForLine(file, line, module?) → { addr, line } | null,  // snapped line reported (skip-line needs
+                                           // it); module ('R'|id) restricts to that module's own lines
+                                           // instead of the active view (breakpoint binding, Step F)
   nextLineAddr(pc, file, line) → addr | -1,   // next DIFFERENT line of file strictly after pc (stepping)
   declOf(name)             → { file, line } | null,   // #SYM decl (first textual occurrence)
   setActiveModule(id),                     // recompose R + overlay; cheap (re-layer, not full reparse)
