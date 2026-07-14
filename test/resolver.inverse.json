@@ -54,6 +54,30 @@
       "fn": "nextLineAddr", "module": null,
       "pc": "fffe", "file": "loader.asm", "line": 544,
       "expect": -1
+    },
+    {
+      "name": "declOf: #SYM points at a jmp REFERENCE (loader.asm:137) — the definition label at 149 wins",
+      "fn": "declOf", "module": null,
+      "symbol": "_LoaderResidentStart",
+      "expect": { "file": "loader.asm", "line": 149 }
+    },
+    {
+      "name": "declOf: #SYM points at an lda reference (kernel.s:132) — the boundary label at 733 wins (bare label = no own #LINES entry, found by the upward scan)",
+      "fn": "declOf", "module": null,
+      "symbol": "_OverlayBufferEnd",
+      "expect": { "file": "kernel.s", "line": 733 }
+    },
+    {
+      "name": "declOf: overlay-only symbol visible in its module view, null in resident view",
+      "fn": "declOf", "module": 0,
+      "symbol": "_flash_idx",
+      "expect": { "file": "module_megabuilding.s", "line": 393 }
+    },
+    {
+      "name": "declOf: overlay-only symbol is invisible resident-only",
+      "fn": "declOf", "module": null,
+      "symbol": "_flash_idx",
+      "expect": null
     }
   ]
 }

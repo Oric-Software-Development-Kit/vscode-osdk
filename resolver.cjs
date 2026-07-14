@@ -202,6 +202,16 @@ function buildResolver(text, opts) {
     const symAddrs = [...symsByAddr.keys()].sort((a, b) => a - b);
     const lineAddrs = [...linesByAddr.keys()].sort((a, b) => a - b);
 
+    // First in-view symbol per name — declOf()'s index, iterated in ord order
+    // so the first declaration wins among duplicates. Stores the sym object:
+    // defSiteOf() needs addr/uid too (a TMP-dropped decl can still resolve to
+    // the unit's line at the symbol's address).
+    const declByName = new Map();
+    for (const s of syms) {
+      if (!inView(s.module, active)) continue;
+      if (!declByName.has(s.name)) declByName.set(s.name, s);
+    }
+
     // Aliased = a genuine conflict: 2+ symbols, or 2+ lines, or a lone sym+line
     // that come from DIFFERENT units (cross-unit collision). NOT every label that
     // merely sits on a lined instruction (finding #5).
@@ -211,7 +221,7 @@ function buildResolver(text, opts) {
       if (ss.length > 1 || (ll && ll.length > 1) ||
           (ss.length === 1 && ll && ll.length === 1 && ss[0].uid !== ll[0].uid)) aliased.push(addr);
     }
-    return { symsByAddr, linesByAddr, runMember, symAddrs, lineAddrs, aliased };
+    return { symsByAddr, linesByAddr, runMember, symAddrs, lineAddrs, aliased, declByName };
   }
 
   function view() {
@@ -339,7 +349,7 @@ function buildResolver(text, opts) {
       const seen = new Set([owner.name]);
       for (const s of symsHere) {
         if (seen.has(s.name)) continue; seen.add(s.name);
-        aliases.push({ name: s.name, source: s.symFile ? { file: s.symFile, line: s.symLine } : null });
+        aliases.push({ name: s.name, source: defSiteOf(s, v) });
       }
       aliases.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
       rec.symbol = { name: owner.name, base: owner.addr, offset: addr - owner.addr, aliases };
@@ -413,10 +423,48 @@ function buildResolver(text, opts) {
     return -1;
   }
 
+  // Best-effort DEFINITION site of a symbol. The #SYM location is only the
+  // name's FIRST TEXTUAL OCCURRENCE — for exported labels that is often a mere
+  // reference (`lda _OverlayBufferEnd`, `jmp _LoaderResidentStart`), not the
+  // definition. Trust the decl only when its line TEXT defines the name (label
+  // in leading position, which also covers `name = expr`); otherwise prefer the
+  // symbol's own unit's #LINES entry at its address (the storage/code line right
+  // at the label); else the decl as-is. Exact everywhere once XA records real
+  // definition lines.
+  function defSiteOf(sym, v) {
+    const defines = new RegExp('^\\s*' + sym.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b');
+    if (sym.symFile && sym.symLine) {
+      const text = readSourceLine(sym.symFile, sym.symLine);
+      if (text == null) return { file: sym.symFile, line: sym.symLine }; // unreadable: trust it
+      if (defines.test(stripComment(text))) return { file: sym.symFile, line: sym.symLine };
+    }
+    const here = v.linesByAddr.get(sym.addr);
+    if (here) for (const l of here) if (l.uid === sym.uid) {
+      // The entry marks the code/storage AT the address; a bare label defining
+      // the name emits no #LINES entry of its own and sits at or a few lines
+      // above — scan up for the line that actually starts with the name.
+      for (let ln = l.line; ln >= Math.max(1, l.line - 8); ln--) {
+        const t = readSourceLine(l.file, ln);
+        if (t != null && defines.test(stripComment(t))) return { file: l.file, line: ln };
+      }
+      return { file: l.file, line: l.line };
+    }
+    return sym.symFile ? { file: sym.symFile, line: sym.symLine } : null;
+  }
+
+  // Definition site of a symbol by NAME in the active view (first declaration
+  // wins among duplicates). Spec §6; the symbol browser navigates per-alias
+  // through it (Step D).
+  function declOf(name) {
+    const v = view();
+    const sym = v.declByName.get(name);
+    return sym ? defSiteOf(sym, v) : null;
+  }
+
   function setActiveModule(id) { activeModule = (id === undefined ? null : id); } // keep explicit: module 0 is falsy but valid
   function aliasedAddresses() { return view().aliased.slice(); } // already sorted ascending
 
-  return { resolve, addrForLine, nextLineAddr, setActiveModule, aliasedAddresses };
+  return { resolve, addrForLine, nextLineAddr, declOf, setActiveModule, aliasedAddresses };
 }
 
 module.exports = { buildResolver };

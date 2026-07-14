@@ -44,7 +44,7 @@ try { ({ buildResolver } = require('../resolver.cjs')); }
 catch (e) { fail('cannot load resolver.cjs: ' + e.message, 2); }
 
 const resolver = buildResolver(symbolText, { readSourceLine, sourceRoot: undefined, workspaceFolder: NOVA_ROOT });
-for (const fn of ['addrForLine', 'nextLineAddr', 'setActiveModule']) {
+for (const fn of ['addrForLine', 'nextLineAddr', 'declOf', 'setActiveModule']) {
   if (typeof resolver[fn] !== 'function') fail('resolver missing required method: ' + fn + '()', 2);
 }
 
@@ -77,6 +77,12 @@ for (const c of fixture.cases) {
       got = resolver.nextLineAddr(parseInt(c.pc, 16), toFull(c.file), c.line);
       ok = (c.expect === -1) ? got === -1 : got >= 0 && hex(got) === c.expect;
       shown = got === -1 ? '-1' : '$' + hex(got);
+    } else if (c.fn === 'declOf') {
+      got = resolver.declOf(c.symbol);
+      const gotBase = got ? path.basename(String(got.file)).toLowerCase() : null;
+      ok = c.expect === null ? got === null
+         : !!got && gotBase === c.expect.file.toLowerCase() && got.line === c.expect.line;
+      shown = got ? gotBase + ':' + got.line : 'null';
     } else { throw new Error('unknown fn ' + c.fn); }
   } catch (e) {
     process.stderr.write('[FAIL] ' + c.name + '\n    THREW: ' + e.message + '\n'); failed++; continue;

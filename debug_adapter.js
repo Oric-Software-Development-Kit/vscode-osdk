@@ -1860,32 +1860,10 @@ async function buildTypedVar(name, addr, fullType, size, ann) {
     return { name, value: formatScalar(base, mem, 0, size) + '  ' + fullType + '  @ ' + hAddr, variablesReference: 0 };
 }
 
-// Exact-match lookup in lineTable: returns {file, line} only if the address
-// has an entry at that precise address.  Used by readAllSymbols for symbol
-// browser — unlike sourceFor(), this never returns a fuzzy/nearby match.
-function exactLineSource(addr) {
-    if (lineTable.length === 0) return null;
-    let lo = 0, hi = lineTable.length - 1;
-    while (lo <= hi) {
-        const mid = (lo + hi) >> 1;
-        if (lineTable[mid].addr === addr) return lineTable[mid];
-        if (lineTable[mid].addr < addr) lo = mid + 1;
-        else hi = mid - 1;
-    }
-    return null;
-}
-
 // Check if a file path looks like a build artifact (linked.s, etc.)
 function isBuildArtifact(filePath) {
     const base = path.basename(filePath).toLowerCase();
     return base === 'linked.s' || base === 'linked.asm';
-}
-
-// addrSource lookup that skips build artifacts
-function nonArtifactSource(addr) {
-    const src = addrSource.get(addr);
-    if (src && !isBuildArtifact(src.file)) return src;
-    return null;
 }
 
 // Address of the next different source line after `pc` (source-level
@@ -3811,34 +3789,29 @@ const handlers = {
                 const pageData = mem.get(page);
                 value.push(pageData ? pageData[off] : 0);
             }
-            // Order: master define first (the one addrSym returns, i.e. first in
-            // symbol file), then aliases sorted by name length
-            const master = addrSym.get(s.addr);
+            // Canonical owner first — the resolver's stage-3b pick, i.e. the SAME
+            // name the call stack and disassembly show at this address — then
+            // aliases sorted by name length.
+            const rec = resolverInstance ? resolverInstance.resolve(s.addr) : null;
+            const master = rec && rec.symbol ? rec.symbol.name : null;
             if (master && s.names.includes(master)) {
                 s.names = [master, ...s.names.filter(n => n !== master).sort((a, b) => a.length - b.length)];
             } else {
                 s.names.sort((a, b) => a.length - b.length);
             }
-            // Build per-name source locations.
-            // Use exact lineTable match (from #LINES) first — it points to real
-            // source files.  Fall back to symSource (V2 per-symbol info) only if
-            // it doesn't reference a build artifact like linked.s.
-            // sourceFor() is NOT used here because its fuzzy nearest-address
-            // matching produces garbage for ZP/data symbols that have no code.
+            // Per-name navigation targets, all off the one resolver record:
+            // the owner gets the record's source (winning exact line, else its
+            // decl); each alias gets its own #SYM decl (aliases[].source), with
+            // declOf() as the fallback for names the record doesn't carry.
+            const aliasSrc = new Map();
+            if (rec && rec.symbol) for (const al of rec.symbol.aliases) if (al.source) aliasSrc.set(al.name, al.source);
             const nameSources = {};
             for (const n of s.names) {
-                const addr = symbols.get(n);
-                const lt = (typeof addr === 'number') ? exactLineSource(addr) : null;
-                if (lt) {
-                    nameSources[n] = { file: lt.file, line: lt.line };
-                } else {
-                    const ns = symSource.get(n);
-                    if (ns && !isBuildArtifact(ns.file)) {
-                        nameSources[n] = { file: ns.file, line: ns.line };
-                    }
-                }
+                const src = (n === master && rec.source) ? rec.source
+                    : aliasSrc.get(n) || (resolverInstance ? resolverInstance.declOf(n) : null);
+                if (src) nameSources[n] = { file: src.file, line: src.line };
             }
-            const src = exactLineSource(s.addr) || nonArtifactSource(s.addr);
+            const src = rec && rec.source ? rec.source : null;
             const vt = varTypes.get(s.names[0]);
             // Annotated value rendered through the SAME path as Watch (formatAnnotated),
             // so a @bcd/@enum/@bool/@bitset symbol shows the decoded value + type token

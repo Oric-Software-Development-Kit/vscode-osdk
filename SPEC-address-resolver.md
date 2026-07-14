@@ -272,7 +272,7 @@ buildResolver(symbolFileText, {
                                source:{file,line}|null, kind, module },
   addrForLine(file, line)      → { addr, line } | null,  // snapped line reported (skip-line needs it)
   nextLineAddr(pc, file, line) → addr | -1,   // next DIFFERENT line of file strictly after pc (stepping)
-  declOf(name)             → { file, line } | null,   // (Step D, not yet implemented)
+  declOf(name)             → { file, line } | null,   // #SYM decl (first textual occurrence)
   setActiveModule(id),                     // recompose R + overlay; cheap (re-layer, not full reparse)
   aliasedAddresses()       → [addr…],      // for the disagreement log + golden test
 }
