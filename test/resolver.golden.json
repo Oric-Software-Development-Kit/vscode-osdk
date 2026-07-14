@@ -2,7 +2,7 @@
   "_meta": {
     "symbolFile": "E:/git/Nova2026/build/symbols_ext_combined",
     "rule": "spec v3 §5.3 (line-entry-first + unit restriction + stage-3b tie-break) / §5.4 (source-text kind)",
-    "generated": "2026-07-11T11:28:58.796Z",
+    "generated": "2026-07-14T18:36:42.123Z",
     "note": "Independent oracle (Fable). Aliased = >=2 distinct symbol names OR >=2 #LINES entries in the composed view. owner.file is absolute; compare paths case/slash-insensitively.",
     "modules": {
       "0": "Megabuilding",
@@ -87,8 +87,8 @@
           "addr": 84,
           "owner": {
             "name": "_MemsetSizeH",
-            "file": "E:\\git\\Nova2026\\code\\kernel.s",
-            "line": 135
+            "file": "E:\\git\\Nova2026\\code\\memory.s",
+            "line": 19
           },
           "kind": "unknown",
           "aliases": [
@@ -392,14 +392,14 @@
         "d5dd": {
           "addr": 54749,
           "owner": {
-            "name": "_StartBSS_Kernel",
+            "name": "_KernelIrqCounter",
             "file": "E:\\git\\Nova2026\\code\\kernel.s",
             "line": 671
           },
           "kind": "data",
           "aliases": [
             "_KernelEnd",
-            "_KernelIrqCounter"
+            "_StartBSS_Kernel"
           ]
         },
         "fd40": {
@@ -519,13 +519,13 @@
         "3917": {
           "addr": 14615,
           "owner": {
-            "name": "_MapNusaImagePacked",
+            "name": "_BufferAddrLow",
             "file": "E:\\git\\Nova2026\\code\\module_megabuilding.s",
             "line": 1592
           },
           "kind": "data",
           "aliases": [
-            "_BufferAddrLow",
+            "_MapNusaImagePacked",
             "_TrainBgBuffer"
           ]
         },
@@ -670,8 +670,8 @@
           "addr": 84,
           "owner": {
             "name": "_MemsetSizeH",
-            "file": "E:\\git\\Nova2026\\code\\kernel.s",
-            "line": 135
+            "file": "E:\\git\\Nova2026\\code\\memory.s",
+            "line": 19
           },
           "kind": "unknown",
           "aliases": [
@@ -902,14 +902,14 @@
         "0400": {
           "addr": 1024,
           "owner": {
-            "name": "_TrainBuffer",
-            "file": "E:\\git\\Nova2026\\code\\module_megabuilding.s",
-            "line": 217
+            "name": "_Buffer_8000",
+            "file": "E:\\git\\Nova2026\\code\\module_start.h",
+            "line": 20
           },
           "kind": "unknown",
           "aliases": [
-            "_Buffer_8000",
             "_MetroInsideView",
+            "_TrainBuffer",
             "_WindowViewImage"
           ]
         },
@@ -1195,14 +1195,14 @@
         "d5dd": {
           "addr": 54749,
           "owner": {
-            "name": "_StartBSS_Kernel",
+            "name": "_KernelIrqCounter",
             "file": "E:\\git\\Nova2026\\code\\kernel.s",
             "line": 671
           },
           "kind": "data",
           "aliases": [
             "_KernelEnd",
-            "_KernelIrqCounter"
+            "_StartBSS_Kernel"
           ]
         },
         "fd40": {
@@ -1422,8 +1422,8 @@
           "addr": 84,
           "owner": {
             "name": "_MemsetSizeH",
-            "file": "E:\\git\\Nova2026\\code\\kernel.s",
-            "line": 135
+            "file": "E:\\git\\Nova2026\\code\\memory.s",
+            "line": 19
           },
           "kind": "unknown",
           "aliases": [
@@ -1615,13 +1615,13 @@
         "0400": {
           "addr": 1024,
           "owner": {
-            "name": "_ScrollDataBuffer",
-            "file": "E:\\git\\Nova2026\\code\\module_monitor_scroll.s",
-            "line": 28
+            "name": "_Buffer_8000",
+            "file": "E:\\git\\Nova2026\\code\\module_start.h",
+            "line": 20
           },
           "kind": "unknown",
           "aliases": [
-            "_Buffer_8000"
+            "_ScrollDataBuffer"
           ]
         },
         "c14b": {
@@ -1881,14 +1881,14 @@
         "d5dd": {
           "addr": 54749,
           "owner": {
-            "name": "_StartBSS_Kernel",
+            "name": "_KernelIrqCounter",
             "file": "E:\\git\\Nova2026\\code\\kernel.s",
             "line": 671
           },
           "kind": "data",
           "aliases": [
             "_KernelEnd",
-            "_KernelIrqCounter"
+            "_StartBSS_Kernel"
           ]
         },
         "fd40": {
@@ -2096,8 +2096,8 @@
           "addr": 84,
           "owner": {
             "name": "_MemsetSizeH",
-            "file": "E:\\git\\Nova2026\\code\\kernel.s",
-            "line": 135
+            "file": "E:\\git\\Nova2026\\code\\memory.s",
+            "line": 19
           },
           "kind": "unknown",
           "aliases": [
@@ -2567,14 +2567,14 @@
         "d5dd": {
           "addr": 54749,
           "owner": {
-            "name": "_StartBSS_Kernel",
+            "name": "_KernelIrqCounter",
             "file": "E:\\git\\Nova2026\\code\\kernel.s",
             "line": 671
           },
           "kind": "data",
           "aliases": [
             "_KernelEnd",
-            "_KernelIrqCounter"
+            "_StartBSS_Kernel"
           ]
         },
         "fd40": {
@@ -2756,14 +2756,14 @@
         "5900": {
           "addr": 22784,
           "owner": {
-            "name": "_TextScrollBuffer",
+            "name": "_BallHiresAddrLow_Mirror",
             "file": "E:\\git\\Nova2026\\code\\module_demo.s",
             "line": 488
           },
           "kind": "data",
           "aliases": [
-            "_BallHiresAddrLow_Mirror",
-            "_DotHiresAddrLow_Mirror"
+            "_DotHiresAddrLow_Mirror",
+            "_TextScrollBuffer"
           ]
         },
         "9472": {
@@ -2860,8 +2860,8 @@
           "addr": 84,
           "owner": {
             "name": "_MemsetSizeH",
-            "file": "E:\\git\\Nova2026\\code\\kernel.s",
-            "line": 135
+            "file": "E:\\git\\Nova2026\\code\\memory.s",
+            "line": 19
           },
           "kind": "unknown",
           "aliases": [
@@ -3157,16 +3157,16 @@
         "58a2": {
           "addr": 22690,
           "owner": {
-            "name": "_LabelPicture1",
+            "name": "_BallOffsetX",
             "file": "E:\\git\\Nova2026\\code\\module_demo.s",
             "line": 482
           },
           "kind": "data",
           "aliases": [
-            "_BallOffsetX",
             "_BufferZ",
             "_DotPrevX",
             "_EndText",
+            "_LabelPicture1",
             "_RatBoyFontEnd",
             "_StartBSS"
           ]
@@ -3174,51 +3174,51 @@
         "58b2": {
           "addr": 22706,
           "owner": {
-            "name": "_DotPrevY",
+            "name": "_BallOffsetY",
             "file": "E:\\git\\Nova2026\\code\\module_demo.s",
             "line": 483
           },
           "kind": "data",
           "aliases": [
-            "_BallOffsetY"
+            "_DotPrevY"
           ]
         },
         "5a00": {
           "addr": 23040,
           "owner": {
-            "name": "_PaperBuf0",
+            "name": "_BallHiresAddrHigh_Mirror",
             "file": "E:\\git\\Nova2026\\code\\module_demo.s",
             "line": 489
           },
           "kind": "data",
           "aliases": [
-            "_BallHiresAddrHigh_Mirror",
-            "_DotHiresAddrHigh_Mirror"
+            "_DotHiresAddrHigh_Mirror",
+            "_PaperBuf0"
           ]
         },
         "5b00": {
           "addr": 23296,
           "owner": {
-            "name": "_PaperBuf1",
+            "name": "_CosTable_X",
             "file": "E:\\git\\Nova2026\\code\\module_demo.s",
             "line": 494
           },
           "kind": "data",
           "aliases": [
             "_BSSEnd_Dots",
-            "_CosTable_X"
+            "_PaperBuf1"
           ]
         },
         "5c00": {
           "addr": 23552,
           "owner": {
-            "name": "_PaperBuf2",
+            "name": "_CosTable_Y",
             "file": "E:\\git\\Nova2026\\code\\module_demo.s",
             "line": 495
           },
           "kind": "data",
           "aliases": [
-            "_CosTable_Y"
+            "_PaperBuf2"
           ]
         },
         "5d00": {
@@ -3490,14 +3490,14 @@
         "d5dd": {
           "addr": 54749,
           "owner": {
-            "name": "_StartBSS_Kernel",
+            "name": "_KernelIrqCounter",
             "file": "E:\\git\\Nova2026\\code\\kernel.s",
             "line": 671
           },
           "kind": "data",
           "aliases": [
             "_KernelEnd",
-            "_KernelIrqCounter"
+            "_StartBSS_Kernel"
           ]
         },
         "fd40": {
@@ -3705,8 +3705,8 @@
           "addr": 84,
           "owner": {
             "name": "_MemsetSizeH",
-            "file": "E:\\git\\Nova2026\\code\\kernel.s",
-            "line": 135
+            "file": "E:\\git\\Nova2026\\code\\memory.s",
+            "line": 19
           },
           "kind": "unknown",
           "aliases": [
@@ -4152,14 +4152,14 @@
         "d5dd": {
           "addr": 54749,
           "owner": {
-            "name": "_StartBSS_Kernel",
+            "name": "_KernelIrqCounter",
             "file": "E:\\git\\Nova2026\\code\\kernel.s",
             "line": 671
           },
           "kind": "data",
           "aliases": [
             "_KernelEnd",
-            "_KernelIrqCounter"
+            "_StartBSS_Kernel"
           ]
         },
         "fd40": {
@@ -4355,8 +4355,8 @@
           "addr": 84,
           "owner": {
             "name": "_MemsetSizeH",
-            "file": "E:\\git\\Nova2026\\code\\kernel.s",
-            "line": 135
+            "file": "E:\\git\\Nova2026\\code\\memory.s",
+            "line": 19
           },
           "kind": "unknown",
           "aliases": [
@@ -4827,14 +4827,14 @@
         "d5dd": {
           "addr": 54749,
           "owner": {
-            "name": "_StartBSS_Kernel",
+            "name": "_KernelIrqCounter",
             "file": "E:\\git\\Nova2026\\code\\kernel.s",
             "line": 671
           },
           "kind": "data",
           "aliases": [
             "_KernelEnd",
-            "_KernelIrqCounter"
+            "_StartBSS_Kernel"
           ]
         },
         "fd40": {
