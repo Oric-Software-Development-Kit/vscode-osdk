@@ -3778,6 +3778,31 @@ const handlers = {
             return;
         }
 
+        // Symbol owned by an INACTIVE module: answer quietly instead of erroring.
+        // Multi-module projects legitimately watch symbols that only exist while
+        // their overlay is loaded (gSaveGameFile in Splash/Outro, the MonkeyKing
+        // scores…). The built-in Watch shows the calm text; the Symbol Browser's
+        // watch section folds these away via the `inactive`/`owners` fields.
+        // Memory is NOT read — the address belongs to whatever module is mapped.
+        {
+            const owners = [];
+            for (const [mod, b] of moduleBuckets) {
+                if (mod === 'R' || mod === activeModuleId) continue; // active view already searched
+                const ba = b.symbols.get(expr) !== undefined ? b.symbols.get(expr) : b.symbols.get('_' + expr);
+                if (ba !== undefined)
+                    owners.push((moduleNames.get(mod) || ('module ' + mod)) + ' @ $' + ba.toString(16).toUpperCase().padStart(4, '0'));
+            }
+            if (owners.length) {
+                respond(req, {
+                    result: '(inactive — ' + owners.join(', ') + ')',
+                    variablesReference: 0,
+                    inactive: true,
+                    owners: owners.join(', ')
+                });
+                return;
+            }
+        }
+
         // Forward to Oricutron monitor via qOricCmd:  ! <command>
         if (expr.startsWith('!')) {
             const monCmd = expr.substring(1).trim();
