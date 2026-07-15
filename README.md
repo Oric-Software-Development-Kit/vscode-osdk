@@ -142,6 +142,8 @@ sources for them at session start.
 | `@bcd` / `@bcd-be` / `@bcd-le` | packed BCD decoded to a readable number | `current_score_bcd .dsb 2 ; @bcd-be` |
 | `@str [term]` | terminated string at the symbol (terminator byte in decimal, default 0) | `_Text_Title ; @str 255` |
 | `@strptr [term]` | 16-bit pointer to a terminated string | `textPtr .dsb 2 ; @strptr 255` |
+| `@stream <E>` | a 16-bit pointer into a byte-code stream whose opcodes are enum `<E>`; expands to the next decoded commands with typed parameters | `_gCurrentStream .dsb 2 ; @stream script_command` |
+| `@params <t>…` | on an enum MEMBER: the byte-stream parameters that opcode consumes (drives `@stream`) | `COMMAND_WAIT = 6, // @params byte` |
 
 Notes:
 - `@enum` / `@bitset` name a C `enum` type (the OSDK compiler emits enum info under `-g1`, and XA
@@ -157,6 +159,13 @@ Notes:
 - An `@enum` on a multi-byte symbol (a `.dsb` buffer) decodes each byte separately:
   `gWordBuffer → [e_WORD_TAKE, e_ITEM_Meat, ...]`. Chains resolve per byte, so mixed
   word/item buffers show the right names as long as the enums' value ranges don't overlap.
+- `@stream <E>` visualizes a byte-code stream: watching the pointer expands to the next
+  commands, each shown as `COMMAND_NAME(param, param, …)` with parameters decoded by their
+  `@params` types. Each `@params` token is an enum type name, `byte`, `word` (16-bit LE),
+  `str` (inline NUL-terminated string), or `end` (a terminator/jump that stops the linear
+  preview). A member with no `@params` (or an unknown opcode) stops the walk. `@params`
+  comments must contain ONLY tokens and must match the byte layout the engine consumes,
+  or the walk desyncs. Edit one and reparse (no rebuild) to see it live.
 - Annotated values render consistently in the Watch/Variables views, the Symbol Browser, and inline
   in the disassembly — each shows the decoded value plus a short type token (e.g. `bool`, the enum
   name, `bcd-be`).

@@ -484,6 +484,10 @@ let enumDefs   = new Map();   // enumName -> { size, byValue: Map<number,string>
 // header (.h, "// @...") and assembler (.s, "; @...") source. Two association
 // levels: by C-struct field, and by symbol name (C globals & asm data labels).
 let annByField  = new Map();  // "structName.fieldName" -> { kind:'bool'|'enum'|'bitset', enumName? }
+// @params grammar for byte-stream commands: "enumName.MEMBER" -> [typeToken, ...].
+// Each token is a param type (an enum name, byte, word, str255) or the special
+// "end" token = stop the linear preview after this command (terminators, jumps).
+let paramsByEnumMember = new Map();
 let annBySymbol = new Map();  // symbolName (no leading _) -> { kind, enumName? }
 // Union of every module's enum defs. Annotation resolution (@enum/@bitset) must
 // work regardless of which module is active (the enum defs are identical across
@@ -769,6 +773,7 @@ function buildSymInfo() {
 // (Symbol addresses, line tables and struct/enum type defs come from the built
 // symbol file — those DO need a rebuild + session restart to change.)
 function reparseAnnotations() {
+    sourceLineCache = {};              // drop cached source text so CODE-LINE @enum edits reload
     parseAnnotations(moduleAllFiles);
     buildSymInfo();                    // annotation widths (bcd/bitset) re-applied
     evt('oricSymbolsChanged', { reason: 'reparse', module: activeModuleId });
@@ -1260,14 +1265,24 @@ function fieldAtOffset(structName, y) {
              index: elemSize > 0 ? Math.floor(within / elemSize) : 0 };
 }
 
+// The `@enum <E>` type named on the source CODE LINE at `pc`, or null. Explicit
+// intent for the value an instruction fetches (covers indexed/indirect reads the
+// operand's own type can't cover). One place, so the register tag and the inline
+// annotation read the same line annotation. Read live via getSourceLine (whose
+// cache reparse clears), so edits go live on save.
+function lineEnumOf(pc) {
+    const s = sourceFor(pc);
+    const text = s ? getSourceLine(s.file, s.line) : null;
+    const lm = text && text.match(/@enum\b\s*([\w|]+)?/);
+    return (lm && lm[1] && resolveEnum(lm[1])) ? lm[1] : null;
+}
+
 // The enum tag a load instruction confers, or null. Line annotation first
 // (explicit intent, covers indirect fetches like the byte-stream readers),
 // else registry inference from a direct-address operand's symbol.
 function tagForLoad(prevPc, mode, lo, hi) {
-    const s = sourceFor(prevPc);
-    const text = s ? getSourceLine(s.file, s.line) : null;
-    const lm = text && text.match(/@enum\b\s*([\w|]+)?/);
-    if (lm && lm[1] && resolveEnum(lm[1])) return { enumName: lm[1], source: 'line' };
+    const le = lineEnumOf(prevPc);
+    if (le) return { enumName: le, source: 'line' };
     let operand = -1;
     if (mode === 'z') operand = lo;
     else if (mode === 'a') operand = (hi << 8) | lo;
@@ -1289,6 +1304,11 @@ function tagForLoad(prevPc, mode, lo, hi) {
     if (mode === ')' && regs) {
         const pname = symbolAt(lo);
         const pann = pname ? annForSymbol(pname) : null;
+        // @stream pointer read at Y=0 = the OPCODE byte (the pointer points at the
+        // current command) → tag the register with the stream's command enum.
+        // Param bytes are read at Y>=1 (or via other pointers), so they don't tag.
+        if (pann && pann.kind === 'stream' && regs.y === 0 && resolveEnum(pann.enumName))
+            return { enumName: pann.enumName, source: pname + '→opcode' };
         if (pann && pann.kind === 'ptr16' && pann.enumName) {
             const info = fieldAtOffset(pann.enumName, regs.y);
             if (info && info.elemSize === 1 && resolveEnum(info.base))
@@ -1875,8 +1895,12 @@ function bitsetBytes(ed) {
 function parseAnnotations(files) {
   annByField.clear();
   annBySymbol.clear();
+  paramsByEnumMember.clear();
   try {
-    const ANN = /@(bool|enum|bitset|ptr16|bcd(?:-[bl]e)?|strptr|str)\b\s*([\w|]+)?/;   // matched within the comment portion (strptr before str: alternation is first-match; [\w|] admits '|' fallback chains)
+    // stream before str: alternation is first-match (str\b would not match "stream"
+    // anyway due to \b, but keep the longer tokens earlier to be safe).
+    const ANN = /@(bool|enum|bitset|ptr16|bcd(?:-[bl]e)?|strptr|stream|str)\b\s*([\w|]+)?/;   // matched within the comment portion; [\w|] admits '|' fallback chains
+    const PARAMS = /@params\b[ \t]*([^\r\n]*)$/;   // grammar for a byte-stream command enum member
     const seen = new Set();
     // Struct-field annotations (@bool/@enum/@bitset/@bcd on C struct members) live in
     // headers, but #FILES lists only compilation units (.c/.s) — no .h. Pull in sibling
@@ -1897,6 +1921,7 @@ function parseAnnotations(files) {
         catch (e) { continue; }
         const isAsm = /\.(s|asm)$/i.test(f);
         let inStruct = false, structName = null, pending = [];
+        let inEnum = false, enumName = null, pendingParams = [];
         for (const line of lines) {
             // Enter a C struct/union body (name may be trailing on the '}' line).
             if (!isAsm && !inStruct && /\b(typedef\s+)?(struct|union)\b/.test(line)
@@ -1904,6 +1929,11 @@ function parseAnnotations(files) {
                 inStruct = true; pending = [];
                 const nm = line.match(/(?:struct|union)\s+([A-Za-z_]\w*)\s*\{/);
                 structName = nm ? nm[1] : null;
+            }
+            // Enter a C enum body — its members may carry @params byte-stream grammar.
+            if (!isAsm && !inEnum && /\benum\b/.test(line)
+                && !/;/.test(line.replace(/\/\/.*$/, ''))) {
+                inEnum = true; pendingParams = []; enumName = null;
             }
             // Split code from comment. C comment = "//"; asm also allows ";".
             let ci = line.indexOf('//');
@@ -1913,6 +1943,16 @@ function parseAnnotations(files) {
             }
             const code = ci >= 0 ? line.slice(0, ci) : line;
             const comment = ci >= 0 ? line.slice(ci) : '';
+            // @params on an enum member: record the ordered grammar tokens.
+            if (!isAsm && inEnum) {
+                const pm = comment.match(PARAMS);
+                if (pm) {
+                    const c = code.replace(/[=,].*$/, '');
+                    const ids = c.match(/[A-Za-z_]\w*/g);
+                    const member = ids ? ids[ids.length - 1] : null;
+                    if (member) pendingParams.push({ member, types: pm[1].trim() ? pm[1].trim().split(/\s+/) : [] });
+                }
+            }
             const m = comment.match(ANN);
             if (m) {
                 const directive = { kind: m[1], enumName: m[2] || null };
@@ -1953,6 +1993,13 @@ function parseAnnotations(files) {
                 if (structName) for (const p of pending) annByField.set(structName + '.' + p.field, p.directive);
                 inStruct = false; structName = null; pending = [];
             }
+            // Close a C enum: flush buffered @params grammar under the enum's name.
+            if (!isAsm && inEnum && /\}/.test(line)) {
+                const nm = line.match(/\}\s*([A-Za-z_]\w*)\s*;/);
+                if (nm) enumName = nm[1];
+                if (enumName) for (const p of pendingParams) paramsByEnumMember.set(enumName + '.' + p.member, p.types);
+                inEnum = false; enumName = null; pendingParams = [];
+            }
         }
     }
   } catch (e) {
@@ -1986,10 +2033,115 @@ async function readTermString(addr, term) {
     return (formatCharArray(mem, 0, len) || '""') + (len === CAP ? '…' : '');
 }
 
+// Decode one @params parameter token from the stream bytes in `mem` at `memPos`
+// (absolute address `absAddr`, for symbol lookups). Returns { value, size }.
+// Reuses the shared formatters (formatEnum/formatScalar/formatCharArray) — no
+// second render path. `str` = inline NUL-terminated string; `word` = 16-bit LE;
+// anything else is an enum name (decoded) or `byte` (raw).
+function decodeStreamParam(tok, absAddr, mem, memPos, depth) {
+    if (tok === 'str') {
+        let len = 0;
+        while (memPos + len < mem.length && mem[memPos + len] !== 0) len++;
+        return { value: (formatCharArray(mem, memPos, len) || '""'), size: len + 1 };
+    }
+    if (tok === 'word') {
+        const w = (mem[memPos] || 0) | ((mem[memPos + 1] || 0) << 8);
+        let v = '$' + w.toString(16).toUpperCase().padStart(4, '0');
+        const s = symbolAt(w);
+        v += s ? ' →' + s : ' (' + w + ')';
+        return { value: v, size: 2 };
+    }
+    // cmd:<enum> — a nested sub-command decoded by <enum>'s grammar (e.g. the
+    // condition operator inside a JUMP_IF). Renders like a top-level command and
+    // reports its full byte length so the outer walk stays in sync.
+    if (tok.indexOf('cmd:') === 0) {
+        const subEnum = tok.slice(4);
+        const sub = decodeOneCommand(subEnum, mem, memPos, absAddr - memPos, (depth || 0) + 1);
+        return { value: streamCmdText(sub, subEnum), size: sub.size };
+    }
+    const b = mem[memPos] || 0;
+    if (tok === 'byte') return { value: '$' + b.toString(16).toUpperCase().padStart(2, '0') + '|' + b, size: 1 };
+    const ed = resolveEnum(tok, b);
+    return { value: ed ? formatEnum(ed, [b], 0, 1) : formatScalar('uchar', [b], 0, 1), size: 1 };
+}
+
+// Decode a single command at mem[pos] (chunk base `base`, for word symbol
+// lookups) using enum `enumName` + paramsByEnumMember. Returns
+// {offset, opcode, name, known, params:[{value,size}], size, end}. Shared by
+// decodeStream (top-level list) and the cmd:<enum> nested param (DRY). `depth`
+// guards runaway nesting.
+function decodeOneCommand(enumName, mem, pos, base, depth) {
+    const unknown = (name) => ({ offset: pos, opcode: mem[pos] || 0, name: name === undefined ? null : name, known: false, params: [], size: 1, end: true });
+    if ((depth || 0) > 4) return unknown(null);
+    const ed = resolveEnum(enumName);
+    if (!ed) return unknown(null);
+    const opcode = mem[pos] || 0;
+    const name = ed.byValue.get(opcode);
+    if (name === undefined) return unknown(undefined);
+    const grammar = paramsByEnumMember.get(enumName + '.' + name);
+    if (grammar === undefined) return { offset: pos, opcode, name, known: false, params: [], size: 1, end: true };
+    let p = pos + 1, stop = false;
+    const params = [];
+    for (const tok of grammar) {
+        if (tok === 'end') { stop = true; break; }
+        if (p >= mem.length) break;
+        const r = decodeStreamParam(tok, base + p, mem, p, depth || 0);
+        params.push(r);
+        p += r.size;
+    }
+    return { offset: pos, opcode, name, known: true, params, size: p - pos, end: stop };
+}
+
+// Decode up to `maxCmds` byte-stream commands starting at `addr`, using enum
+// `enumName` for the opcode byte and paramsByEnumMember for each command's
+// grammar. Returns [{offset, opcode, name, known, params:[{value}], size, end}].
+// Stops at: maxCmds, an opcode not in the enum, a command with no @params
+// grammar, a grammar containing the `end` token (terminators / jumps), or a
+// chunk overrun. One readMem for the whole window (per-stop cache makes it cheap).
+async function decodeStream(enumName, addr, maxCmds) {
+    const out = [];
+    if (!resolveEnum(enumName)) return out;
+    const CHUNK = 128;
+    const base = addr & 0xFFFF;
+    const mem = await readMem(base, CHUNK);
+    let pos = 0;
+    for (let n = 0; n < maxCmds && pos < CHUNK; n++) {
+        const c = decodeOneCommand(enumName, mem, pos, base, 0);
+        c.offset = pos;
+        out.push(c);
+        pos += c.size;
+        if (c.end || !c.known) break;  // terminator/jump, unknown opcode, or no grammar
+    }
+    return out;
+}
+
+// One-line text for a decoded stream command — shared by the collapsed/inline
+// stream value and the expanded child list so they read identically (DRY).
+function streamCmdText(c, enumName) {
+    if (c.name === null) return '??? $' + c.opcode.toString(16).toUpperCase().padStart(2, '0') + ' (not a ' + enumName + ')';
+    if (!c.known) return c.name + '  (no @params grammar)';
+    return c.name + (c.params.length ? '(' + c.params.map(p => p.value).join(', ') + ')' : '') + (c.end ? '  …' : '');
+}
+
 // Render a value using a comment annotation (@bool/@enum/@bitset/@ptr16/@bcd/
-// @str/@strptr). Returns { value, ref? } or null. bitset returns an expandable
-// ref (children = set bits).
+// @str/@strptr/@stream). Returns { value, ref? } or null. bitset & stream return
+// an expandable ref (bitset children = set bits; stream children = decoded cmds).
 async function formatAnnotated(ann, addr, size) {
+    // @stream <E>: a 16-bit pointer into a byte-code stream whose opcodes are
+    // enum <E>. Expand to the next decoded commands (see the varRefs handler).
+    if (ann.kind === 'stream') {
+        const m = await readMem(addr, 2);
+        const target = (m[0] | (m[1] << 8)) & 0xFFFF;
+        const tHex = '$' + target.toString(16).toUpperCase().padStart(4, '0');
+        if (target === 0) return { value: '(null)', type: ann.enumName || 'stream' };
+        const ref = stableRef('stream:' + target + ':' + ann.enumName,
+                              { kind: 'stream', addr: target, enumName: ann.enumName });
+        // Show the first command inline so the collapsed value (and the disasm
+        // annotation) is informative without expanding; the ref lists the rest.
+        const head = await decodeStream(ann.enumName, target, 1);
+        const headTxt = head.length ? ' = ' + streamCmdText(head[0], ann.enumName) : '';
+        return { value: '→ ' + tHex + headTxt, ref, type: ann.enumName || 'stream' };
+    }
     // @str [term]: the text itself sits at the symbol; @strptr [term]: a 16-bit
     // pointer to it. term defaults to 0 (NUL); attribute-text uses e.g. 255.
     if (ann.kind === 'str') {
@@ -3024,6 +3176,13 @@ const handlers = {
                     }
                 }
                 if (vars.length === 0) vars.push({ name: '(none set)', value: '', variablesReference: 0 });
+                respond(req, { variables: vars }); return;
+            }
+            // @stream expansion: one child per decoded command, at its byte offset.
+            if (info.kind === 'stream') {
+                const cmds = await decodeStream(info.enumName, info.addr, 16);
+                const vars = cmds.map(c => ({ name: '+' + c.offset, value: streamCmdText(c, info.enumName), variablesReference: 0 }));
+                if (vars.length === 0) vars.push({ name: '(empty)', value: '', variablesReference: 0 });
                 respond(req, { variables: vars }); return;
             }
             const def = typeDefs.get(info.typeName);
@@ -4414,6 +4573,16 @@ const handlers = {
             return fmtVal(await readByte(addr));
         };
 
+        // A "; @enum <E>" on this code line types the fetched byte — the way to
+        // decode indexed/indirect reads whose operand has no per-symbol type
+        // (e.g. the operator byte a JUMP_IF handler peeks). One helper so every
+        // indexed mode honours it identically.
+        const lineEnum = lineEnumOf(pc);
+        const valOrEnum = (b) => {
+            if (lineEnum) { const ed = resolveEnum(lineEnum, b); if (ed) return formatEnum(ed, [b], 0, 1) + '  ' + lineEnum; }
+            return fmtVal(b);
+        };
+
         let annotation = '';
         try {
             switch (mode) {
@@ -4432,13 +4601,13 @@ const handlers = {
                 case 'x': { // zp,X
                     const ea = (lo + regs.x) & 0xFF;
                     const val = await readByte(ea);
-                    annotation = '(' + symAddr(lo, false) + '+X:' + h2(regs.x) + '=' + h2(ea) + ')=' + fmtVal(val);
+                    annotation = '(' + symAddr(lo, false) + '+X:' + h2(regs.x) + '=' + h2(ea) + ')=' + valOrEnum(val);
                     break;
                 }
                 case 'y': { // zp,Y
                     const ea = (lo + regs.y) & 0xFF;
                     const val = await readByte(ea);
-                    annotation = '(' + symAddr(lo, false) + '+Y:' + h2(regs.y) + '=' + h2(ea) + ')=' + fmtVal(val);
+                    annotation = '(' + symAddr(lo, false) + '+Y:' + h2(regs.y) + '=' + h2(ea) + ')=' + valOrEnum(val);
                     break;
                 }
                 case 'a': { // absolute
@@ -4457,21 +4626,21 @@ const handlers = {
                     const base = (hi << 8) | lo;
                     const ea = (base + regs.x) & 0xFFFF;
                     const val = await readByte(ea);
-                    annotation = '$' + h4(base) + '+X:' + h2(regs.x) + '=$' + h4(ea) + ' =' + fmtVal(val);
+                    annotation = '$' + h4(base) + '+X:' + h2(regs.x) + '=$' + h4(ea) + ' =' + valOrEnum(val);
                     break;
                 }
                 case 'Y': { // abs,Y
                     const base = (hi << 8) | lo;
                     const ea = (base + regs.y) & 0xFFFF;
                     const val = await readByte(ea);
-                    annotation = '$' + h4(base) + '+Y:' + h2(regs.y) + '=$' + h4(ea) + ' =' + fmtVal(val);
+                    annotation = '$' + h4(base) + '+Y:' + h2(regs.y) + '=$' + h4(ea) + ' =' + valOrEnum(val);
                     break;
                 }
                 case '(': { // (zp,X) indirect X
                     const ptr = (lo + regs.x) & 0xFF;
                     const ea = await readWord(ptr);
                     const val = await readByte(ea);
-                    annotation = '(' + symAddr(lo, false) + '+X:' + h2(regs.x) + '=' + h2(ptr) + ')=$' + h4(ea) + ' =' + fmtVal(val);
+                    annotation = '(' + symAddr(lo, false) + '+X:' + h2(regs.x) + '=' + h2(ptr) + ')=$' + h4(ea) + ' =' + valOrEnum(val);
                     break;
                 }
                 case ')': { // (zp),Y indirect Y
@@ -4483,6 +4652,20 @@ const handlers = {
                     // struct syntax — this is where "ldy #4" gets its meaning back.
                     const pname = sym(lo);
                     const pann = pname ? annForSymbol(pname) : null;
+                    // @stream pointer: when it sits AT a decodable command (a
+                    // boundary — e.g. the opcode fetch, or a handler peeking a
+                    // param of the current command), show that command and which
+                    // byte Y fetches. When the pointer is mid-command (its own
+                    // byte isn't a valid opcode — a handler that already advanced
+                    // past the opcode), fall through to the plain byte annotation
+                    // rather than mis-decoding garbage as "??? $xx".
+                    if (pann && pann.kind === 'stream') {
+                        const cmds = await decodeStream(pann.enumName, ptr, 1);
+                        if (cmds.length && cmds[0].known) {
+                            annotation = '(' + pname + '→' + streamCmdText(cmds[0], pann.enumName) + ')  +Y:' + h2(regs.y) + '=' + fmtVal(await readByte(ea));
+                            break;
+                        }
+                    }
                     const sname = (pann && pann.kind === 'ptr16') ? pann.enumName : null;
                     const info = sname ? fieldAtOffset(sname, regs.y) : null;
                     if (info) {
@@ -4504,7 +4687,7 @@ const handlers = {
                         break;
                     }
                     const val = await readByte(ea);
-                    annotation = '(*(' + symAddr(lo, false) + ')=$' + h4(ptr) + '+Y:' + h2(regs.y) + ')=$' + h4(ea) + ' =' + fmtVal(val);
+                    annotation = '(*(' + symAddr(lo, false) + ')=$' + h4(ptr) + '+Y:' + h2(regs.y) + ')=$' + h4(ea) + ' =' + valOrEnum(val);
                     break;
                 }
                 case 'n': { // indirect (JMP only)

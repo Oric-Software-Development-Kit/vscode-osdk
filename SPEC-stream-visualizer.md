@@ -1,6 +1,33 @@
 # SPEC — Byte-stream visualizer (`@stream` / `@params`)
 
-Status: DESIGNED 2026-07-15 (Fable session), NOT implemented. User-approved direction.
+Status: SCRIPT STREAM IMPLEMENTED 2026-07-15 (Opus session), user-testing pending.
+Audio stream (`_SoundDataPointer`) DEFERRED by user decision (its opcodes carry flag
+bits — SOUND_FLAG_END OR'd on — plus a 14-byte SET_BANK payload and REPEAT/ENDREPEAT
+blocks, which need masking + block handling beyond `@params`; revisit later).
+
+What shipped for the script stream:
+- COMMAND_* -> `typedef enum {...} script_command` in scripting.h (byte-identical build).
+- `@stream <E>` on a pointer symbol + `@params <tokens>` on each enum member.
+  Tokens: enum-name / `byte` / `word` (16-bit LE) / `str` (inline NUL-terminated) /
+  `end` (terminator or jump: stops the linear preview after this command).
+- Adapter: paramsByEnumMember map (built by parseAnnotations scanning enum bodies),
+  decodeStream()/decodeStreamParam(), formatAnnotated 'stream' branch (expandable ref),
+  varRefs 'stream' expansion listing `+offset  COMMAND_NAME(params…)`. ANN regex adds
+  `stream`. Reuses formatEnum/formatScalar/formatCharArray (no 2nd render path).
+- `_gCurrentStream .dsb 2 ; @stream script_command` in bytestream.s.
+- Grammar extracted from bytestream.s handlers (subagent) + scripting.h macros.
+  KEY: inline stream strings are NUL(0)-terminated (macros append ,0), NOT 255.
+  BITMAP reads 7 bytes (byte byte byte word word) despite the 3-arg macro comment.
+  JUMP/JUMP_IF/BUBBLE marked `end` (jumps leave; JUMP_IF condition + BUBBLE repeat-count
+  are variable — v1 shows the command and stops rather than risk desync). COMBINE=4 bytes.
+- Harness `<scratchpad>/verify_stream.js` PASS (plants a stream, expands, checks decode).
+- UNCOMMITTED as of this note (awaiting user live test).
+Possible follow-ups: decode JUMP_IF operator sub-grammar; repeat-count for BUBBLE; the
+inline `(stream),y` disasm annotation (SPEC "Rendering" bullet 2) not done — only the
+tree view. Then the audio stream.
+
+--- Original design below (still accurate for the mechanism) ---
+
 Prerequisite work (words/directions enums + `@enum a|b` chains) done the same day.
 
 ## Goal
