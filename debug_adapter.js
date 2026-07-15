@@ -179,9 +179,9 @@ const CONSOLE_HELP = [
     '  goto label                set PC to a symbol',
     '',
     'Memory',
-    '  x $C000 [len]             hex dump (len is decimal, default 16)',
-    '  m C000,20                 hex dump, GDB-style (addr and len in hex)',
-    '  w $C000 $FF               write one byte',
+    '  x $C000 [len]             hex dump ($ = hex, no $ = decimal; len is decimal, default 16)',
+    '  m C000,20                 hex dump, GDB-style (addr and len always hex)',
+    '  w $C000 $FF               write one byte ($ = hex, no $ = decimal)',
     '',
     'Symbols & expressions',
     '  sym NAME                  show a symbol’s address',
@@ -3367,9 +3367,13 @@ const handlers = {
         }
 
         // Memory read:  x $ADDR [LEN]  or  m ADDR,LEN
-        if ((m = expr.match(/^[xm]\s+\$?([0-9a-fA-F]{1,4})(?:[,\s]+(\d+))?$/i))) {
-            const addr = parseInt(m[1], 16);
-            const len  = parseInt(m[2] || '16', 10);
+        // No implicit hex: for `x`, $ = hex and bare digits = decimal; `m` is
+        // the GDB-protocol form and stays all-hex as documented.
+        if ((m = expr.match(/^([xm])\s+(\$?)([0-9a-fA-F]{1,4})(?:[,\s]+(\d+))?$/i))) {
+            const isHex = m[1].toLowerCase() === 'm' || m[2] === '$';
+            if (!isHex && !/^\d+$/.test(m[3])) { respond(req, {}, false, 'Hex addresses need a $ prefix (e.g. x $' + m[3].toUpperCase() + ')'); return; }
+            const addr = parseInt(m[3], isHex ? 16 : 10);
+            const len  = parseInt(m[4] || '16', 10);
             const r = await gdbCmd('m' + addr.toString(16) + ',' + len.toString(16));
             if (r && r[0] !== 'E') {
                 let out = '$' + addr.toString(16).toUpperCase().padStart(4, '0') + ':';
@@ -3384,10 +3388,14 @@ const handlers = {
             return;
         }
 
-        // Memory write:  w $ADDR $VAL
-        if ((m = expr.match(/^w\s+\$?([0-9a-fA-F]{1,4})\s+\$?([0-9a-fA-F]{1,2})$/i))) {
-            const addr = parseInt(m[1], 16);
-            const val  = parseInt(m[2], 16);
+        // Memory write:  w $ADDR $VAL   ($ = hex, bare digits = decimal — no implicit hex)
+        if ((m = expr.match(/^w\s+(\$?)([0-9a-fA-F]{1,4})\s+(\$?)([0-9a-fA-F]{1,3})$/i))) {
+            if ((!m[1] && !/^\d+$/.test(m[2])) || (!m[3] && !/^\d+$/.test(m[4]))) {
+                respond(req, {}, false, 'Hex values need a $ prefix (e.g. w $C000 $FF)'); return;
+            }
+            const addr = parseInt(m[2], m[1] ? 16 : 10);
+            const val  = parseInt(m[4], m[3] ? 16 : 10);
+            if (val > 255) { respond(req, {}, false, 'Value must fit in one byte'); return; }
             const r = await gdbCmd('M' + addr.toString(16) + ',1:' + val.toString(16).padStart(2, '0'));
             respond(req, {
                 result: r === 'OK' ? 'OK' : 'Write failed',
@@ -3456,7 +3464,9 @@ const handlers = {
         }
 
         // Goto (set PC):  goto $ADDR  or  goto symbolName
-        if ((m = expr.match(/^goto\s+\$?([0-9a-fA-F]{1,4})$/i))) {
+        // No implicit hex: a bare token falls through to the symbol form below
+        // (a label named "abcd" must never be hijacked as address $ABCD).
+        if ((m = expr.match(/^goto\s+(?:\$|0x)([0-9a-fA-F]{1,4})$/i))) {
             const addr = parseInt(m[1], 16) & 0xFFFF;
             const pcLo = (addr & 0xFF).toString(16).padStart(2, '0');
             const pcHi = ((addr >> 8) & 0xFF).toString(16).padStart(2, '0');
@@ -3497,15 +3507,37 @@ const handlers = {
             const isPtr = m[2] === '*';
             const count = m[3] ? parseInt(m[3], 10) : 0;
             const target = m[4];
+            const elemSize = typeDefs.has(baseType) ? typeDefs.get(baseType).size : scalarSizeOf(baseType);
+            if (!elemSize && !isPtr) { respond(req, {}, false, 'Unknown type: ' + baseType); return; }
+            // Registers are cast by VALUE, not address: (item_id)a interprets
+            // the A register as the type — no memory involved. Registers take
+            // precedence over symbols, matching bare-watch behavior (so "a" is
+            // never silently hex-parsed as address $000A).
+            const rm = target.match(/^(a|x|y|sp|pc)$/i);
+            if (rm) {
+                if (!regs) { respond(req, {}, false, 'No register state'); return; }
+                if (isPtr || count || typeDefs.has(baseType)) {
+                    respond(req, {}, false, 'A register holds a value — cast it to a scalar or enum type'); return;
+                }
+                const rname = rm[1].toLowerCase();
+                const rv = regs[rname] || 0;
+                respond(req, {
+                    result: formatScalar(baseType, [rv & 0xFF, (rv >> 8) & 0xFF], 0, elemSize) + '  ' + baseType + '  ' + rname.toUpperCase(),
+                    variablesReference: 0
+                });
+                return;
+            }
             let castAddr = symbols.get(target);
             if (castAddr === undefined && !target.startsWith('_')) castAddr = symbols.get('_' + target);
             if (castAddr === undefined) {
-                const hm = target.match(/^(?:\$|0x)?([0-9a-fA-F]{1,4})$/);
+                // No implicit hex: $/0x = hex address, bare digits = DECIMAL
+                // address. A hex-looking word without a prefix (e.g. a mistyped
+                // symbol "face") must not silently become a memory address.
+                const hm = target.match(/^(?:\$|0x)([0-9a-fA-F]{1,4})$/);
                 if (hm) castAddr = parseInt(hm[1], 16);
+                else if (/^\d+$/.test(target)) castAddr = parseInt(target, 10) & 0xFFFF;
             }
             if (castAddr === undefined) { respond(req, {}, false, 'Cast target not found: ' + target); return; }
-            const elemSize = typeDefs.has(baseType) ? typeDefs.get(baseType).size : scalarSizeOf(baseType);
-            if (!elemSize && !isPtr) { respond(req, {}, false, 'Unknown type: ' + baseType); return; }
             let fullType, size;
             if (isPtr)      { fullType = '*' + baseType; size = 2; }
             else if (count) { fullType = baseType + '[' + count + ']'; size = count * elemSize; }
