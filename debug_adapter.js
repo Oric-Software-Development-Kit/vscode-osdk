@@ -1831,18 +1831,23 @@ async function formatAnnotated(ann, addr, size) {
 // ============================================================================
 // THE single render path for "a named value at an address". EVERY view MUST go
 // through here — Globals, Locals, Zero-page, Watch/evaluate, struct-field and
-// array-element expansion, and any future scope ("auto", etc.). Do NOT format a
-// variable's value inline in a handler: that path drift is what silently broke
-// annotations in the Watch window. Handles scalars, enums, structs, arrays,
+// array-element expansion, the inline instruction annotation (via
+// opts.omitAddr — the operand label already carries the address), and any
+// future scope ("auto", etc.). Do NOT format a variable's value inline in a
+// handler: that path drift is what silently broke annotations in the Watch
+// window, and later hid @enum decoding from the instruction annotation. Handles scalars, enums, structs, arrays,
 // pointer-to-struct, and comment annotations (@bool/@enum/@bitset via `ann`).
 // Look up `ann` with annForSymbol(name) for symbols or annByField for fields;
 // resolve enums with resolveEnum() so it works regardless of the active module.
 // (Registers/Flags are CPU state, not memory-typed values — they legitimately
 // render separately.) See CORE-CONCEPTS.md → "One render path".
 // ============================================================================
-async function buildTypedVar(name, addr, fullType, size, ann) {
+async function buildTypedVar(name, addr, fullType, size, ann, opts) {
     addr &= 0xFFFF;
     const hAddr = '$' + addr.toString(16).toUpperCase().padStart(4, '0');
+    // opts.omitAddr: compact form for the inline instruction annotation, where
+    // the operand label already carries the address.
+    const at = (opts && opts.omitAddr) ? '' : '  @ ' + hAddr;
     // Comment annotation (@bool/@enum/@bitset) overrides the default rendering.
     if (ann) {
         const a = await formatAnnotated(ann, addr, size);
@@ -1850,7 +1855,7 @@ async function buildTypedVar(name, addr, fullType, size, ann) {
         // way the scalar path shows fullType, so annotated values read consistently.
         if (a) {
             const t = a.type ? '  ' + a.type : '';
-            return { name, value: a.value + t + '  @ ' + hAddr, variablesReference: a.ref || 0 };
+            return { name, value: a.value + t + at, variablesReference: a.ref || 0 };
         }
     }
     // Pointer (`*T`): value is the pointed-to address; expandable to that struct.
@@ -1862,16 +1867,16 @@ async function buildTypedVar(name, addr, fullType, size, ann) {
         if (typeDefs.has(pointed) && target !== 0) {
             const ref = stableRef('ptr:' + target + ':' + pointed,
                                   { addr: target, typeName: pointed, count: 1 });
-            return { name, value: fullType + ' → ' + tHex + '  @ ' + hAddr, variablesReference: ref };
+            return { name, value: fullType + ' → ' + tHex + at, variablesReference: ref };
         }
         // Scalar target: dereference one hop and show the pointed-to value,
         // mirroring the @ptr16 annotation's "→" so pointers read consistently.
         const psz = scalarSizeOf(pointed);
         if (psz && target !== 0) {
             const tm = await readMem(target, psz);
-            return { name, value: fullType + ' → ' + tHex + ' = ' + formatScalar(pointed, tm, 0, psz) + '  @ ' + hAddr, variablesReference: 0 };
+            return { name, value: fullType + ' → ' + tHex + ' = ' + formatScalar(pointed, tm, 0, psz) + at, variablesReference: 0 };
         }
-        return { name, value: fullType + ' = ' + tHex + '  @ ' + hAddr, variablesReference: 0 };
+        return { name, value: fullType + ' = ' + tHex + at, variablesReference: 0 };
     }
     const am = fullType.match(/^(.+)\[(\d+)\]$/);
     const base = am ? am[1] : fullType;
@@ -1879,15 +1884,15 @@ async function buildTypedVar(name, addr, fullType, size, ann) {
     if (typeDefs.has(base) || count > 1) {
         const ref = stableRef('st:' + addr + ':' + base + ':' + count,
                               { addr, typeName: base, count, totalSize: size });
-        let val = fullType + '  @ ' + hAddr;
+        let val = fullType + at;
         if (count > 1 && isCharType(base)) {
             const mem = await readMem(addr, size);
-            val = formatCharArray(mem, 0, count) + '  ' + fullType + '  @ ' + hAddr;
+            val = formatCharArray(mem, 0, count) + '  ' + fullType + at;
         }
         return { name, value: val, variablesReference: ref };
     }
     const mem = await readMem(addr, size);
-    return { name, value: formatScalar(base, mem, 0, size) + '  ' + fullType + '  @ ' + hAddr, variablesReference: 0 };
+    return { name, value: formatScalar(base, mem, 0, size) + '  ' + fullType + at, variablesReference: 0 };
 }
 
 // Check if a file path looks like a build artifact (linked.s, etc.)
@@ -4069,6 +4074,25 @@ const handlers = {
             return '(' + label + '+' + annHint.off + ')=' + a.value + (a.type ? '  ' + a.type : '');
         };
 
+        // Value of a DIRECT operand (the effective address IS the symbol):
+        // when the registry knows how to DECODE the symbol (annotation or a
+        // real .ctype type), render through buildTypedVar — THE one render
+        // path — in its compact omitAddr form (the operand label already
+        // shows the address). Untyped symbols keep the plain byte form
+        // rather than gaining a noisy default "uchar" token.
+        const typedValStr = async (addr) => {
+            const name = sym(addr);
+            if (name) {
+                const info = infoForSymbol(name);
+                const spec = renderSpec(name);
+                if (spec.ann || (info && info.type)) {
+                    const v = await buildTypedVar(name, addr, spec.type, spec.size, spec.ann, { omitAddr: true });
+                    return v.value;
+                }
+            }
+            return fmtVal(await readByte(addr));
+        };
+
         let annotation = '';
         try {
             switch (mode) {
@@ -4081,8 +4105,7 @@ const handlers = {
                         annotation = await annHintStr((lo - annHint.off) & 0xFF, false);
                         break;
                     }
-                    const val = await readByte(lo);
-                    annotation = '(' + symAddr(lo, false) + ')=' + fmtVal(val);
+                    annotation = '(' + symAddr(lo, false) + ')=' + await typedValStr(lo);
                     break;
                 }
                 case 'x': { // zp,X
@@ -4105,8 +4128,7 @@ const handlers = {
                     } else if (annHint) {
                         annotation = await annHintStr((addr - annHint.off) & 0xFFFF, true);
                     } else {
-                        const val = await readByte(addr);
-                        annotation = '(' + symAddr(addr, true) + ')=' + fmtVal(val);
+                        annotation = '(' + symAddr(addr, true) + ')=' + await typedValStr(addr);
                     }
                     break;
                 }
