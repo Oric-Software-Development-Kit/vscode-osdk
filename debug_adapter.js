@@ -846,7 +846,8 @@ async function checkModuleSwitch(force) {
     if (moduleNames.has(val) && val !== activeModuleId) {
         applyActiveModule(val);
         await rearmModuleBreakpoints();
-        log('Active module -> ' + moduleNames.get(val) + ' (id ' + val + ')');
+        log('Active module -> ' + moduleNames.get(val) + ' (id ' + val + ')' +
+            (force ? ' [early: module-load watch]' : ' [late: detected at a stop]'));
         evt('oricActiveModule', { id: val, name: moduleNames.get(val) });
         evt('oricSymbolsChanged', { reason: 'module-switch', module: val });
         moduleReported = true;
@@ -1408,6 +1409,70 @@ async function applyRegTagTracking(kind, prevPc) {
 // Asynchronous stop-reply handler
 // ----------------------------------------------------------------
 
+// Evaluate one logpoint sub-expression to a compact display string. Covers the
+// common cases — a register (decoded via its tag), a symbol (fully typed via the
+// one render path), or a $hex address (the byte there). Unknown -> "?".
+async function evalLogExpr(expr) {
+    expr = expr.trim();
+    if (!expr) return '';
+    const rm = expr.match(/^(a|x|y|sp|pc)$/i);
+    if (rm && regs) {
+        const rn = rm[1].toLowerCase();
+        if (rn === 'sp' || rn === 'pc') return '$' + ((regs[rn] || 0) & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
+        return regTagStr(rn) || formatScalar('uchar', [regs[rn] || 0], 0, 1);
+    }
+    let addr = symbols.get(expr);
+    if (addr === undefined && !expr.startsWith('_')) addr = symbols.get('_' + expr);
+    if (addr !== undefined) {
+        const spec = renderSpec(expr);
+        const v = await buildTypedVar(expr, addr & 0xFFFF, spec.type, spec.size, spec.ann, { omitAddr: true });
+        return v.value;
+    }
+    const hm = expr.match(/^\$([0-9a-fA-F]{1,4})$/);
+    if (hm) { const b = await readMem(parseInt(hm[1], 16), 1); return '$' + (b[0] || 0).toString(16).toUpperCase().padStart(2, '0'); }
+    return '?';
+}
+
+// Interpolate a VS Code logpoint message: literal text with {expr} placeholders.
+// {{ and }} are literal braces (DAP convention).
+async function interpolateLog(msg) {
+    let out = '', i = 0;
+    while (i < msg.length) {
+        const c = msg[i];
+        if (c === '{' && msg[i + 1] === '{') { out += '{'; i += 2; continue; }
+        if (c === '}' && msg[i + 1] === '}') { out += '}'; i += 2; continue; }
+        if (c === '{') {
+            const end = msg.indexOf('}', i + 1);
+            if (end < 0) { out += msg.slice(i); break; }
+            out += await evalLogExpr(msg.slice(i + 1, end));
+            i = end + 1;
+            continue;
+        }
+        out += c; i++;
+    }
+    return out;
+}
+
+// Source breakpoints (logpoints) armed at `pc` that carry a logMessage.
+function logpointsAt(pc) {
+    const out = [];
+    for (const [, arr] of srcBps)
+        for (const bp of arr)
+            if (bp.logMessage && bp.bindings.some(b => b.addr === pc && b.armed)) out.push(bp);
+    return out;
+}
+
+// Is there a NON-logpoint (stopping) breakpoint at `pc`? A logpoint auto-resumes
+// only when nothing here would otherwise stop.
+function stoppingBpAt(pc) {
+    for (const [, b] of bps)  if (b.addr === pc) return true;
+    for (const [, b] of ibps) if (b.addr === pc) return true;
+    for (const [, arr] of srcBps)
+        for (const bp of arr)
+            if (!bp.logMessage && bp.bindings.some(b => b.addr === pc && b.armed)) return true;
+    return false;
+}
+
 async function onStopReply(payload) {
     running = false;
     regs = parseStopRegs(payload);
@@ -1560,6 +1625,36 @@ async function onStopReply(payload) {
 
     // Sync any by-hand monitor breakpoint edits into VS Code's model.
     await reconcileMonitorBreakpoints();
+
+    // Logpoints: a source breakpoint with a logMessage prints instead of stopping.
+    // Print every logpoint at this PC; if nothing else here would stop, resume
+    // transparently (step off the bp first, then continue — same as `continue`).
+    // A message containing "[stop]" logs AND stops (VS Code allows only a
+    // logpoint OR a plain bp per line — this is how to get both at once).
+    // Logpoint output is cyan (ANSI) so it stands out from the emulator's own
+    // stdout in the Debug Console.
+    if (watchAddr === null && regs && regs.pc !== undefined) {
+        const logs = logpointsAt(regs.pc);
+        if (logs.length) {
+            let forceStop = false;
+            for (const bp of logs) {
+                let raw = bp.logMessage;
+                if (/\[stop\]/i.test(raw)) { forceStop = true; raw = raw.replace(/\s*\[stop\]\s*/ig, ' ').trim(); }
+                let line;
+                try { line = await interpolateLog(raw); }
+                catch (e) { line = '[logpoint error: ' + (e && e.message ? e.message : e) + ']'; }
+                evt('output', { category: 'console', output: '\x1b[36m' + line + '\x1b[0m\n' });
+            }
+            if (!forceStop && !stoppingBpAt(regs.pc)) {
+                resumeMode = 'run';
+                continueAfterStep = true;   // step past the bp; onStopReply then issues 'c'
+                running = true;
+                regs = null;
+                gdbWrite('s');
+                return;                     // no 'stopped' event — logpoints don't stop
+            }
+        }
+    }
 
     onStopReply_emit(watchAddr);
 }
@@ -3585,7 +3680,9 @@ const handlers = {
             }
             const message = anyFail ? 'Failed to set breakpoint'
                 : (!activeInFile ? 'Inactive module (' + owners.map(m => moduleNames.get(m) || m).join('/') + ') — binds when it loads' : undefined);
-            newBps.push({ id, line: dispLine, source: args.source, bindings });
+            // logMessage (VS Code "Logpoint"): this bp doesn't stop — on hit it
+            // prints the interpolated message and resumes (see onStopReply).
+            newBps.push({ id, line: dispLine, source: args.source, bindings, logMessage: sbp.logMessage || null });
             result.push({ id, verified: anyArmed, line: dispLine, source: args.source, message });
         }
         srcBps.set(norm, newBps);

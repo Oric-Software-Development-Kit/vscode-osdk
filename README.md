@@ -28,6 +28,8 @@ Connects VS Code to Oricutron's GDB Remote Serial Protocol (RSP) stub over TCP.
 - **Step** (F10/F11), **Continue** (F5), **Pause** (F6)
 - **Instruction breakpoints** via the Breakpoints panel
 - **Function breakpoints** using symbol names
+- **Data breakpoints (watchpoints)** — break on read / write / access of a memory address. Right-click a variable in Variables or the Symbol Browser watch → *Break on Value Read/Change/Access*. (Single address per watchpoint; the stub allows up to 16.)
+- **Logpoints (print breakpoints)** — a breakpoint that prints instead of stopping. Right-click the editor gutter → *Add Logpoint*, and enter a message with `{expr}` placeholders. On hit the message is evaluated, written to the Debug Console (in cyan, to stand out from the emulator's own output), and execution resumes automatically. Placeholders accept a register (`{a}`, `{pc}` — decoded via its type tag), a symbol (`{gCurrentLocation}` — fully typed: enum name, struct, etc.), or a `$hex` address (`{$C000}`). `{{`/`}}` are literal braces. Put **`[stop]`** anywhere in the message to both log **and** stop at that line (VS Code allows only one breakpoint-or-logpoint per line, so this is how to get both behaviours at one spot); the `[stop]` marker itself is not printed.
 - **Call stack** walking (reconstructed from the hardware stack)
 - **Disassembly view** with symbol resolution in operands
 - **Virtual disassembly source**: when no source mapping exists, the extension generates a disassembly document centered on the current PC
