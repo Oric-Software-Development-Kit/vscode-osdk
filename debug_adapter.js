@@ -170,8 +170,10 @@ const CONSOLE_HELP = [
     'Oric Debug Console commands',
     '',
     'Registers',
-    '  A  X  Y  SP  PC           read a register',
+    '  A  X  Y  SP  PC           read a register (decoded via its type tag when tracked)',
     '  A=$1F   X=10   PC=$C000   write ($ = hex, no $ = decimal)',
+    '  tag a location_id          tag a register with an enum type by hand',
+    '  tag  /  untag [a|x|y]      list tracked tags / clear one or all',
     '',
     'Execution',
     '  skip                      skip the current instruction (like Oricutron F12)',
@@ -400,6 +402,9 @@ function onGdbData(data) {
 }
 
 function gdbWrite(cmd) {
+    // Stamp resume kind for register-tag tracking: a bare single step ('s'),
+    // Oricutron step-over ('N'), continue ('c') or step-out ('O').
+    if (cmd === 's' || cmd === 'N' || cmd === 'c' || cmd === 'O') lastResumeKind = cmd;
     if (!sock) { logVerbose('[GDB] write failed: no socket (cmd=' + cmd.substring(0, 20) + ')'); return; }
     let cs = 0;
     for (let i = 0; i < cmd.length; i++) cs = (cs + cmd.charCodeAt(i)) & 0xff;
@@ -1173,12 +1178,115 @@ function parseStopRegs(payload) {
 }
 
 // ----------------------------------------------------------------
+// Register type tags — "close the type-matching loop when tracing asm"
+// (user feature 2026-07-15). A/X/Y can carry an enum tag so the Registers
+// view, watches and console decode them (A=$04 → e_LOC_MAINSTREET). Tags are
+// inferred while single-stepping and propagate through transfers:
+//   - LDA/LDX/LDY from a symbol the registry can decode → dest inherits it;
+//     a line annotation (`lda (ptr),y  ; @enum location_id`) wins over
+//     inference and covers indirect/indexed fetches.
+//   - TAX/TAY/TXA/TYA copy the tag between registers.
+//   - A load with no known type, PLA, or a value-transforming op on A
+//     (ADC/SBC/AND/ORA/EOR, accumulator shifts) CLEARS the tag (user rule:
+//     flush when the value changed without an annotation). INC/DEC-style
+//     register bumps KEEP it — iterating over ids is the common idiom.
+//   - Free-running (continue / step-out / stepping over a JSR) clears all:
+//     the executed path is unknown.
+// `tag a location_id` / `untag a` manage tags by hand from the console.
+// ----------------------------------------------------------------
+let regTags = { a: null, x: null, y: null };  // reg -> { enumName, source } | null
+let lastStopPc = -1;        // pc of the previous stop = the instruction a single step executed
+let lastResumeKind = null;  // 's' | 'N' | 'c' | 'O' — stamped by gdbWrite, read per stop
+
+function clearRegTags() { regTags.a = regTags.x = regTags.y = null; }
+
+// Decoded display for a tagged register's current value, or null.
+function regTagStr(reg) {
+    const tag = regTags[reg];
+    if (!tag || !regs) return null;
+    const def = resolveEnum(tag.enumName);
+    if (!def) return null; // enum not in the active view anymore
+    const v = regs[reg] || 0;
+    return formatEnum(def, [v & 0xFF], 0, 1) + '  ' + tag.enumName;
+}
+
+// The enum tag a load instruction confers, or null. Line annotation first
+// (explicit intent, covers indirect fetches like the byte-stream readers),
+// else registry inference from a direct-address operand's symbol.
+function tagForLoad(prevPc, mode, lo, hi) {
+    const s = sourceFor(prevPc);
+    const text = s ? getSourceLine(s.file, s.line) : null;
+    const lm = text && text.match(/@enum\b\s*(\w+)?/);
+    if (lm && lm[1] && resolveEnum(lm[1])) return { enumName: lm[1], source: 'line' };
+    let operand = -1;
+    if (mode === 'z') operand = lo;
+    else if (mode === 'a') operand = (hi << 8) | lo;
+    if (operand >= 0) {
+        const name = symbolAt(operand);
+        if (name) {
+            const spec = renderSpec(name);
+            if (spec.ann && spec.ann.kind === 'enum' && resolveEnum(spec.ann.enumName))
+                return { enumName: spec.ann.enumName, source: name };
+            if (spec.type && resolveEnum(spec.type))
+                return { enumName: spec.type, source: name };
+        }
+    }
+    return null;
+}
+
+// Run once per hardware stop: decode the instruction the previous resume
+// executed and update the tags. Only a single-step ('s', or 'N' on a non-JSR)
+// gives path knowledge; anything else clears. Takes SNAPSHOTTED (kind, prevPc)
+// — onStopReply captures them synchronously and updates lastStopPc BEFORE this
+// suspends on the memory read, so a second stop arriving mid-decode (async
+// re-entry) still sees coherent state; the serialized gdb queue keeps the
+// decode applications in stop order.
+async function applyRegTagTracking(kind, prevPc) {
+    if (!kind) return;                                     // PC edits (goto/skip) don't touch registers
+    if (kind === 'c' || kind === 'O') { clearRegTags(); return; }
+    if (prevPc < 0) return;
+    const bytes = await readMem(prevPc, 3);
+    const entry = OPS[bytes[0]];
+    if (!entry) { clearRegTags(); return; }
+    const mne = entry.substring(0, 3), mode = entry[3];
+    if (kind === 'N' && mne === 'JSR') { clearRegTags(); return; } // stepped over a call: path unknown
+    switch (mne) {
+        case 'LDA': regTags.a = tagForLoad(prevPc, mode, bytes[1], bytes[2]); break;
+        case 'LDX': regTags.x = tagForLoad(prevPc, mode, bytes[1], bytes[2]); break;
+        case 'LDY': regTags.y = tagForLoad(prevPc, mode, bytes[1], bytes[2]); break;
+        case 'TAX': regTags.x = regTags.a; break;
+        case 'TAY': regTags.y = regTags.a; break;
+        case 'TXA': regTags.a = regTags.x; break;
+        case 'TYA': regTags.a = regTags.y; break;
+        case 'TSX': regTags.x = null; break;
+        case 'PLA': regTags.a = null; break;               // no shadow stack (yet)
+        case 'ADC': case 'SBC': case 'AND': case 'ORA': case 'EOR':
+            regTags.a = null; break;                       // value transformed
+        case 'ASL': case 'LSR': case 'ROL': case 'ROR':
+            if (mode === 'A') regTags.a = null; break;     // accumulator shift
+        // INX/DEX/INY/DEY deliberately KEEP tags (id iteration); everything
+        // else leaves registers untouched.
+    }
+}
+
+// ----------------------------------------------------------------
 // Asynchronous stop-reply handler
 // ----------------------------------------------------------------
 
 async function onStopReply(payload) {
     running = false;
     regs = parseStopRegs(payload);
+    // Register tag tracking — BEFORE any early return so internal step loops
+    // (source-level step-into, module-watch commits) keep the chain coherent.
+    // Snapshot + advance lastStopPc SYNCHRONOUSLY, then decode: onStopReply can
+    // re-enter while the decode awaits its memory read.
+    {
+        const tagKind = lastResumeKind;
+        lastResumeKind = null;
+        const tagPrevPc = lastStopPc;
+        if (regs && regs.pc !== undefined) lastStopPc = regs.pc;
+        await applyRegTagTracking(tagKind, tagPrevPc);
+    }
     // NOTE: do NOT clear varRefs / reset nextVarRef here. Refs are identity-stable
     // (see stableRef) and must persist across stops so VS Code keeps the Variables/
     // Watch tree expanded while stepping. They are only reset on symbol reload /
@@ -2679,10 +2787,15 @@ const handlers = {
             // A/X/Y hold data → full "hex|dec|%binary['char']" form (formatScalar takes a
             // byte array). SP/PC are addresses → hex + decimal only (binary/glyph of an
             // address is noise; decimal helps offset math).
+            // A tracked type tag (regTags) REPLACES the raw form — this is THE
+            // register value rendering: the built-in Variables panel, the
+            // Registers webview and the watch all read it from here, so the tag
+            // shows identically everywhere (one representation, not a bolt-on row).
+            const rr = (r2) => regTagStr(r2) || formatScalar('uchar', [regs[r2]], 0, 1);
             respond(req, { variables: [
-                { name: 'A',  value: formatScalar('uchar', [regs.a], 0, 1), variablesReference: 0 },
-                { name: 'X',  value: formatScalar('uchar', [regs.x], 0, 1), variablesReference: 0 },
-                { name: 'Y',  value: formatScalar('uchar', [regs.y], 0, 1), variablesReference: 0 },
+                { name: 'A',  value: rr('a'), variablesReference: 0 },
+                { name: 'X',  value: rr('x'), variablesReference: 0 },
+                { name: 'Y',  value: rr('y'), variablesReference: 0 },
                 { name: 'SP', value: '$' + regs.sp.toString(16).toUpperCase().padStart(2, '0') + '|' + regs.sp, variablesReference: 0 },
                 { name: 'PC', value: '$' + regs.pc.toString(16).toUpperCase().padStart(4, '0') + '|' + regs.pc, memoryReference: '0x' + regs.pc.toString(16).padStart(4, '0'), variablesReference: 0 }
             ]});
@@ -2949,6 +3062,7 @@ const handlers = {
         if (r !== 'OK') { respond(req, {}, false, 'Failed to set PC'); return; }
         const g = await gdbCmd('g');
         regs = parseRegsG(g);
+        lastStopPc = addr; // PC edited in place — keep register-tag tracking coherent
         respond(req);
         evt('stopped', { reason: 'goto', threadId: 1, allThreadsStopped: true });
     },
@@ -3363,6 +3477,7 @@ const handlers = {
             await gdbCmd('P4=' + pcLo + pcHi);
             const r = await gdbCmd('g');
             regs = parseRegsG(r);
+            lastStopPc = newPc; // PC edited in place — keep register-tag tracking coherent
             respond(req, {
                 result: 'Skipped to ' + labelFor(newPc) + ' ($' + newPc.toString(16).toUpperCase().padStart(4, '0') + ')',
                 variablesReference: 0
@@ -3453,15 +3568,18 @@ const handlers = {
             return;
         }
 
-        // Register read:  A, X, Y, SP, PC
+        // Register read:  A, X, Y, SP, PC — decoded through the register's
+        // tracked type tag when one is live (see regTags).
         if (regs) {
             const u = expr.toUpperCase();
             const vals = { A: regs.a, X: regs.x, Y: regs.y, SP: regs.sp, PC: regs.pc };
             if (u in vals) {
                 const v = vals[u];
                 const w = u === 'PC' ? 4 : 2;
+                const tagged = regTagStr(u.toLowerCase());
                 respond(req, {
-                    result: '$' + v.toString(16).toUpperCase().padStart(w, '0') + ' (' + v + ')',
+                    result: tagged ? tagged + '  ' + u
+                                   : '$' + v.toString(16).toUpperCase().padStart(w, '0') + ' (' + v + ')',
                     variablesReference: 0
                 });
                 return;
@@ -3478,6 +3596,7 @@ const handlers = {
             await gdbCmd('P4=' + pcLo + pcHi);
             const r = await gdbCmd('g');
             regs = parseRegsG(r);
+            lastStopPc = addr; // PC edited in place
             respond(req, {
                 result: 'PC = ' + labelFor(addr) + ' ($' + addr.toString(16).toUpperCase().padStart(4, '0') + ')',
                 variablesReference: 0
@@ -3493,11 +3612,36 @@ const handlers = {
             await gdbCmd('P4=' + pcLo + pcHi);
             const r = await gdbCmd('g');
             regs = parseRegsG(r);
+            lastStopPc = symAddr; // PC edited in place
             respond(req, {
                 result: 'PC = ' + m[1] + ' ($' + symAddr.toString(16).toUpperCase().padStart(4, '0') + ')',
                 variablesReference: 0
             });
             evt('stopped', { reason: 'goto', threadId: 1, allThreadsStopped: true });
+            return;
+        }
+
+        // Register tags:  tag                 list the tracked tags
+        //                 tag a location_id   tag a register with an enum type
+        //                 untag a | untag     clear one / all
+        // Manual tags follow the same tracking lifecycle as inferred ones (a
+        // later untyped load or transform clears them).
+        if ((m = expr.match(/^tag(?:\s+(a|x|y)\s+(\w+))?$/i))) {
+            if (m[1]) {
+                if (!resolveEnum(m[2])) { respond(req, {}, false, 'Unknown enum: ' + m[2]); return; }
+                regTags[m[1].toLowerCase()] = { enumName: m[2], source: 'manual' };
+            }
+            const parts = [];
+            for (const rn of ['a', 'x', 'y']) {
+                const t = regTags[rn];
+                parts.push(rn.toUpperCase() + ': ' + (t ? t.enumName + ' [' + t.source + '] = ' + (regTagStr(rn) || '?') : '(untagged)'));
+            }
+            respond(req, { result: parts.join('\n'), variablesReference: 0 });
+            return;
+        }
+        if ((m = expr.match(/^untag(?:\s+(a|x|y))?$/i))) {
+            if (m[1]) regTags[m[1].toLowerCase()] = null; else clearRegTags();
+            respond(req, { result: 'OK', variablesReference: 0 });
             return;
         }
 
@@ -4188,6 +4332,37 @@ const handlers = {
                 // I (implied), A (accumulator): no memory operand
                 default:
                     break;
+            }
+
+            // Register context (user request 2026-07-15): comparisons and
+            // A-arithmetic show the implicit register operand next to the
+            // memory/immediate one — both compared values at a glance while
+            // tracing — and implied/accumulator ops show the register they
+            // touch. A tagged register decodes through its tag, and a CMP/CPX/
+            // CPY IMMEDIATE decodes through the compared register's tag too
+            // (both sides live in the same domain: #e_ITEM_CURRENT vs
+            // A=e_ITEM_YoungGirl).
+            const regVal = (rn) => regTagStr(rn) || fmtVal(regs[rn] || 0);
+            const CMP_REG = { CMP: 'a', CPX: 'x', CPY: 'y' };
+            const ARITH_A = new Set(['ADC', 'SBC', 'AND', 'ORA', 'EOR']);
+            const IMPLIED_REG = { INX: 'x', DEX: 'x', INY: 'y', DEY: 'y',
+                                  TAX: 'a', TAY: 'a', TXA: 'x', TYA: 'y',
+                                  PHA: 'a', PLA: 'a', TXS: 'x' };
+            if (CMP_REG[mne]) {
+                const rn = CMP_REG[mne];
+                const tag = regTags[rn];
+                if (mode === '#' && tag) {
+                    const def = resolveEnum(tag.enumName);
+                    if (def) annotation = '#' + formatEnum(def, [lo], 0, 1);
+                }
+                annotation += '  vs ' + rn.toUpperCase() + '=' + regVal(rn);
+            } else if (ARITH_A.has(mne)) {
+                annotation += '  A=' + regVal('a');
+            } else if (mode === 'A') {
+                annotation = 'A=' + regVal('a');
+            } else if (mode === 'I' && IMPLIED_REG[mne]) {
+                const rn = IMPLIED_REG[mne];
+                annotation = rn.toUpperCase() + '=' + regVal(rn);
             }
         } catch (_) { /* annotation stays empty */ }
 
