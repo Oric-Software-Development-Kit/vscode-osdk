@@ -135,6 +135,7 @@ sources for them at session start.
 |---|---|---|
 | `@bool` | `true` / `false` (0 = false, non-zero = true) | `unsigned char music_enabled; // @bool` |
 | `@enum <E>` | the enumerator name for the value | `unsigned char layout; // @enum KeyboardLayout` |
+| `@enum <E1>\|<E2>` | fallback chain for union holders: the first enum that defines the value wins | `_gWordBuffer .dsb 3 ; @enum word_id\|item_id` |
 | `@bitset <E>` | the set bits decoded to a list of enum names | `_gAchievements .dsb 7 ; @bitset achievement` |
 | `@ptr16` | the 16-bit pointer and what it currently points to | `sourcePtr = tmp0 ; @ptr16` |
 | `@ptr16 <struct>` | typed pointer: expandable pointed-to struct; `(ptr),y` disassembly names the FIELD the Y offset hits and decodes it with the field's type | `_gStreamItemPtr .dsb 2 ; @ptr16 item` |
@@ -153,6 +154,9 @@ Notes:
   Plain `*char` / `char*` variables and struct fields show their NUL-terminated string automatically.
 - An `@enum` on a CODE line (e.g. `lda (_gCurrentStream),y ; @enum item_id`) types the value the
   instruction fetches: the destination register gets tagged with it when single-stepping.
+- An `@enum` on a multi-byte symbol (a `.dsb` buffer) decodes each byte separately:
+  `gWordBuffer → [e_WORD_TAKE, e_ITEM_Meat, ...]`. Chains resolve per byte, so mixed
+  word/item buffers show the right names as long as the enums' value ranges don't overlap.
 - Annotated values render consistently in the Watch/Variables views, the Symbol Browser, and inline
   in the disassembly — each shows the decoded value plus a short type token (e.g. `bool`, the enum
   name, `bcd-be`).

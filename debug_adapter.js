@@ -190,6 +190,7 @@ const CONSOLE_HELP = [
     '  NAME                      evaluate a symbol / C variable',
     '  (TYPE)EXPR                view EXPR as TYPE: (uchar*)tmp0, (int)$C000,',
     '                            (uchar[8])buffer, (save_game_file)ptr — also in Watch',
+    '  reparse                   re-read @annotations from source (no rebuild, no lost state)',
     '  <expr>                    evaluate via Oricutron (e.g. tmp0+2)',
     '',
     'Display',
@@ -488,7 +489,24 @@ let annBySymbol = new Map();  // symbolName (no leading _) -> { kind, enumName? 
 // work regardless of which module is active (the enum defs are identical across
 // modules), including when no module is active yet (resident-only at boot).
 let allEnumDefs = new Map();
-function resolveEnum(name) { return enumDefs.get(name) || allEnumDefs.get(name); }
+// One lookup for enum defs by annotation/type name. A '|' chain
+// ('@enum word_id|item_id' on union holders like gWordBuffer) resolves to the
+// first member that DEFINES the value when one is given (Encounter keeps the
+// ranges disjoint: items < 128, words >= 128), else the first member that
+// exists (existence checks, sizing).
+function resolveEnum(name, value) {
+    if (name && name.indexOf('|') >= 0) {
+        let first = null;
+        for (const part of name.split('|')) {
+            const ed = enumDefs.get(part) || allEnumDefs.get(part);
+            if (!ed) continue;
+            if (value !== undefined && ed.byValue.has(value)) return ed;
+            if (!first) first = ed;
+        }
+        return first;
+    }
+    return enumDefs.get(name) || allEnumDefs.get(name);
+}
 // Annotation lookup for a symbol (C global or asm label), tolerant of the leading
 // underscore the C compiler / assembler add. One place so every view resolves the
 // same way.
@@ -742,6 +760,19 @@ function buildSymInfo() {
         }
     }
     zpSymbols.sort((a, b) => a.addr - b.addr);
+}
+
+// Re-read comment annotations (@bool/@enum/@ptr16/@bcd/@str/…) from the source
+// files WITHOUT reloading the symbol table — no rebuild, no lost debugger state.
+// Annotations live purely in source comments; parseAnnotations reads them fresh
+// from disk, so editing/adding one and reparsing makes it live immediately.
+// (Symbol addresses, line tables and struct/enum type defs come from the built
+// symbol file — those DO need a rebuild + session restart to change.)
+function reparseAnnotations() {
+    parseAnnotations(moduleAllFiles);
+    buildSymInfo();                    // annotation widths (bcd/bitset) re-applied
+    evt('oricSymbolsChanged', { reason: 'reparse', module: activeModuleId });
+    return annBySymbol.size + annByField.size;
 }
 
 // Modules for the manual-override UI.
@@ -1204,10 +1235,29 @@ function clearRegTags() { regTags.a = regTags.x = regTags.y = null; }
 function regTagStr(reg) {
     const tag = regTags[reg];
     if (!tag || !regs) return null;
-    const def = resolveEnum(tag.enumName);
-    if (!def) return null; // enum not in the active view anymore
     const v = regs[reg] || 0;
+    const def = resolveEnum(tag.enumName, v & 0xFF);
+    if (!def) return null; // enum not in the active view anymore
     return formatEnum(def, [v & 0xFF], 0, 1) + '  ' + tag.enumName;
+}
+
+// For a struct accessed as (ptr),y: which field does the Y offset land in, and
+// — when that field is an array — which element? Returns { field, base,
+// isArray, elemSize, index, within } or null. THE one place that maps a Y
+// offset to a struct field/element, shared by the disassembly annotation and
+// the register-tag inference so the two always agree (DRY). `base` is the
+// element/scalar type (array brackets stripped); `within` is the byte offset
+// into the field; `index` is the array element index.
+function fieldAtOffset(structName, y) {
+    if (!structName || !typeDefs.has(structName)) return null;
+    const f = typeDefs.get(structName).fields.find(f2 => y >= f2.offset && y < f2.offset + f2.size);
+    if (!f) return null;
+    const am = f.type.match(/^(.+)\[(\d+)\]$/);
+    const count = am ? parseInt(am[2], 10) : 1;
+    const elemSize = am ? (Math.floor(f.size / count) || 1) : f.size;
+    const within = y - f.offset;
+    return { field: f, base: am ? am[1] : f.type, isArray: !!am, elemSize, within,
+             index: elemSize > 0 ? Math.floor(within / elemSize) : 0 };
 }
 
 // The enum tag a load instruction confers, or null. Line annotation first
@@ -1216,7 +1266,7 @@ function regTagStr(reg) {
 function tagForLoad(prevPc, mode, lo, hi) {
     const s = sourceFor(prevPc);
     const text = s ? getSourceLine(s.file, s.line) : null;
-    const lm = text && text.match(/@enum\b\s*(\w+)?/);
+    const lm = text && text.match(/@enum\b\s*([\w|]+)?/);
     if (lm && lm[1] && resolveEnum(lm[1])) return { enumName: lm[1], source: 'line' };
     let operand = -1;
     if (mode === 'z') operand = lo;
@@ -1232,14 +1282,17 @@ function tagForLoad(prevPc, mode, lo, hi) {
         }
     }
     // (ptr),y through a @ptr16 <struct> pointer: the FIELD at the Y offset
-    // gives the type — lda (_gStreamItemPtr),y with Y=+4 tags A item_flags.
-    // Y is unchanged by the load itself, so the current value is the one used.
+    // gives the type — lda (_gStreamItemPtr),y with Y=+4 tags A item_flags, and
+    // an array field like directions[6] tags A with the ELEMENT type
+    // (location_id). Y is unchanged by the load itself, so the current value
+    // is the one used.
     if (mode === ')' && regs) {
         const pname = symbolAt(lo);
         const pann = pname ? annForSymbol(pname) : null;
-        if (pann && pann.kind === 'ptr16' && pann.enumName && typeDefs.has(pann.enumName)) {
-            const f = typeDefs.get(pann.enumName).fields.find(f2 => regs.y === f2.offset && f2.size === 1);
-            if (f && resolveEnum(f.type)) return { enumName: f.type, source: pname + '→' + f.name };
+        if (pann && pann.kind === 'ptr16' && pann.enumName) {
+            const info = fieldAtOffset(pann.enumName, regs.y);
+            if (info && info.elemSize === 1 && resolveEnum(info.base))
+                return { enumName: info.base, source: pname + '→' + info.field.name + (info.isArray ? '[' + info.index + ']' : '') };
         }
     }
     return null;
@@ -1676,6 +1729,18 @@ function clearGdbReadCache() {
     gdbReadCache.clear();
 }
 
+// Write memory through the stub. Invalidates the per-stop read cache so the
+// new bytes are immediately visible — the cache is otherwise only cleared on
+// stop notifications, and a `w`/writeMemory while stopped would keep serving
+// the old bytes. THE one M-packet sender (console `w` + DAP writeMemory).
+async function writeMem(addr, bytes) {
+    let hex = '';
+    for (const b of bytes) hex += (b & 0xFF).toString(16).padStart(2, '0');
+    const reply = await gdbCmd('M' + (addr & 0xFFFF).toString(16) + ',' + bytes.length.toString(16) + ':' + hex);
+    if (reply === 'OK') clearGdbReadCache();
+    return reply === 'OK';
+}
+
 // Read memory from the emulator. Returns a Uint8Array of `len` bytes starting at `addr`.
 async function readMem(addr, len) {
     if (len <= 0) return new Uint8Array(0);
@@ -1737,7 +1802,10 @@ function scalarSizeOf(t) {
 
 // Format a scalar value from raw bytes for display
 function formatScalar(typeName, mem, offset, size) {
-    const ed = resolveEnum(typeName);   // case-sensitive: enum tags before lowercasing
+    // Value first: '|' chains pick their enum by it. Case-sensitive lookup —
+    // enum tags before lowercasing.
+    const vv = size >= 2 ? ((mem[offset] || 0) | ((mem[offset + 1] || 0) << 8)) : (mem[offset] || 0);
+    const ed = resolveEnum(typeName, vv);
     if (ed) return formatEnum(ed, mem, offset, size);
     const t = typeName.toLowerCase();
     const isSigned = (t === 'char' || t === 'schar' || t === 'int' || t === 'short' || t === 'sint' || t === 'sshort');
@@ -1808,7 +1876,7 @@ function parseAnnotations(files) {
   annByField.clear();
   annBySymbol.clear();
   try {
-    const ANN = /@(bool|enum|bitset|ptr16|bcd(?:-[bl]e)?|strptr|str)\b\s*(\w+)?/;   // matched within the comment portion (strptr before str: alternation is first-match)
+    const ANN = /@(bool|enum|bitset|ptr16|bcd(?:-[bl]e)?|strptr|str)\b\s*([\w|]+)?/;   // matched within the comment portion (strptr before str: alternation is first-match; [\w|] admits '|' fallback chains)
     const seen = new Set();
     // Struct-field annotations (@bool/@enum/@bitset/@bcd on C struct members) live in
     // headers, but #FILES lists only compilation units (.c/.s) — no .h. Pull in sibling
@@ -1967,9 +2035,22 @@ async function formatAnnotated(ann, addr, size) {
         return { value: (v ? 'true' : 'false') + '  ($' + v.toString(16).toUpperCase().padStart(2, '0') + '|' + v + ')', type: 'bool' };
     }
     if (ann.kind === 'enum') {
-        const ed = resolveEnum(ann.enumName);
         const sz = size || 1;
         const mem = await readMem(addr, sz);
+        // Buffers (.dsb arrays like gWordBuffer, one id per byte): decode each
+        // byte on its own — a 16-bit read across two ids is meaningless.
+        if (sz > 2) {
+            const parts = [];
+            for (let i = 0; i < sz; i++) {
+                const b = mem[i] || 0;
+                const edi = resolveEnum(ann.enumName, b);
+                parts.push(edi && edi.byValue.has(b) ? edi.byValue.get(b)
+                         : '$' + b.toString(16).toUpperCase().padStart(2, '0'));
+            }
+            return { value: '[' + parts.join(', ') + ']', type: ann.enumName || 'enum' };
+        }
+        const v = sz >= 2 ? ((mem[0] || 0) | ((mem[1] || 0) << 8)) : (mem[0] || 0);
+        const ed = resolveEnum(ann.enumName, v);
         return { value: ed ? formatEnum(ed, mem, 0, sz) : formatScalar('uchar', mem, 0, sz), type: ann.enumName || 'enum' };
     }
     if (ann.kind === 'bitset') {
@@ -3370,10 +3451,8 @@ const handlers = {
         const args = req.arguments;
         const addr = (parseInt(args.memoryReference, 16) + (args.offset || 0)) & 0xFFFF;
         const buf = Buffer.from(args.data, 'base64');
-        let hex = '';
-        for (const b of buf) hex += b.toString(16).padStart(2, '0');
-        const reply = await gdbCmd('M' + addr.toString(16) + ',' + buf.length.toString(16) + ':' + hex);
-        respond(req, { bytesWritten: reply === 'OK' ? buf.length : 0 });
+        const ok = await writeMem(addr, buf);
+        respond(req, { bytesWritten: ok ? buf.length : 0 });
     },
 
     // -- Virtual disassembly source ---------------------------------
@@ -3518,6 +3597,15 @@ const handlers = {
             return;
         }
 
+        // Re-read source annotations without a rebuild/reload:  reparse
+        // Add a "; @ptr16 foo" while debugging, save, run this — it's live, no
+        // context lost. Only annotations refresh; symbol addresses need a build.
+        if (/^reparse$/i.test(expr)) {
+            const n = reparseAnnotations();
+            respond(req, { result: 'Reparsed annotations — ' + n + ' now active (symbol addresses unchanged; rebuild for those)', variablesReference: 0 });
+            return;
+        }
+
         // Skip instruction (like Oricutron's F12):  skip
         if (expr.toLowerCase() === 'skip') {
             if (!regs) { respond(req, {}, false, 'No register state'); return; }
@@ -3572,9 +3660,9 @@ const handlers = {
             const addr = parseInt(m[2], m[1] ? 16 : 10);
             const val  = parseInt(m[4], m[3] ? 16 : 10);
             if (val > 255) { respond(req, {}, false, 'Value must fit in one byte'); return; }
-            const r = await gdbCmd('M' + addr.toString(16) + ',1:' + val.toString(16).padStart(2, '0'));
+            const ok = await writeMem(addr, [val]);
             respond(req, {
-                result: r === 'OK' ? 'OK' : 'Write failed',
+                result: ok ? 'OK' : 'Write failed',
                 variablesReference: 0
             });
             return;
@@ -4016,6 +4104,14 @@ const handlers = {
         respond(req, { addr: snap.addr, line: snap.line, executable: executableSnap(snap, a.file) });
     },
 
+    // -- Reparse annotations (custom request) -------------------------
+    // Fired by the extension when a source file is saved (or from the palette
+    // command), so annotation edits go live without a rebuild or session restart.
+    reparseAnnotations(req) {
+        const n = reparseAnnotations();
+        respond(req, { count: n });
+    },
+
     // -- Reset cycle counter (custom request) -------------------------
 
     async resetCycles(req) {
@@ -4388,15 +4484,23 @@ const handlers = {
                     const pname = sym(lo);
                     const pann = pname ? annForSymbol(pname) : null;
                     const sname = (pann && pann.kind === 'ptr16') ? pann.enumName : null;
-                    const fld = (sname && typeDefs.has(sname))
-                        ? typeDefs.get(sname).fields.find(f => regs.y >= f.offset && regs.y < f.offset + f.size)
-                        : null;
-                    if (fld) {
-                        const fv = await buildTypedVar('', (ea - (regs.y - fld.offset)) & 0xFFFF, fld.type, fld.size,
-                                                       annByField.get(sname + '.' + fld.name), { omitAddr: true });
-                        annotation = '(' + pname + '→' + sname + '.' + fld.name
-                            + (regs.y !== fld.offset ? '+' + (regs.y - fld.offset) : '')
-                            + ' @ $' + h4(ea) + ')=' + fv.value;
+                    const info = sname ? fieldAtOffset(sname, regs.y) : null;
+                    if (info) {
+                        const fann = annByField.get(sname + '.' + info.field.name);
+                        if (info.isArray) {
+                            // Y indexes an ELEMENT — decode the one element at `ea`
+                            // with the element type (directions[i] = e_LOC_…),
+                            // not the whole array header.
+                            const ev = await buildTypedVar('', ea, info.base, info.elemSize, fann, { omitAddr: true });
+                            annotation = '(' + pname + '→' + sname + '.' + info.field.name + '[' + info.index + ']'
+                                + ' @ $' + h4(ea) + ')=' + ev.value;
+                        } else {
+                            const fv = await buildTypedVar('', (ea - info.within) & 0xFFFF, info.field.type, info.field.size,
+                                                           fann, { omitAddr: true });
+                            annotation = '(' + pname + '→' + sname + '.' + info.field.name
+                                + (info.within ? '+' + info.within : '')
+                                + ' @ $' + h4(ea) + ')=' + fv.value;
+                        }
                         break;
                     }
                     const val = await readByte(ea);
@@ -4451,7 +4555,7 @@ const handlers = {
                 const rn = CMP_REG[mne];
                 const tag = regTags[rn];
                 if (mode === '#' && tag) {
-                    const def = resolveEnum(tag.enumName);
+                    const def = resolveEnum(tag.enumName, lo);
                     if (def) annotation = '#' + formatEnum(def, [lo], 0, 1);
                 }
                 annotation += '  vs ' + rn.toUpperCase() + '=' + regVal(rn);
