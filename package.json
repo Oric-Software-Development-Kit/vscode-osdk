@@ -142,6 +142,10 @@
                 "title": "Oric: Reparse Annotations (no rebuild)"
             },
             {
+                "command": "oric-debug.reloadSymbols",
+                "title": "Oric: Reload Symbols (after byte-identical rebuild)"
+            },
+            {
                 "command": "oric-debug.openDisassembly",
                 "title": "Oric: Disassembly View"
             },

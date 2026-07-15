@@ -154,8 +154,14 @@ Notes:
   NUL-terminated text needs no argument; attribute-laden text where 0 is a valid byte (ink codes)
   uses its end marker, e.g. `@str 255` for `TEXT_END`. Non-printable bytes render as dots.
   Plain `*char` / `char*` variables and struct fields show their NUL-terminated string automatically.
-- An `@enum` on a CODE line (e.g. `lda (_gCurrentStream),y ; @enum item_id`) types the value the
-  instruction fetches: the destination register gets tagged with it when single-stepping.
+- On a CODE line, three directives type what an indexed/indirect read fetches (handy for reads
+  with no per-symbol type, e.g. inside a byte-stream handler):
+  - `; @enum <E>` — the fetched byte, decoded as enum `<E>` (also tags the destination register
+    when single-stepping);
+  - `; @word` — the 16-bit little-endian word at the read address, plus the symbol it points to
+    (e.g. a jump target: `$7875 →end_girl_following`);
+  - `; @stream <E>` — that word treated as a stream pointer, showing the target's first command.
+  An explicit code-line directive overrides the pointer's own `@stream`/`@ptr16` typing.
 - An `@enum` on a multi-byte symbol (a `.dsb` buffer) decodes each byte separately:
   `gWordBuffer → [e_WORD_TAKE, e_ITEM_Meat, ...]`. Chains resolve per byte, so mixed
   word/item buffers show the right names as long as the enums' value ranges don't overlap.

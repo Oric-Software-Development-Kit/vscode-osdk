@@ -11,6 +11,7 @@
 const net = require('net');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const child_process = require('child_process');
 
 // Staleness self-check: capture this adapter file's mtime at process start (the
@@ -772,6 +773,34 @@ function buildSymInfo() {
 // from disk, so editing/adding one and reparsing makes it live immediately.
 // (Symbol addresses, line tables and struct/enum type defs come from the built
 // symbol file — those DO need a rebuild + session restart to change.)
+// Hash of the disk image the emulator is actually running (captured at launch).
+// A rebuild that leaves this UNCHANGED is byte-identical: the running binary
+// still matches, so the symbol file can be re-parsed in place (new enum members,
+// etc.) WITHOUT relaunching. A changed hash means the emulator holds a stale
+// binary — reloading symbols would mismatch, so we refuse and ask for a restart.
+let launchArtifactPath = null;
+let launchArtifactHash = null;
+function hashFile(p) {
+    try { return crypto.createHash('md5').update(fs.readFileSync(p)).digest('hex'); }
+    catch (e) { return null; }
+}
+
+// Re-parse the symbol FILE in place (new enum members / types / symbols from a
+// rebuild) without relaunching the emulator — but ONLY when the disk image is
+// byte-identical to launch (see launchArtifactHash). Returns a result object.
+function reloadSymbols(force) {
+    if (!config || !config.symbolFile) return { reloaded: false, reason: 'no symbol file configured' };
+    if (launchArtifactPath && launchArtifactHash && !force) {
+        const now = hashFile(launchArtifactPath);
+        if (now && now !== launchArtifactHash)
+            return { reloaded: false, changed: true, reason: 'disk image changed since launch — the emulator is running the old binary; restart the debug session to load the new build (or force to reload symbols anyway)' };
+    }
+    const prevActive = activeModuleId;
+    loadSymbols(config.symbolFile);            // re-reads #SYM/#TYPES/#LINES + annotations; emits oricSymbolsChanged
+    if (prevActive !== null && moduleNames.has(prevActive)) applyActiveModule(prevActive);
+    return { reloaded: true, symbols: symbols.size };
+}
+
 function reparseAnnotations() {
     sourceLineCache = {};              // drop cached source text so CODE-LINE @enum edits reload
     parseAnnotations(moduleAllFiles);
@@ -1275,6 +1304,27 @@ function lineEnumOf(pc) {
     const text = s ? getSourceLine(s.file, s.line) : null;
     const lm = text && text.match(/@enum\b\s*([\w|]+)?/);
     return (lm && lm[1] && resolveEnum(lm[1])) ? lm[1] : null;
+}
+
+// The type directives on the source CODE LINE at `pc`, for the inline annotation.
+// A line may carry several, combined in one annotation:
+//   @enum <E>   the fetched byte decoded as enum <E>
+//   @word       the 16-bit LE word at the read address, + the symbol it targets
+//   @stream <E> that word treated as a stream pointer -> first command
+// e.g. "; @word @stream script_command" shows "$7875 →end_girl_following = COMMAND_END".
+// Read live via getSourceLine (cache cleared by reparse). Only @enum can tag a
+// register (a byte); @word/@stream are 16-bit reads for the annotation only.
+function lineDirectivesOf(pc) {
+    const s = sourceFor(pc);
+    const text = s ? getSourceLine(s.file, s.line) : null;
+    if (!text) return [];
+    const dirs = [];
+    let m = text.match(/@enum\b\s*([\w|]+)?/);
+    if (m && m[1] && resolveEnum(m[1])) dirs.push({ kind: 'enum', enumName: m[1] });
+    m = text.match(/@stream\b\s*([\w|]+)?/);
+    if (m && m[1] && resolveEnum(m[1])) dirs.push({ kind: 'stream', enumName: m[1] });
+    if (/@word\b/.test(text)) dirs.push({ kind: 'word' });
+    return dirs;
 }
 
 // The enum tag a load instruction confers, or null. Line annotation first
@@ -2667,6 +2717,12 @@ const handlers = {
 
         if (config.symbolFile) loadSymbols(config.symbolFile);
 
+        // Hash the disk image now, so a later `reloadsymbols` can tell a
+        // byte-identical rebuild (safe to reload symbols in place) from a real
+        // rebuild (emulator holds a stale binary — needs a relaunch).
+        launchArtifactPath = config.diskImage || null;
+        launchArtifactHash = launchArtifactPath ? hashFile(launchArtifactPath) : null;
+
         // --- Step 1: Build if stale ---
         if (config.build) {
             const buildOutput = config.build.output;
@@ -3765,6 +3821,21 @@ const handlers = {
             return;
         }
 
+        // Re-read the symbol FILE after a byte-identical rebuild (new enum members,
+        // types, symbols) WITHOUT relaunching:  reloadsymbols  [force]
+        // Gated on the disk-image hash so a real (non-byte-identical) rebuild is
+        // refused — the running emulator would mismatch the fresh symbols.
+        if (/^reloadsymbols(\s+force)?$/i.test(expr)) {
+            const r = reloadSymbols(/force/i.test(expr));
+            respond(req, {
+                result: r.reloaded
+                    ? 'Reloaded symbol file — ' + r.symbols + ' symbols (binary unchanged since launch)'
+                    : 'Not reloaded: ' + r.reason,
+                variablesReference: 0
+            });
+            return;
+        }
+
         // Skip instruction (like Oricutron's F12):  skip
         if (expr.toLowerCase() === 'skip') {
             if (!regs) { respond(req, {}, false, 'No register state'); return; }
@@ -4271,6 +4342,16 @@ const handlers = {
         respond(req, { count: n });
     },
 
+    // -- Reload symbol file (custom request) --------------------------
+    // Re-parse the (rebuilt) symbol file in place after a byte-identical build —
+    // new enum members / types / symbols without relaunching. Gated on the disk
+    // hash; returns { reloaded, changed?, reason?, symbols? } so the caller can
+    // tell "refreshed" from "binary changed — restart needed".
+    reloadSymbols(req) {
+        const force = req.arguments && req.arguments.force;
+        respond(req, reloadSymbols(force));
+    },
+
     // -- Reset cycle counter (custom request) -------------------------
 
     async resetCycles(req) {
@@ -4573,21 +4654,53 @@ const handlers = {
             return fmtVal(await readByte(addr));
         };
 
-        // A "; @enum <E>" on this code line types the fetched byte — the way to
-        // decode indexed/indirect reads whose operand has no per-symbol type
-        // (e.g. the operator byte a JUMP_IF handler peeks). One helper so every
-        // indexed mode honours it identically.
-        const lineEnum = lineEnumOf(pc);
-        const valOrEnum = (b) => {
-            if (lineEnum) { const ed = resolveEnum(lineEnum, b); if (ed) return formatEnum(ed, [b], 0, 1) + '  ' + lineEnum; }
-            return fmtVal(b);
+        // A code-line directive types an indexed/indirect read whose operand has
+        // no per-symbol type. One helper so every indexed mode honours it:
+        //   ; @enum <E>    the fetched byte, decoded as enum <E>
+        //   ; @word        the 16-bit LE word at the effective address, + symbol
+        //   ; @stream <E>  that word treated as a stream pointer -> first command
+        // Returns the display string, or null when there is no directive (caller
+        // falls back to the plain byte).
+        const lineDirs = lineDirectivesOf(pc);
+        const valOrEnum = async (b, ea) => {
+            if (!lineDirs.length) return fmtVal(b);
+            const hasWord = lineDirs.some(d => d.kind === 'word');
+            const streamDir = lineDirs.find(d => d.kind === 'stream');
+            const enumDir = lineDirs.find(d => d.kind === 'enum');
+            const parts = [];
+            if (enumDir) {                                     // byte-level: decode the fetched byte
+                const ed = resolveEnum(enumDir.enumName, b);
+                parts.push(ed ? formatEnum(ed, [b], 0, 1) + '  ' + enumDir.enumName : fmtVal(b));
+            }
+            if (hasWord || streamDir) {                        // word-level: the 16-bit word at the addr
+                const m = await readMem(ea, 2);
+                const w = (m[0] | (m[1] << 8)) & 0xFFFF;
+                let s = '$' + w.toString(16).toUpperCase().padStart(4, '0');
+                if (hasWord) { const sy = symbolAt(w); s += sy ? ' →' + sy : ' (' + w + ')'; }
+                else { s = '→ ' + s; }                         // stream-only: keep the arrow form
+                if (streamDir) {
+                    const cmds = await decodeStream(streamDir.enumName, w, 1);
+                    if (cmds.length && cmds[0].known) s += ' = ' + streamCmdText(cmds[0], streamDir.enumName);
+                }
+                parts.push(s);
+            }
+            return parts.length ? parts.join('  ') : fmtVal(b);
         };
 
         let annotation = '';
         try {
             switch (mode) {
                 case '#': { // immediate
-                    annotation = '#' + fmtVal(lo);
+                    // A "; @enum <E>" on the line decodes the immediate as that enum
+                    // (an immediate carries no inherent type — e.g. lda #FLAG_END_STREAM
+                    // shows FLAG_END_STREAM). @word/@stream don't apply (no address).
+                    const enumDir = lineDirs.find(d => d.kind === 'enum');
+                    if (enumDir) {
+                        const ed = resolveEnum(enumDir.enumName, lo);
+                        annotation = '#' + (ed ? formatEnum(ed, [lo], 0, 1) + '  ' + enumDir.enumName : fmtVal(lo));
+                    } else {
+                        annotation = '#' + fmtVal(lo);
+                    }
                     break;
                 }
                 case 'z': { // zero page
@@ -4601,13 +4714,13 @@ const handlers = {
                 case 'x': { // zp,X
                     const ea = (lo + regs.x) & 0xFF;
                     const val = await readByte(ea);
-                    annotation = '(' + symAddr(lo, false) + '+X:' + h2(regs.x) + '=' + h2(ea) + ')=' + valOrEnum(val);
+                    annotation = '(' + symAddr(lo, false) + '+X:' + h2(regs.x) + '=' + h2(ea) + ')=' + await valOrEnum(val, ea);
                     break;
                 }
                 case 'y': { // zp,Y
                     const ea = (lo + regs.y) & 0xFF;
                     const val = await readByte(ea);
-                    annotation = '(' + symAddr(lo, false) + '+Y:' + h2(regs.y) + '=' + h2(ea) + ')=' + valOrEnum(val);
+                    annotation = '(' + symAddr(lo, false) + '+Y:' + h2(regs.y) + '=' + h2(ea) + ')=' + await valOrEnum(val, ea);
                     break;
                 }
                 case 'a': { // absolute
@@ -4626,26 +4739,34 @@ const handlers = {
                     const base = (hi << 8) | lo;
                     const ea = (base + regs.x) & 0xFFFF;
                     const val = await readByte(ea);
-                    annotation = '$' + h4(base) + '+X:' + h2(regs.x) + '=$' + h4(ea) + ' =' + valOrEnum(val);
+                    annotation = '$' + h4(base) + '+X:' + h2(regs.x) + '=$' + h4(ea) + ' =' + await valOrEnum(val, ea);
                     break;
                 }
                 case 'Y': { // abs,Y
                     const base = (hi << 8) | lo;
                     const ea = (base + regs.y) & 0xFFFF;
                     const val = await readByte(ea);
-                    annotation = '$' + h4(base) + '+Y:' + h2(regs.y) + '=$' + h4(ea) + ' =' + valOrEnum(val);
+                    annotation = '$' + h4(base) + '+Y:' + h2(regs.y) + '=$' + h4(ea) + ' =' + await valOrEnum(val, ea);
                     break;
                 }
                 case '(': { // (zp,X) indirect X
                     const ptr = (lo + regs.x) & 0xFF;
                     const ea = await readWord(ptr);
                     const val = await readByte(ea);
-                    annotation = '(' + symAddr(lo, false) + '+X:' + h2(regs.x) + '=' + h2(ptr) + ')=$' + h4(ea) + ' =' + valOrEnum(val);
+                    annotation = '(' + symAddr(lo, false) + '+X:' + h2(regs.x) + '=' + h2(ptr) + ')=$' + h4(ea) + ' =' + await valOrEnum(val, ea);
                     break;
                 }
                 case ')': { // (zp),Y indirect Y
                     const ptr = await readWord(lo);
                     const ea = (ptr + regs.y) & 0xFFFF;
+                    // An explicit code-line directive (@word / @stream / @enum) on
+                    // THIS line wins over the pointer's own @stream/@ptr16 typing —
+                    // the user annotated this instruction on purpose (e.g. @word on
+                    // the JUMP handler's read to show the jump target).
+                    if (lineDirs.length) {
+                        annotation = '(' + symAddr(lo, false) + ')=' + await valOrEnum(await readByte(ea), ea);
+                        break;
+                    }
                     // Struct-aware: a @ptr16 <struct> pointer names the FIELD the
                     // Y offset lands in, and decodes the value with the field's
                     // type ((_gStreamItemPtr→item.flags)=ITEM_FLAG_…). XA has no
@@ -4687,7 +4808,7 @@ const handlers = {
                         break;
                     }
                     const val = await readByte(ea);
-                    annotation = '(*(' + symAddr(lo, false) + ')=$' + h4(ptr) + '+Y:' + h2(regs.y) + ')=$' + h4(ea) + ' =' + valOrEnum(val);
+                    annotation = '(*(' + symAddr(lo, false) + ')=$' + h4(ptr) + '+Y:' + h2(regs.y) + ')=$' + h4(ea) + ' =' + await valOrEnum(val, ea);
                     break;
                 }
                 case 'n': { // indirect (JMP only)

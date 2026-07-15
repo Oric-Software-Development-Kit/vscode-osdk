@@ -3553,6 +3553,9 @@ tr:nth-child(even) td {
 .wg::before { content: ''; position: absolute; left: 5px; top: -1px; bottom: -1px; border-left: 1px solid var(--vscode-tree-indentGuidesStroke, #585858); }
 .wtype { color: var(--vscode-debugTokenExpression-type, #4ec9b0); }
 .waddr { color: var(--vscode-descriptionForeground, #888); }
+/* Decoded enum/bool name: a distinct greenish tint so the symbolic value stands
+   out from the raw ($hex|dec|%bin) that follows it. */
+.wenum { color: var(--vscode-symbolIcon-enumeratorMemberForeground, #a5d6a7); }
 /* Stale: session ended, rows show the last live values grayed out */
 #watchSec.stale .wrow { opacity: 0.55; }
 .wn { color: var(--vscode-debugTokenExpression-name, #9cdcfe); flex: none; }
@@ -3893,6 +3896,10 @@ function renderWatch() {
                 // Struct render is just "type  @ $addr" — the type IS the first segment
                 if (segs.length === 2 && /^@ \\$/.test(segs[1]) && isType(seg))
                     return '<span class="wtype">' + seg + '</span>';
+                // Decoded enum/bool value: "NAME (raw)" or flags "A|B|C (raw)" — tint
+                // the name(s) distinctly from the numeric part in parentheses.
+                const em = seg.match(/^([A-Za-z_][\\w]*(?:\\|[A-Za-z_][\\w]*)*) (\\(.+\\))$/);
+                if (em) return '<span class="wenum">' + em[1] + '</span> ' + em[2];
                 // Pointer values lead with their type: "*item → $0421"
                 return seg.replace(/^(\\*[A-Za-z_]\\w*)/, '<span class="wtype">$1</span>');
             }
@@ -4263,6 +4270,31 @@ function activate(context) {
         reparseAnnotations(false);
     }));
 
+    // Reload the symbol file after a rebuild WITHOUT relaunching — for changes
+    // the build produced but that are byte-identical (new enum members, types,
+    // symbols). The adapter gates on the disk-image hash: if the binary changed,
+    // it refuses and tells you to restart (the emulator holds the old binary).
+    async function reloadSymbols() {
+        const session = vscode.debug.activeDebugSession;
+        if (!session || session.type !== 'oric-debug') {
+            vscode.window.showInformationMessage('Oric: start a debug session first.');
+            return;
+        }
+        try {
+            const r = await session.customRequest('reloadSymbols');
+            if (r && r.reloaded) {
+                refreshAll();
+                vscode.window.setStatusBarMessage('Oric: reloaded symbols — ' + r.symbols + ' symbols (binary unchanged)', 5000);
+            } else if (r && r.changed) {
+                vscode.window.showWarningMessage('Oric: the binary changed since launch — restart the debug session to load the new build (the emulator is still running the old one).');
+            } else {
+                vscode.window.showInformationMessage('Oric: symbols not reloaded' + (r && r.reason ? ' — ' + r.reason : ''));
+            }
+        } catch (e) {
+            vscode.window.showErrorMessage('Oric reload-symbols failed: ' + (e && e.message ? e.message : String(e)));
+        }
+    }
+
     // --- Editor hover provider: show symbol info + heatmap highlight ---
     context.subscriptions.push(
         vscode.languages.registerHoverProvider('osdk', {
@@ -4425,6 +4457,7 @@ function activate(context) {
         vscode.commands.registerCommand('osdk.6502Reference', () => create6502ReferencePanel()),
         vscode.commands.registerCommand('oric-debug.openSymbols', () => createSymbolsPanel(context)),
         vscode.commands.registerCommand('oric-debug.reparseAnnotations', () => reparseAnnotations(true)),
+        vscode.commands.registerCommand('oric-debug.reloadSymbols', () => reloadSymbols()),
         vscode.commands.registerCommand('oric-debug.openDisassembly', () => createDisasmPanel()),
         vscode.commands.registerCommand('oric-debug.stepOverInstruction', async () => {
             const session = vscode.debug.activeDebugSession;
