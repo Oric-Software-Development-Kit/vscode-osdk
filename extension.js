@@ -3786,12 +3786,17 @@ searchEl.addEventListener('focus', () => { if (!searchEl.value && mruItems.lengt
 searchEl.addEventListener('blur', () => { setTimeout(mruClose, 150); });
 searchEl.addEventListener('keydown', e => {
     if (e.key === 'Escape') { searchEl.value = ''; filterText = ''; mruClose(); render(); }
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { watchTyped(); return; }
-    if (e.key === 'Enter' && filterText.trim()) { mruAdd(filterText); mruSave(); mruClose(); }
+    // Enter watches the typed expression (and remembers it in the search history).
+    if (e.key === 'Enter') {
+        if (filterText.trim()) { mruAdd(filterText); mruSave(); }
+        mruClose();
+        watchTyped();
+        return;
+    }
     if (e.key === 'ArrowDown' && !searchEl.value && mruItems.length) { mruRender(); }
 });
 
-// "+ Watch" (or Ctrl+Enter): watch WHATEVER is typed — casts like (item_id)a,
+// "+ Watch" button / Enter: watch WHATEVER is typed — casts like (item_id)a,
 // registers, hex addresses — no need to match a row in the table.
 function watchTyped() {
     const expr = searchEl.value.trim();
@@ -3879,7 +3884,7 @@ function renderWatch() {
     // delimiter and classify each segment instead of pattern-guessing.
     function colorVal(v) {
         const segs = escW(v).split('  ');
-        const isType = s => /^\\*?[A-Za-z_][\\w-]*(\\[\\d+\\])?$/.test(s);
+        const isType = s => /^\\*?[A-Za-z_][\\w|-]*(\\[\\d+\\])?$/.test(s);
         return segs.map((seg, i) => {
             if (/^@ \\$[0-9A-Fa-f]+$/.test(seg)) return '<span class="waddr">' + seg + '</span>';
             if (/^(A|X|Y|SP|PC)$/.test(seg)) return seg;              // register token of a cast
@@ -4227,6 +4232,37 @@ function activate(context) {
 
     context.subscriptions.push(instrDecorationType);
 
+    // Re-read source @annotations into the running adapter — no rebuild, no lost
+    // debugger state. Panels/watch refresh via the adapter's oricSymbolsChanged
+    // event; refreshAll() also updates registers + the inline instruction hint.
+    // `explicit` = user-invoked (palette/command): show feedback and a
+    // no-session notice; auto-on-save stays silent.
+    async function reparseAnnotations(explicit) {
+        const session = vscode.debug.activeDebugSession;
+        if (!session || session.type !== 'oric-debug') {
+            if (explicit) vscode.window.showInformationMessage('Oric: start a debug session first — reparse updates the live one.');
+            return;
+        }
+        try {
+            const r = await session.customRequest('reparseAnnotations');
+            refreshAll();
+            const n = r && typeof r.count === 'number' ? r.count : null;
+            vscode.window.setStatusBarMessage('Oric: reparsed annotations' + (n !== null ? ' — ' + n + ' active' : ''), 4000);
+        } catch (e) {
+            if (explicit) vscode.window.showErrorMessage('Oric reparse failed: ' + (e && e.message ? e.message : String(e)));
+        }
+    }
+
+    // Auto-reparse on save: editing an annotation in a source file and saving
+    // makes it live immediately, mid-debug. Only source files that can carry
+    // annotations trigger it, and only while an oric-debug session is running.
+    context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(doc => {
+        if (!/\.(h|s|asm|c)$/i.test(doc.fileName)) return;
+        const session = vscode.debug.activeDebugSession;
+        if (!session || session.type !== 'oric-debug') return;
+        reparseAnnotations(false);
+    }));
+
     // --- Editor hover provider: show symbol info + heatmap highlight ---
     context.subscriptions.push(
         vscode.languages.registerHoverProvider('osdk', {
@@ -4388,6 +4424,7 @@ function activate(context) {
         vscode.commands.registerCommand('osdk.xaReference', () => createXaReferencePanel()),
         vscode.commands.registerCommand('osdk.6502Reference', () => create6502ReferencePanel()),
         vscode.commands.registerCommand('oric-debug.openSymbols', () => createSymbolsPanel(context)),
+        vscode.commands.registerCommand('oric-debug.reparseAnnotations', () => reparseAnnotations(true)),
         vscode.commands.registerCommand('oric-debug.openDisassembly', () => createDisasmPanel()),
         vscode.commands.registerCommand('oric-debug.stepOverInstruction', async () => {
             const session = vscode.debug.activeDebugSession;
@@ -4443,6 +4480,39 @@ function activate(context) {
             } catch (e) {
                 vscode.window.showErrorMessage('Copy annotation failed: ' + (e && e.message ? e.message : e));
             }
+        }),
+
+        // Copy a source line EXACTLY as seen on screen — the raw text plus the
+        // inline decoded annotation the debugger renders after it. Made for
+        // reporting a problem: right-click the gutter, paste the full context.
+        // The annotation only exists for the current PC line (that's the only
+        // line the adapter decodes), so off-PC lines copy just the source text.
+        // Falls back to the active editor's cursor line when invoked without a
+        // gutter context (palette / keybinding).
+        vscode.commands.registerCommand('oric-debug.copyLine', async (ctx) => {
+            let uri, lineNumber; // 1-based, matching ctx.lineNumber and instrDecoLine
+            if (ctx && ctx.uri && typeof ctx.lineNumber === 'number') {
+                uri = ctx.uri; lineNumber = ctx.lineNumber;
+            } else {
+                const ed = vscode.window.activeTextEditor;
+                if (!ed) { vscode.window.setStatusBarMessage('Copy line: no active editor', 3000); return; }
+                uri = ed.document.uri; lineNumber = ed.selection.active.line + 1;
+            }
+            let out;
+            try {
+                const doc = await vscode.workspace.openTextDocument(uri);
+                out = doc.lineAt(lineNumber - 1).text.replace(/\s+$/, '');
+            } catch (e) {
+                vscode.window.showErrorMessage('Copy line failed: ' + (e && e.message ? e.message : e));
+                return;
+            }
+            // Append the on-screen inline annotation when this IS the decorated line.
+            if (instrDecoText && instrDecoFile
+                && canonPath(uri.fsPath) === canonPath(instrDecoFile) && lineNumber === instrDecoLine) {
+                out += '    ' + instrDecoText;
+            }
+            await vscode.env.clipboard.writeText(out);
+            vscode.window.setStatusBarMessage('Copied line: ' + out.trim().slice(0, 70), 3000);
         }),
 
         // --- Line-targeted debug actions (line-number gutter menu + CodeLens) ---
