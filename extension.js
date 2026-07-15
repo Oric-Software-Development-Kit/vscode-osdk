@@ -4079,6 +4079,25 @@ function activate(context) {
             await requestTurboRun(ed ? { file: ed.document.uri.fsPath, line: ed.selection.active.line + 1 } : {});
         }),
 
+        // Copy the current inline instruction annotation to the clipboard —
+        // retyping "(_gStreamItemPtr→item.flags)=ITEM_FLAG_…" by hand is not a
+        // workflow (user request). Native VS Code clipboard API, cross-platform.
+        vscode.commands.registerCommand('oric-debug.copyInstructionAnnotation', async () => {
+            const session = vscode.debug.activeDebugSession;
+            if (!session || session.type !== 'oric-debug') return;
+            try {
+                const r = await session.customRequest('resolveInstruction');
+                if (r && r.annotation) {
+                    await vscode.env.clipboard.writeText(r.annotation);
+                    vscode.window.setStatusBarMessage('Copied: ' + r.annotation.slice(0, 60), 3000);
+                } else {
+                    vscode.window.setStatusBarMessage('No instruction annotation to copy', 3000);
+                }
+            } catch (e) {
+                vscode.window.showErrorMessage('Copy annotation failed: ' + (e && e.message ? e.message : e));
+            }
+        }),
+
         // --- Line-targeted debug actions (line-number gutter menu + CodeLens) ---
         // Run/jump reuse the built-in cursor commands after positioning the caret
         // on the requested line; turbo goes straight to the adapter, which takes

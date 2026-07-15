@@ -497,7 +497,7 @@ function annForSymbol(name) { return name ? annBySymbol.get(name.replace(/^_+/, 
 // to a single byte at the caller). One place so symbol sizing and value rendering agree.
 function annWidth(ann) {
     if (!ann || typeof ann.kind !== 'string') return 0;
-    if (ann.kind === 'ptr16') return 2;
+    if (ann.kind === 'ptr16' || ann.kind === 'strptr') return 2;
     if (ann.kind.indexOf('bcd') === 0) return ann.size || 2;
     if (ann.kind === 'bitset') { const ed = resolveEnum(ann.enumName); return ann.size || (ed ? bitsetBytes(ed) : 0); }
     return 0;
@@ -1231,6 +1231,17 @@ function tagForLoad(prevPc, mode, lo, hi) {
                 return { enumName: spec.type, source: name };
         }
     }
+    // (ptr),y through a @ptr16 <struct> pointer: the FIELD at the Y offset
+    // gives the type — lda (_gStreamItemPtr),y with Y=+4 tags A item_flags.
+    // Y is unchanged by the load itself, so the current value is the one used.
+    if (mode === ')' && regs) {
+        const pname = symbolAt(lo);
+        const pann = pname ? annForSymbol(pname) : null;
+        if (pann && pann.kind === 'ptr16' && pann.enumName && typeDefs.has(pann.enumName)) {
+            const f = typeDefs.get(pann.enumName).fields.find(f2 => regs.y === f2.offset && f2.size === 1);
+            if (f && resolveEnum(f.type)) return { enumName: f.type, source: pname + '→' + f.name };
+        }
+    }
     return null;
 }
 
@@ -1797,7 +1808,7 @@ function parseAnnotations(files) {
   annByField.clear();
   annBySymbol.clear();
   try {
-    const ANN = /@(bool|enum|bitset|ptr16|bcd(?:-[bl]e)?)\b\s*(\w+)?/;   // matched within the comment portion
+    const ANN = /@(bool|enum|bitset|ptr16|bcd(?:-[bl]e)?|strptr|str)\b\s*(\w+)?/;   // matched within the comment portion (strptr before str: alternation is first-match)
     const seen = new Set();
     // Struct-field annotations (@bool/@enum/@bitset/@bcd on C struct members) live in
     // headers, but #FILES lists only compilation units (.c/.s) — no .h. Pull in sibling
@@ -1846,6 +1857,13 @@ function parseAnnotations(files) {
                     directive.enumName = null;
                     if (m[2] && /^\d+$/.test(m[2])) directive.size = parseInt(m[2], 10);
                 }
+                // @str / @strptr carry an optional TERMINATOR byte value
+                // (decimal — no implicit hex), not an enum name. Default 0 (NUL);
+                // Encounter's attribute-text uses 255 (TEXT_END).
+                if (m[1] === 'str' || m[1] === 'strptr') {
+                    directive.enumName = null;
+                    if (m[2] && /^\d+$/.test(m[2])) directive.term = parseInt(m[2], 10) & 0xFF;
+                }
                 let name = null;
                 if (isAsm) {
                     const t = code.match(/^\s*([A-Za-z_.][\w.]*)/);
@@ -1888,10 +1906,41 @@ async function ptr16Str(baseAddr) {
     return s;
 }
 
-// Render a value using a comment annotation (@bool/@enum/@bitset/@ptr16/@bcd).
-// Returns { value, ref? } or null. bitset returns an expandable ref (children = set bits).
+// Read a terminated string at `addr` for display: up to `term` (Encounter has
+// classic NUL-terminated text AND attribute-laden text where 0 is BLACK INK —
+// those use TEXT_END 255 instead), capped, non-printables as dots (attribute
+// bytes stay visible as placeholders without hiding the words).
+async function readTermString(addr, term) {
+    const CAP = 40;
+    const mem = await readMem(addr & 0xFFFF, CAP);
+    let len = 0;
+    while (len < CAP && mem[len] !== term) len++;
+    return (formatCharArray(mem, 0, len) || '""') + (len === CAP ? '…' : '');
+}
+
+// Render a value using a comment annotation (@bool/@enum/@bitset/@ptr16/@bcd/
+// @str/@strptr). Returns { value, ref? } or null. bitset returns an expandable
+// ref (children = set bits).
 async function formatAnnotated(ann, addr, size) {
+    // @str [term]: the text itself sits at the symbol; @strptr [term]: a 16-bit
+    // pointer to it. term defaults to 0 (NUL); attribute-text uses e.g. 255.
+    if (ann.kind === 'str') {
+        return { value: await readTermString(addr, ann.term || 0), type: 'str' + (ann.term ? '/' + ann.term : '') };
+    }
+    if (ann.kind === 'strptr') {
+        const m = await readMem(addr, 2);
+        const target = (m[0] | (m[1] << 8)) & 0xFFFF;
+        const tHex = '$' + target.toString(16).toUpperCase().padStart(4, '0');
+        if (target === 0) return { value: '→ ' + tHex, type: 'strptr' };
+        return { value: '→ ' + tHex + ' = ' + await readTermString(target, ann.term || 0), type: 'strptr' + (ann.term ? '/' + ann.term : '') };
+    }
     if (ann.kind === 'ptr16') {
+        // Typed pointer (@ptr16 <struct>): render as *<struct> through the one
+        // render path — the pointed-to struct is expandable in every view.
+        if (ann.enumName && typeDefs.has(ann.enumName)) {
+            const v = await buildTypedVar('', addr, '*' + ann.enumName, 2, null, { omitAddr: true });
+            return { value: v.value, ref: v.variablesReference, type: null }; // value already names the type
+        }
         return { value: await ptr16Str(addr), type: 'ptr16' };
     }
     if (ann.kind === 'bcd' || ann.kind === 'bcd-be' || ann.kind === 'bcd-le') {
@@ -1976,6 +2025,13 @@ async function buildTypedVar(name, addr, fullType, size, ann, opts) {
             const ref = stableRef('ptr:' + target + ':' + pointed,
                                   { addr: target, typeName: pointed, count: 1 });
             return { name, value: fullType + ' → ' + tHex + at, variablesReference: ref };
+        }
+        // char pointee: a C string — show the NUL-terminated text, not one
+        // character ("description: *char → $2DD7 = 'e'" told the user nothing;
+        // the string IS the context). Attribute-text with other terminators is
+        // covered by @str / @strptr annotations instead.
+        if (isCharType(pointed) && target !== 0) {
+            return { name, value: fullType + ' → ' + tHex + ' = ' + await readTermString(target, 0) + at, variablesReference: 0 };
         }
         // Scalar target: dereference one hop and show the pointed-to value,
         // mirroring the @ptr16 annotation's "→" so pointers read consistently.
@@ -4300,6 +4356,24 @@ const handlers = {
                 case ')': { // (zp),Y indirect Y
                     const ptr = await readWord(lo);
                     const ea = (ptr + regs.y) & 0xFFFF;
+                    // Struct-aware: a @ptr16 <struct> pointer names the FIELD the
+                    // Y offset lands in, and decodes the value with the field's
+                    // type ((_gStreamItemPtr→item.flags)=ITEM_FLAG_…). XA has no
+                    // struct syntax — this is where "ldy #4" gets its meaning back.
+                    const pname = sym(lo);
+                    const pann = pname ? annForSymbol(pname) : null;
+                    const sname = (pann && pann.kind === 'ptr16') ? pann.enumName : null;
+                    const fld = (sname && typeDefs.has(sname))
+                        ? typeDefs.get(sname).fields.find(f => regs.y >= f.offset && regs.y < f.offset + f.size)
+                        : null;
+                    if (fld) {
+                        const fv = await buildTypedVar('', (ea - (regs.y - fld.offset)) & 0xFFFF, fld.type, fld.size,
+                                                       annByField.get(sname + '.' + fld.name), { omitAddr: true });
+                        annotation = '(' + pname + '→' + sname + '.' + fld.name
+                            + (regs.y !== fld.offset ? '+' + (regs.y - fld.offset) : '')
+                            + ' @ $' + h4(ea) + ')=' + fv.value;
+                        break;
+                    }
                     const val = await readByte(ea);
                     annotation = '(*(' + symAddr(lo, false) + ')=$' + h4(ptr) + '+Y:' + h2(regs.y) + ')=$' + h4(ea) + ' =' + fmtVal(val);
                     break;

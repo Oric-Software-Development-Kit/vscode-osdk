@@ -137,13 +137,22 @@ sources for them at session start.
 | `@enum <E>` | the enumerator name for the value | `unsigned char layout; // @enum KeyboardLayout` |
 | `@bitset <E>` | the set bits decoded to a list of enum names | `_gAchievements .dsb 7 ; @bitset achievement` |
 | `@ptr16` | the 16-bit pointer and what it currently points to | `sourcePtr = tmp0 ; @ptr16` |
+| `@ptr16 <struct>` | typed pointer: expandable pointed-to struct; `(ptr),y` disassembly names the FIELD the Y offset hits and decodes it with the field's type | `_gStreamItemPtr .dsb 2 ; @ptr16 item` |
 | `@bcd` / `@bcd-be` / `@bcd-le` | packed BCD decoded to a readable number | `current_score_bcd .dsb 2 ; @bcd-be` |
+| `@str [term]` | terminated string at the symbol (terminator byte in decimal, default 0) | `_Text_Title ; @str 255` |
+| `@strptr [term]` | 16-bit pointer to a terminated string | `textPtr .dsb 2 ; @strptr 255` |
 
 Notes:
 - `@enum` / `@bitset` name a C `enum` type (the OSDK compiler emits enum info under `-g1`, and XA
   supports `enum {}` in shared C/asm headers). `@bitset` decodes bit *P* as byte `P>>3`, bit `1<<(P&7)`.
 - `@bcd-be` (default, and the plain `@bcd` alias) = most-significant byte at the lowest address;
   `@bcd-le` = least-significant first. An explicit width may follow, e.g. `@bcd-be 3` for a 3-byte value.
+- `@str` / `@strptr` take the terminator as a DECIMAL byte value (no implicit hex): plain
+  NUL-terminated text needs no argument; attribute-laden text where 0 is a valid byte (ink codes)
+  uses its end marker, e.g. `@str 255` for `TEXT_END`. Non-printable bytes render as dots.
+  Plain `*char` / `char*` variables and struct fields show their NUL-terminated string automatically.
+- An `@enum` on a CODE line (e.g. `lda (_gCurrentStream),y ; @enum item_id`) types the value the
+  instruction fetches: the destination register gets tagged with it when single-stepping.
 - Annotated values render consistently in the Watch/Variables views, the Symbol Browser, and inline
   in the disassembly — each shows the decoded value plus a short type token (e.g. `bool`, the enum
   name, `bcd-be`).

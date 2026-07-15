@@ -160,6 +160,10 @@
                 "icon": "$(run-all)"
             },
             {
+                "command": "oric-debug.copyInstructionAnnotation",
+                "title": "Oric: Copy Instruction Annotation"
+            },
+            {
                 "command": "oric-debug.selectModule",
                 "title": "Oric: Active Module"
             },
