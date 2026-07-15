@@ -2659,6 +2659,94 @@ async function lineExecutable(uri, lineNumber) {
 
 let symbolsPanel = null;
 
+// --- Watched expressions (shown inside the Symbol Browser panel) ---
+// The in-memory list is the source of truth; workspaceState is a mirror.
+// Memento.update() is ASYNC — reading it back right after an add races
+// and can return the old list.
+let watchedExprs = [];
+let watchMemento = null; // set in activate()
+let watchExpanded = new Set(); // expanded node paths, e.g. '_gSaveGameFile/items'
+let lastWatchGood = null;      // last live {active, inactive} — shown grayed after the session ends
+let symbolMru = [];            // search-box history, persisted per workspace
+function saveWatchedExprs() {
+    if (watchMemento) watchMemento.update('oric-debug.watchExpressions', watchedExprs);
+}
+function removeWatchedExpr(expr) {
+    watchedExprs = watchedExprs.filter(e => e !== expr);
+    for (const p of watchExpanded)
+        if (p === expr || p.startsWith(expr + '/')) watchExpanded.delete(p);
+}
+
+// One watch tree node. Expansion is resolved HERE, not in the webview: the
+// adapter's variablesReference is only valid until the next resume, so the
+// webview never stores one — it just reports expand/collapse by path and
+// receives the fully-resolved tree each refresh.
+async function buildWatchNode(session, path, label, value, vref, error, depth) {
+    const node = { path, label, value, error: !!error, canExpand: !!vref, expanded: false, children: null };
+    if (vref && watchExpanded.has(path) && depth < 8) {
+        node.expanded = true;
+        try {
+            const resp = await session.customRequest('variables', { variablesReference: vref });
+            const vars = (resp && resp.variables) || [];
+            node.children = [];
+            for (const v of vars)
+                node.children.push(await buildWatchNode(session, path + '/' + v.name, v.name, v.value, v.variablesReference, false, depth + 1));
+        } catch (e) {
+            node.children = [];
+        }
+    }
+    return node;
+}
+
+// Evaluate every watched expression through the adapter's ONE evaluate path
+// (symbols, casts, registers, tags — everything the built-in Watch can do)
+// and post the results to the Symbol Browser. Entries whose symbol lives in
+// an INACTIVE module fold into a collapsed group instead of burning a row
+// each on errors; they migrate back automatically on module switch.
+async function refreshWatchValues(session) {
+    if (!symbolsPanel) return;
+    const exprs = watchedExprs.slice();
+    if (!session || session.type !== 'oric-debug') {
+        postStaleWatch(exprs);
+        return;
+    }
+    const active = [], inactive = [];
+    for (const e of exprs) {
+        try {
+            const r = await session.customRequest('evaluate', { expression: e, context: 'watch' });
+            if (r && r.inactive) inactive.push({ path: e, label: e, owners: r.owners || '' });
+            else active.push(await buildWatchNode(session, e, e, (r && r.result) || '', r && r.variablesReference, false, 0));
+        } catch (err) {
+            const m = err && err.message ? err.message : 'error';
+            // Session died mid-refresh ("no debugger available, can not send
+            // 'evaluate'") — fall back to the last live values instead of
+            // painting every row with the same error.
+            if (/no debugger available/i.test(m)) { postStaleWatch(exprs); return; }
+            active.push(await buildWatchNode(session, e, e, '⚠ ' + m, 0, true, 0));
+        }
+    }
+    lastWatchGood = { active, inactive };
+    symbolsPanel.webview.postMessage({ type: 'watch', active, inactive });
+}
+
+// No live session: repost the last live values, grayed out in the UI —
+// practical while editing code against the program's final state. Entries
+// removed since then are filtered; entries added since show empty.
+function postStaleWatch(exprs) {
+    if (!lastWatchGood) {
+        symbolsPanel.webview.postMessage({ type: 'watch', noSession: true,
+            active: exprs.map(e => ({ path: e, label: e, value: '' })), inactive: [] });
+        return;
+    }
+    const keep = new Set(exprs);
+    const active = lastWatchGood.active.filter(n => keep.has(n.path));
+    const inactive = lastWatchGood.inactive.filter(n => keep.has(n.path));
+    const have = new Set([...active.map(n => n.path), ...inactive.map(n => n.path)]);
+    for (const e of exprs)
+        if (!have.has(e)) active.push({ path: e, label: e, value: '' });
+    symbolsPanel.webview.postMessage({ type: 'watch', stale: true, active, inactive });
+}
+
 // Symbol cache: populated from readAllSymbols responses, used by hover provider
 const symbolCache = new Map(); // name -> { addr, size, value, group, source }
 
@@ -2733,6 +2821,7 @@ function createSymbolsPanel(context) {
             symbolsPanel.webview.postMessage({ type: 'symbols', data: defines });
         }
     }
+    refreshWatchValues(session && session.type === 'oric-debug' ? session : null);
 }
 
 // Shared wiring for the symbols panel — fresh create AND serializer restore
@@ -2742,13 +2831,37 @@ function createSymbolsPanel(context) {
 function setupSymbolsPanel(panel) {
     panel.onDidDispose(() => { symbolsPanel = null; });
     panel.onDidChangeViewState(e => {
-        if (e.webviewPanel.visible) refreshSymbolsPanel(vscode.debug.activeDebugSession);
+        if (e.webviewPanel.visible) {
+            refreshSymbolsPanel(vscode.debug.activeDebugSession);
+            refreshWatchValues(vscode.debug.activeDebugSession);
+        }
     });
     panel.webview.onDidReceiveMessage(msg => {
         if (msg.type === 'symbolHover' && typeof msg.addr === 'number') {
             highlightHeatmapAddr(msg.addr);
         } else if (msg.type === 'symbolLeave') {
             restoreHeatmapPcHighlight();
+        } else if (msg.type === 'watchToggle' && msg.expr) {
+            const expr = String(msg.expr).trim();
+            if (watchedExprs.includes(expr)) removeWatchedExpr(expr);
+            else watchedExprs.push(expr);
+            saveWatchedExprs();
+            refreshWatchValues(vscode.debug.activeDebugSession);
+        } else if (msg.type === 'watchRemove' && msg.expr) {
+            removeWatchedExpr(msg.expr);
+            saveWatchedExprs();
+            refreshWatchValues(vscode.debug.activeDebugSession);
+        } else if (msg.type === 'mruGet') {
+            panel.webview.postMessage({ type: 'mru', items: symbolMru });
+        } else if (msg.type === 'mruUpdate' && Array.isArray(msg.items)) {
+            symbolMru = msg.items.slice(0, 10);
+            if (watchMemento) watchMemento.update('oric-debug.symbolSearchMru', symbolMru);
+        } else if (msg.type === 'watchExpand' && msg.path) {
+            watchExpanded.add(msg.path);
+            refreshWatchValues(vscode.debug.activeDebugSession);
+        } else if (msg.type === 'watchCollapse' && msg.path) {
+            watchExpanded.delete(msg.path);
+            refreshWatchValues(vscode.debug.activeDebugSession);
         } else if (msg.type === 'gotoSymbol' && msg.file && msg.line > 0) {
             const uri = vscode.Uri.file(msg.file);
             vscode.workspace.openTextDocument(uri).then(doc => {
@@ -3130,6 +3243,12 @@ document.getElementById('gotoBtn').addEventListener('click', doGoto);
 document.getElementById('gotoInput').addEventListener('keydown', e => { if (e.key === 'Enter') doGoto(); });
 document.getElementById('followBtn').addEventListener('click', () => vscode.postMessage({ type: 'followPc' }));
 
+// Drag a label out (e.g. into an editor) as plain text.
+document.getElementById('content').addEventListener('dragstart', e => {
+    const el = e.target.closest('[data-drag]');
+    if (el) e.dataTransfer.setData('text/plain', el.dataset.drag);
+});
+
 // Right-click on an instruction row: run/turbo/jump/skip targeted at that
 // address — the address-based twin of the source editors' line-number menu.
 let ctxMenu = null;
@@ -3243,7 +3362,7 @@ function render() {
         html += '<td class="gutter" data-addr="' + ins.address + '"><span class="' + bpCls + '"></span></td>';
         html += '<td class="addr">$' + h4(ins.address) + '</td>';
         html += '<td class="bytes">' + bytesStr + '</td>';
-        html += '<td class="label-col">' + (hasLabel ? ins.label : '') + '</td>';
+        html += '<td class="label-col"' + (hasLabel ? ' draggable="true" data-drag="' + ins.label + '"' : '') + '>' + (hasLabel ? ins.label : '') + '</td>';
         html += '<td class="mnemonic">' + ins.mnemonic + '</td>';
         // Hover-revealed line actions ride inside the operand cell so they sit
         // right after the instruction text. Labels are printed, NOT tooltips —
@@ -3291,15 +3410,19 @@ function symbolsPanelHtml() {
     return `<!DOCTYPE html>
 <html><head><style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
 body {
     font-family: var(--vscode-editor-font-family, monospace);
     font-size: var(--vscode-editor-font-size, 13px);
     color: var(--vscode-foreground);
     background: var(--vscode-editor-background);
     padding: 0;
+    /* Fixed column layout: toolbar / watch / splitter / symbols.
+       The page itself never scrolls — each region scrolls on its own. */
+    display: flex; flex-direction: column; overflow: hidden;
 }
 .toolbar {
-    position: sticky; top: 0; z-index: 10;
+    flex: none;
     background: var(--vscode-editor-background);
     padding: 6px 8px;
     display: flex; gap: 8px; align-items: center;
@@ -3313,9 +3436,15 @@ body {
     background: var(--vscode-input-background, #3c3c3c);
     color: var(--vscode-input-foreground, #ccc);
     border: 1px solid var(--vscode-input-border, #555);
-    padding: 3px 24px 3px 6px;
+    padding: 3px 38px 3px 6px;
     font-family: inherit; font-size: inherit;
 }
+.search-wrap .mru-btn {
+    position: absolute; right: 18px; top: 50%; transform: translateY(-50%);
+    background: none; border: none; color: var(--vscode-descriptionForeground, #888);
+    cursor: pointer; font-size: 11px; line-height: 1; padding: 2px 3px;
+}
+.search-wrap .mru-btn:hover { color: var(--vscode-foreground); }
 .search-wrap .clear-btn {
     position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
     background: none; border: none; color: var(--vscode-descriptionForeground, #888);
@@ -3340,6 +3469,13 @@ body {
 .search-wrap .mru-item:hover {
     background: var(--vscode-list-hoverBackground, #2a2d2e);
 }
+.toolbar button.wadd {
+    background: var(--vscode-button-background, #0e639c);
+    color: var(--vscode-button-foreground, #fff);
+    border: none; padding: 3px 8px; cursor: pointer;
+    font-family: inherit; font-size: inherit; white-space: nowrap;
+}
+.toolbar button.wadd:hover { background: var(--vscode-button-hoverBackground, #1177bb); }
 .toolbar select {
     background: var(--vscode-dropdown-background, #3c3c3c);
     color: var(--vscode-dropdown-foreground, #ccc);
@@ -3361,7 +3497,7 @@ col.col-size  { width: 38px; }
 col.col-value { width: 170px; }
 col.col-group { width: 44px; }
 th {
-    position: sticky; top: 33px; z-index: 5;
+    position: sticky; top: 0; z-index: 5;
     background: var(--vscode-editor-background);
     text-align: left; padding: 3px 8px;
     cursor: pointer; user-select: none;
@@ -3388,13 +3524,58 @@ tr:nth-child(even) td {
 .dim  { color: var(--vscode-descriptionForeground, #888); padding: 16px 8px; }
 .sym-link { cursor: pointer; }
 .sym-link:hover { text-decoration: underline; }
+/* --- Watched expressions section (sticky, under the toolbar) --- */
+#watchSec {
+    flex: none;
+    background: var(--vscode-editor-background);
+    padding: 2px 8px 4px;
+    /* Own scrollbar; the splitter below resizes it (drag sets an explicit height) */
+    max-height: 40%; overflow-y: auto; overflow-x: hidden;
+}
+#splitter {
+    flex: none; height: 5px; cursor: ns-resize;
+    border-bottom: 1px solid var(--vscode-widget-border, #444);
+}
+#splitter:hover, #splitter.dragging { background: var(--vscode-focusBorder, #007fd4); }
+#symWrap {
+    flex: 1 1 auto; min-height: 60px;
+    overflow-y: auto; overflow-x: hidden;
+}
+.wrow { display: flex; gap: 5px; align-items: baseline; padding: 1px 0; }
+.wx { cursor: pointer; color: var(--vscode-descriptionForeground, #888); flex: none; font-size: 14px; line-height: 1; }
+.wx:hover { color: var(--vscode-errorForeground, #f48771); }
+.wt { flex: none; width: 11px; color: var(--vscode-descriptionForeground, #888); }
+.wt[data-path] { cursor: pointer; }
+.wt[data-path]:hover { color: var(--vscode-foreground); }
+/* Indent guide: one slot per depth level; the ::before lines of consecutive
+   rows stack into a continuous vertical line marking the expanded scope */
+.wg { flex: none; width: 11px; align-self: stretch; position: relative; }
+.wg::before { content: ''; position: absolute; left: 5px; top: -1px; bottom: -1px; border-left: 1px solid var(--vscode-tree-indentGuidesStroke, #585858); }
+.wtype { color: var(--vscode-debugTokenExpression-type, #4ec9b0); }
+.waddr { color: var(--vscode-descriptionForeground, #888); }
+/* Stale: session ended, rows show the last live values grayed out */
+#watchSec.stale .wrow { opacity: 0.55; }
+.wn { color: var(--vscode-debugTokenExpression-name, #9cdcfe); flex: none; }
+.wv { color: var(--vscode-debugTokenExpression-number, #b5cea8); overflow-wrap: anywhere; }
+.wv.mod { color: #e04040; }
+.wv.err { color: var(--vscode-errorForeground, #f48771); }
+.wv.idle { color: var(--vscode-descriptionForeground, #888); font-style: italic; }
+#watchSec details { margin-top: 2px; }
+#watchSec summary { cursor: pointer; color: var(--vscode-descriptionForeground, #888); user-select: none; }
+/* Watch toggle dot column (like the breakpoint gutter) */
+col.col-watch { width: 22px; }
+.wdot { cursor: pointer; color: var(--vscode-descriptionForeground, #888); text-align: center; padding: 2px 0 2px 6px; }
+.wdot:hover { color: var(--vscode-foreground); }
+.wdot.on { color: var(--vscode-debugIcon-breakpointForeground, #e51400); }
 </style></head><body>
 <div class="toolbar">
     <div class="search-wrap">
         <input type="text" id="search" placeholder="Search name or value..." autocomplete="off" />
+        <button class="mru-btn" id="mruBtn">\u25BE</button>
         <button class="clear-btn" id="clearBtn" title="Clear">\u00D7</button>
         <div class="mru-list" id="mruList"></div>
     </div>
+    <button id="watchBtn" class="wadd">+ Watch</button>
     <select id="groupFilter">
         <option value="all">All</option>
         <option value="zp">Zero Page</option>
@@ -3404,8 +3585,12 @@ tr:nth-child(even) td {
     </select>
     <span class="count" id="count"></span>
 </div>
+<div id="watchSec" style="display:none"></div>
+<div id="splitter" style="display:none"></div>
+<div id="symWrap">
 <table>
     <colgroup>
+        <col class="col-watch">
         <col class="col-name">
         <col class="col-addr">
         <col class="col-size">
@@ -3413,6 +3598,7 @@ tr:nth-child(even) td {
         <col class="col-group">
     </colgroup>
     <thead><tr>
+        <th></th>
         <th data-col="name">Name <span class="arrow"></span></th>
         <th data-col="addr">Addr <span class="arrow"></span></th>
         <th data-col="size">Size <span class="arrow"></span></th>
@@ -3422,6 +3608,7 @@ tr:nth-child(even) td {
     <tbody id="tbody"></tbody>
 </table>
 <div class="dim" id="nodata">No debug session or no symbols loaded</div>
+</div>
 <script>
 const vscode = acquireVsCodeApi();
 const searchEl = document.getElementById('search');
@@ -3433,8 +3620,17 @@ const headers = document.querySelectorAll('th[data-col]');
 
 const clearBtn = document.getElementById('clearBtn');
 const mruListEl = document.getElementById('mruList');
+const watchSec = document.getElementById('watchSec');
+const splitterEl = document.getElementById('splitter');
 
 let allSymbols = null;
+let watchActive = [];          // watch tree nodes {path, label, value, error?, canExpand, expanded, children}
+let watchInactive = [];        // [{path, label, owners}]
+let watchNoSession = false;
+let watchStale = false;        // session ended — showing the last live values grayed
+let watchedSet = new Set();    // exprs, for the row dots
+let prevWatchVals = {};        // expr -> value, red-highlight changes
+let watchInactiveOpen = false; // <details> fold state survives re-renders
 let prevValues = {};   // name -> value string for change detection
 let sortCol = 'addr';
 let sortAsc = true;
@@ -3534,8 +3730,13 @@ function render() {
         if (s.aliases && s.aliases.length > 0) {
             nameHtml += ' <span class="alias">/ ' + s.aliases.map(a => nameSpan(a)).join(' / ') + '</span>';
         }
+        // Watch toggle dot (defines are constants — nothing to watch)
+        const wdot = s.defineValue !== undefined ? '<td class="wdot"></td>'
+            : '<td class="wdot' + (watchedSet.has(s.name) ? ' on' : '') + '" data-wname="' + s.name + '">'
+              + (watchedSet.has(s.name) ? '\\u25CF' : '\\u25CB') + '</td>';
         html += '<tr' + attrs + ' title="' + s.name + (s.aliases && s.aliases.length ? ' / ' + s.aliases.join(' / ') : '') + '">'
-            + '<td class="name">' + nameHtml + '</td>'
+            + wdot
+            + '<td class="name" draggable="true" data-drag="' + s.name + '">' + nameHtml + '</td>'
             + '<td class="addr">' + (s.addr >= 0 ? h(s.addr, 4) : '\u2014') + '</td>'
             + '<td class="sz">' + (s.size > 0 ? s.size : '\u2014') + '</td>'
             + '<td class="val' + mod + '" title="' + (s.defineComment || fmtValue(s)).replace(/"/g, '&quot;') + '">' + fmtValue(s) + '</td>'
@@ -3561,6 +3762,14 @@ function mruRender() {
     mruListEl.classList.add('open');
 }
 function mruClose() { mruListEl.classList.remove('open'); }
+function mruSave() { vscode.postMessage({ type: 'mruUpdate', items: mruItems }); }
+// ▾ opens/closes the full history; mousedown (not click) so the input keeps
+// focus and the blur-close timer never races the toggle.
+document.getElementById('mruBtn').addEventListener('mousedown', e => {
+    e.preventDefault();
+    if (mruListEl.classList.contains('open')) mruClose();
+    else mruRender();
+});
 mruListEl.addEventListener('mousedown', e => {
     const item = e.target.closest('.mru-item');
     if (item) {
@@ -3577,11 +3786,20 @@ searchEl.addEventListener('focus', () => { if (!searchEl.value && mruItems.lengt
 searchEl.addEventListener('blur', () => { setTimeout(mruClose, 150); });
 searchEl.addEventListener('keydown', e => {
     if (e.key === 'Escape') { searchEl.value = ''; filterText = ''; mruClose(); render(); }
-    if (e.key === 'Enter' && filterText.trim()) { mruAdd(filterText); mruClose(); }
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { watchTyped(); return; }
+    if (e.key === 'Enter' && filterText.trim()) { mruAdd(filterText); mruSave(); mruClose(); }
     if (e.key === 'ArrowDown' && !searchEl.value && mruItems.length) { mruRender(); }
 });
+
+// "+ Watch" (or Ctrl+Enter): watch WHATEVER is typed — casts like (item_id)a,
+// registers, hex addresses — no need to match a row in the table.
+function watchTyped() {
+    const expr = searchEl.value.trim();
+    if (expr) vscode.postMessage({ type: 'watchToggle', expr: expr });
+}
+document.getElementById('watchBtn').addEventListener('click', watchTyped);
 clearBtn.addEventListener('click', () => {
-    if (searchEl.value.trim()) mruAdd(searchEl.value);
+    if (searchEl.value.trim()) { mruAdd(searchEl.value); mruSave(); }
     searchEl.value = ''; filterText = ''; mruClose(); render(); searchEl.focus();
 });
 
@@ -3604,11 +3822,121 @@ tbody.addEventListener('mouseover', e => {
 tbody.addEventListener('mouseleave', () => {
     vscode.postMessage({ type: 'symbolLeave' });
 });
+// Drag a symbol name out (e.g. into an editor) as plain text.
+tbody.addEventListener('dragstart', e => {
+    const el = e.target.closest('[data-drag]');
+    if (el) e.dataTransfer.setData('text/plain', el.dataset.drag);
+});
 tbody.addEventListener('click', e => {
+    const dot = e.target.closest('.wdot[data-wname]');
+    if (dot) {
+        vscode.postMessage({ type: 'watchToggle', expr: dot.dataset.wname });
+        return;
+    }
     const link = e.target.closest('.sym-link[data-file]');
     if (link) {
         vscode.postMessage({ type: 'gotoSymbol', file: link.dataset.file, line: parseInt(link.dataset.line, 10) });
     }
+});
+
+// --- Watched expressions section ---
+function escW(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+
+// Draggable splitter between the watch section and the symbol table.
+// Dragging pins an explicit height on watchSec (replacing its 40% max-height).
+let splitDragging = false;
+splitterEl.addEventListener('mousedown', e => {
+    splitDragging = true;
+    splitterEl.classList.add('dragging');
+    e.preventDefault();
+});
+window.addEventListener('mousemove', e => {
+    if (!splitDragging) return;
+    const top = watchSec.getBoundingClientRect().top;
+    const h = Math.max(24, Math.min(e.clientY - top, window.innerHeight * 0.8));
+    watchSec.style.maxHeight = 'none';
+    watchSec.style.height = h + 'px';
+});
+window.addEventListener('mouseup', () => {
+    splitDragging = false;
+    splitterEl.classList.remove('dragging');
+});
+
+function renderWatch() {
+    if (!watchActive.length && !watchInactive.length) {
+        watchSec.innerHTML = '';
+        watchSec.style.display = 'none';
+        splitterEl.style.display = 'none';
+        return;
+    }
+    watchSec.style.display = 'block';
+    splitterEl.style.display = 'block';
+    watchSec.classList.toggle('stale', watchStale);
+    const newVals = {};
+    // Colorize the adapter's pre-rendered value string. buildTypedVar joins
+    // its fields with TWO spaces — "value  type  @ $addr", "type  @ $addr"
+    // (structs), "value  type  A" (register casts) — so split on that
+    // delimiter and classify each segment instead of pattern-guessing.
+    function colorVal(v) {
+        const segs = escW(v).split('  ');
+        const isType = s => /^\\*?[A-Za-z_][\\w-]*(\\[\\d+\\])?$/.test(s);
+        return segs.map((seg, i) => {
+            if (/^@ \\$[0-9A-Fa-f]+$/.test(seg)) return '<span class="waddr">' + seg + '</span>';
+            if (/^(A|X|Y|SP|PC)$/.test(seg)) return seg;              // register token of a cast
+            if (i > 0 && isType(seg)) return '<span class="wtype">' + seg + '</span>';
+            if (i === 0) {
+                // Struct render is just "type  @ $addr" — the type IS the first segment
+                if (segs.length === 2 && /^@ \\$/.test(segs[1]) && isType(seg))
+                    return '<span class="wtype">' + seg + '</span>';
+                // Pointer values lead with their type: "*item → $0421"
+                return seg.replace(/^(\\*[A-Za-z_]\\w*)/, '<span class="wtype">$1</span>');
+            }
+            return seg;
+        }).join('  ');
+    }
+    // One node = one row; expanded children recurse, each depth level adds an
+    // indent-guide slot whose vertical line shows the expanded scope.
+    // Only top-level rows get the remove x; expandables get a twisty.
+    function wnode(n, depth, removable) {
+        const twisty = n.canExpand
+            ? '<span class="wt" data-path="' + escW(n.path) + '" data-open="' + (n.expanded ? '1' : '0') + '">'
+              + (n.expanded ? '\\u25BE' : '\\u25B8') + '</span>'
+            : '<span class="wt"></span>';
+        const x = removable ? '<span class="wx" data-expr="' + escW(n.label) + '">\\u00D7</span>' : '';
+        let val;
+        if (watchNoSession) val = '<span class="wv idle">(no session)</span>';
+        else if (n.owners !== undefined) val = '<span class="wv idle">' + escW(n.owners) + '</span>';
+        else {
+            const mod = !watchStale && prevWatchVals[n.path] !== undefined && prevWatchVals[n.path] !== n.value;
+            newVals[n.path] = n.value;
+            val = '<span class="wv' + (n.error ? ' err' : mod ? ' mod' : '') + '">'
+                + (n.error ? escW(n.value) : colorVal(n.value)) + '</span>';
+        }
+        let guides = '';
+        for (let i = 0; i < depth; i++) guides += '<span class="wg"></span>';
+        let html = '<div class="wrow">' + guides + twisty
+            + '<span class="wn">' + escW(n.label) + '</span>' + x + ' = ' + val + '</div>';
+        if (n.expanded && n.children)
+            for (const c of n.children) html += wnode(c, depth + 1, false);
+        return html;
+    }
+    let html = watchActive.map(n => wnode(n, 0, true)).join('');
+    if (watchInactive.length) {
+        html += '<details' + (watchInactiveOpen ? ' open' : '') + '><summary>Inactive (' + watchInactive.length + ')</summary>'
+            + watchInactive.map(n => wnode(n, 0, true)).join('')
+            + '</details>';
+    }
+    watchSec.innerHTML = html;
+    const det = watchSec.querySelector('details');
+    if (det) det.addEventListener('toggle', ev => { watchInactiveOpen = ev.target.open; });
+    prevWatchVals = newVals;
+}
+
+watchSec.addEventListener('click', e => {
+    const x = e.target.closest('.wx[data-expr]');
+    if (x) { vscode.postMessage({ type: 'watchRemove', expr: x.dataset.expr }); return; }
+    const t = e.target.closest('.wt[data-path]');
+    if (t) vscode.postMessage({ type: t.dataset.open === '1' ? 'watchCollapse' : 'watchExpand', path: t.dataset.path });
 });
 
 window.addEventListener('message', e => {
@@ -3626,8 +3954,23 @@ window.addEventListener('message', e => {
             prevValues = {};
         }
         render();
+    } else if (e.data.type === 'watch') {
+        watchActive = e.data.active || [];
+        watchInactive = e.data.inactive || [];
+        watchNoSession = !!e.data.noSession;
+        watchStale = !!e.data.stale;
+        // Watch values arrive on every step — only re-render the (heavy)
+        // symbol table when the watched SET changed (a dot must flip).
+        const newSet = new Set([...watchActive.map(it => it.path), ...watchInactive.map(it => it.path)]);
+        const setChanged = newSet.size !== watchedSet.size || [...newSet].some(x => !watchedSet.has(x));
+        watchedSet = newSet;
+        renderWatch();
+        if (setChanged) render();
+    } else if (e.data.type === 'mru') {
+        mruItems = (e.data.items || []).slice(0, MRU_MAX);
     }
 });
+vscode.postMessage({ type: 'mruGet' }); // load the persisted search history
 </script>
 </body></html>`;
 }
@@ -4007,6 +4350,10 @@ function activate(context) {
         })
     );
 
+    watchMemento = context.workspaceState;
+    watchedExprs = watchMemento.get('oric-debug.watchExpressions', []).slice();
+    symbolMru = watchMemento.get('oric-debug.symbolSearchMru', []).slice();
+
     const regsProvider = new RegistersWebviewProvider();
     const periphProvider = new PeripheralsWebviewProvider();
 
@@ -4258,6 +4605,7 @@ function activate(context) {
         const session = vscode.debug.activeDebugSession;
         const lightMode = isDisasmFocused(); // instruction-stepping: skip heavy refreshes
         regsProvider.refresh(session);
+        refreshWatchValues(session); // watches matter while stepping — always refresh
         refreshDisasmPanel(session);
         if (!lightMode) {
             periphProvider.refresh(session);
@@ -4518,6 +4866,7 @@ function activate(context) {
                         if (msg.type === 'event' && msg.event === 'oricSymbolsChanged') {
                             symbolCache.clear();
                             refreshSymbolsPanel(session);
+                            refreshWatchValues(session); // re-sort active/inactive on module switch
                         }
                         // Log verbosity changed (initial config, status bar, or console) — reflect it
                         if (msg.type === 'event' && msg.event === 'oricLogLevel' && msg.body) {
