@@ -63,6 +63,16 @@
         ]
     },
     "contributes": {
+        "configuration": {
+            "title": "Oric Debug",
+            "properties": {
+                "oric-debug.showBinary": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Show the %binary column in decoded values (e.g. $02|2|%00000010). Turn off for a compact $02|2. Applies live to a running debug session."
+                }
+            }
+        },
         "languages": [
             {
                 "id": "osdk",
@@ -144,6 +154,10 @@
             {
                 "command": "oric-debug.reloadSymbols",
                 "title": "Oric: Reload Symbols (after byte-identical rebuild)"
+            },
+            {
+                "command": "oric-debug.toggleBinary",
+                "title": "Oric: Toggle Binary Column in Values"
             },
             {
                 "command": "oric-debug.openDisassembly",

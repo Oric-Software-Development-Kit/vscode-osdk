@@ -36,13 +36,14 @@ Connects VS Code to Oricutron's GDB Remote Serial Protocol (RSP) stub over TCP.
 
 ## Debug Panels
 
-Three dedicated panels appear in the Debug sidebar when a session is active:
+Two dedicated panels appear in the Debug sidebar when a session is active:
 
 | Panel | Description |
 |---|---|
-| **Oric Registers** | CPU registers (A, X, Y, SP, PC), processor flags (N, V, B, D, I, Z, C), last PC, cycle counter, frame count, raster line, and interrupt vectors (NMI, RST, IRQ) |
-| **Oric Zero Page** | Zero page variables ($00-$FF) with symbol names from the symbol file |
+| **Oric Registers** | CPU registers (A, X, Y, SP, PC), processor flags (N, V, B, D, I, Z, C), last PC, cycle counter, frame count, raster line, and interrupt vectors (NMI, RST, IRQ). A/X/Y show their decoded value when the register carries a type tag (see *Register type tags*). |
 | **Oric Peripherals** | Live state of the VIA 6522, AY-3-8912 (PSG), WD1793 floppy disk controller, Microdisc interface, and ACIA 6551 serial controller |
+
+(Zero-page variables are no longer a separate panel — view them in the **Symbol Browser** with the group filter set to *Zero Page*.)
 
 ---
 
@@ -95,6 +96,19 @@ Open via command palette: **Oric: Symbol Browser**
 - **Hover to highlight**: hovering a symbol row draws a crosshair on the Memory Heatmap
 - **Click to navigate**: click any symbol name to jump to its source definition (requires V2 symbol file or `#define` in source)
 - **Defines**: `#define` constants from `.s`, `.h`, and `.asm` files are included with their resolved values
+
+#### Watch (built into the Symbol Browser)
+
+The Symbol Browser doubles as a **watch panel**, kept above the symbol table and separated by a draggable splitter:
+
+- **Watch dot** (first column): click the ○ next to any symbol to watch it (● = watched). Watched entries appear in the section at the top with their live, decoded value.
+- **Watch an arbitrary expression**: type it in the search box and press **Enter** (or the **+ Watch** button) — casts like `(item_id)a`, registers, and `$hex` addresses all work, no matching row required.
+- **Expandable**: watched structs/pointers expand into fields/elements with indent guides; `@stream` pointers expand into decoded commands.
+- **Decoded values**: everything renders through the one type path — enums by name, flags decomposed, `@bcd`/strings/pointers, with the decoded name tinted distinctly from the raw `$hex|dec|%binary`.
+- **Inactive-module entries** fold into a collapsed *Inactive (n)* group showing which module owns them, and migrate back automatically on module switch (so a multi-module project's watch list stays clean instead of erroring).
+- **Stale mode**: when the session ends, the last live values stay visible (greyed) so you can edit code against the program's final state.
+- **Search history** persists per workspace behind the ▾ button.
+- Remove a watch with the ✕ or by clicking its dot off. Entries persist per workspace.
 
 ### Reference Panels
 
@@ -207,13 +221,23 @@ All commands are available from the Command Palette (Ctrl+Shift+P):
 | **Oric: Memory View** | Open the expression-based memory viewer | Always |
 | **Oric: Memory Heatmap** | Open the real-time memory access heatmap | Always |
 | **Oric: Screen View** | Open the live Oric screen display | Always |
-| **Oric: Symbol Browser** | Open the symbol/define browser panel | Always |
+| **Oric: Symbol Browser** | Open the symbol/define browser + watch panel | Always |
+| **Oric: Disassembly View** | Open the disassembly panel (with per-line run/turbo/jump/skip actions) | Always |
+| **Oric: Reparse Annotations (no rebuild)** | Re-read `@…` comment annotations from source into the live session (also runs automatically on save) | Debug |
+| **Oric: Reload Symbols (after byte-identical rebuild)** | Re-read the symbol file in place after a rebuild that left the binary unchanged — new enum members/types/symbols without relaunching | Debug |
+| **Oric: Toggle Binary Column in Values** | Show/hide the `%binary` part of decoded values (also the `oric-debug.showBinary` setting) | Always |
+| **Oric: Copy Line + Annotation** | Copy the source line plus its inline decoded annotation (gutter right-click, or the palette) | Debug (stopped) |
+| **Oric: Active Module** | Pick the active overlay module (multi-module projects) | Debug |
+| **Oric: Toggle Step Granularity** | Switch stepping between C statement and instruction | Debug |
+| **Oric: Debug Log Level** | Set log verbosity (Errors / Normal / Verbose) | Always |
 | **Oric: Skip Instruction** | Advance PC past the current instruction without executing it | Debug (stopped) |
 | **Oric: Toggle Warp Speed** | Toggle Oricutron's warp mode (run at maximum speed) | Debug |
 | **Oric: Reset Cycle Counter** | Reset the CPU cycle counter to zero | Debug (stopped) |
 | **Oric: Show Current Location** | Navigate the editor to the current PC location | Debug (stopped) |
 | **OSDK: XA Quick Reference** | Open the XA assembler directive reference | Always |
 | **OSDK: 6502 Opcode Reference** | Open the 6502 instruction set reference | Always |
+
+The line-number **gutter right-click** menu (while stopped) also offers **Run to This Line**, **Turbo Run to This Line**, **Jump to This Line** / **Skip This Line** (contextual — skip only on the PC line), and **Copy Line + Annotation**.
 
 ---
 
@@ -262,14 +286,20 @@ Type these commands in the VS Code Debug Console during a debug session:
 |---|---|---|
 | `A`, `X`, `Y`, `SP`, `PC` | Read a CPU register | `A` |
 | `REG=value` | Write a register (decimal or `$hex`) | `A=$41`, `X=0` |
-| `x $ADDR [LEN]` | Read memory (default 16 bytes) | `x $0400 32` |
-| `w $ADDR $VAL` | Write a byte to memory | `w $BB80 $41` |
+| `x $ADDR [LEN]` | Read memory ($ = hex, no $ = decimal; default 16 bytes) | `x $0400 32` |
+| `m ADDR,LEN` | Read memory, GDB-style (addr and len always hex) | `m 0400,20` |
+| `w $ADDR $VAL` | Write a byte to memory ($ = hex, no $ = decimal) | `w $BB80 $41` |
 | `goto $ADDR` | Set PC to address (refused below $0400) | `goto $0500` |
 | `goto symbol` | Set PC to symbol address | `goto _main` |
 | `skip` | Skip current instruction (advance PC) | `skip` |
 | `sym NAME` | Look up a symbol address | `sym _irq_handler` |
 | `symbolName` | Look up a symbol by typing its name | `_main` |
+| `(TYPE)EXPR` | View EXPR as TYPE — a cast: `(uchar*)tmp0`, `(int)$C000`, `(item_id)a` | `(location_id)a` |
+| `tag a ENUM` / `untag [a\|x\|y]` | Manually type a register with an enum / clear tag(s) | `tag a item_id` |
 | `hex` / `dec` | Set the number base for console output | `hex` |
+| `bin [on\|off]` | Show/hide the `%binary` column in decoded values | `bin off` |
+| `reparse` | Re-read `@…` annotations from source (no rebuild) | `reparse` |
+| `reloadsymbols [force]` | Re-read the symbol file after a byte-identical rebuild (no relaunch) | `reloadsymbols` |
 | `loglevel [0\|1\|2]` | Show or set log verbosity (Errors/Normal/Verbose) | `loglevel 1` |
 | `profile [on\|off]` | Per-request timing + gdb read counts in the log (find slow stops) | `profile on` |
 | `! <cmd>` | Run a raw Oricutron monitor command | `! = tmp0+2` |
@@ -278,6 +308,30 @@ Type these commands in the VS Code Debug Console during a debug session:
 The status bar (bottom left, during a session) shows the active **Module** and the
 current **Log** level. Click either one to change it — the log-level picker is the
 quickest way to silence verbose GDB/DAP tracing without editing `launch.json`.
+
+---
+
+## Settings
+
+VS Code settings (User or Workspace) under **Oric Debug**:
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `oric-debug.showBinary` | boolean | `true` | Show the `%binary` column in decoded values (`$02\|2\|%00000010`). Turn off for a compact `$02\|2`. Applies live to a running session; also toggleable via **Oric: Toggle Binary Column in Values** or the `bin` console command. |
+
+---
+
+## Editing While Debugging
+
+You can iterate on many things without losing your debug session. What takes effect when:
+
+| You change… | How to apply | Session kept? |
+|---|---|---|
+| A `@…` comment annotation (`@enum`, `@word`, `@stream`, `@bool`, `@bcd`, …) | **Save the file** — auto-reparsed (or run **Reparse Annotations** / `reparse`) | Yes |
+| Enum members, struct fields, types, new symbols (a build that leaves the binary **byte-identical**) | Rebuild, then **Reload Symbols** / `reloadsymbols` | Yes |
+| Code that changes the binary, or inserting/moving source lines | Rebuild and **restart** the debug session | No — relaunch |
+
+Reload Symbols is gated on a hash of the disk image taken at launch: if the rebuild changed the binary, it refuses (the emulator is still running the old one) and asks you to restart, so fresh symbols never silently mismatch stale code.
 
 ---
 

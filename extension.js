@@ -4120,6 +4120,10 @@ function activate(context) {
                 } else if (config.logLevel === undefined) {
                     config.logLevel = 1;
                 }
+                // Seed the binary-column preference from the global setting so the
+                // adapter starts with it applied.
+                if (config.showBinary === undefined)
+                    config.showBinary = vscode.workspace.getConfiguration('oric-debug').get('showBinary', true);
                 return config;
             }
         })
@@ -4268,6 +4272,16 @@ function activate(context) {
         const session = vscode.debug.activeDebugSession;
         if (!session || session.type !== 'oric-debug') return;
         reparseAnnotations(false);
+    }));
+
+    // Push the oric-debug.showBinary setting to the live session when it changes,
+    // so toggling the %binary column applies immediately without relaunching.
+    context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
+        if (!e.affectsConfiguration('oric-debug.showBinary')) return;
+        const session = vscode.debug.activeDebugSession;
+        if (!session || session.type !== 'oric-debug') return;
+        const on = vscode.workspace.getConfiguration('oric-debug').get('showBinary', true);
+        session.customRequest('setShowBinary', { on }).then(() => refreshAll(), () => {});
     }));
 
     // Reload the symbol file after a rebuild WITHOUT relaunching — for changes
@@ -4458,6 +4472,12 @@ function activate(context) {
         vscode.commands.registerCommand('oric-debug.openSymbols', () => createSymbolsPanel(context)),
         vscode.commands.registerCommand('oric-debug.reparseAnnotations', () => reparseAnnotations(true)),
         vscode.commands.registerCommand('oric-debug.reloadSymbols', () => reloadSymbols()),
+        vscode.commands.registerCommand('oric-debug.toggleBinary', async () => {
+            const cfg = vscode.workspace.getConfiguration('oric-debug');
+            const next = !cfg.get('showBinary', true);
+            await cfg.update('showBinary', next, vscode.ConfigurationTarget.Global);
+            vscode.window.setStatusBarMessage('Oric: %binary in values ' + (next ? 'on' : 'off'), 3000);
+        }),
         vscode.commands.registerCommand('oric-debug.openDisassembly', () => createDisasmPanel()),
         vscode.commands.registerCommand('oric-debug.stepOverInstruction', async () => {
             const session = vscode.debug.activeDebugSession;

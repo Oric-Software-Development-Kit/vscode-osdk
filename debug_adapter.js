@@ -196,6 +196,7 @@ const CONSOLE_HELP = [
     '',
     'Display',
     '  hex   dec                 number base for this console',
+    '  bin [on|off]              show/hide the %binary column in decoded values',
     '  loglevel [0|1|2]          log verbosity (Errors/Normal/Verbose); no arg = show current',
     '  profile [on|off]          per-request timing + gdb read counts in the log',
     '',
@@ -1829,12 +1830,18 @@ async function readMem(addr, len) {
     return bytes;
 }
 
-// Numeric part shared by enum display: "$hex|dec|%binary" (no char glyph — an
+// Whether decoded values include the "|%binary" part. Off trims the display to
+// "$hex|dec". Global, live-toggleable (setShowBinary request / bin console cmd),
+// seeded from the oric-debug.showBinary VS Code setting at launch.
+let showBinary = true;
+function binPart(v, bits) { return showBinary ? '|%' + v.toString(2).padStart(bits, '0') : ''; }
+
+// Numeric part shared by enum display: "$hex|dec[|%binary]" (no char glyph — an
 // enum byte is a code/flag word, not text).
 function enumNumeric(v, size) {
     if (size >= 2)
-        return '$' + v.toString(16).toUpperCase().padStart(4, '0') + '|' + v + '|%' + v.toString(2).padStart(16, '0');
-    return '$' + v.toString(16).toUpperCase().padStart(2, '0') + '|' + v + '|%' + v.toString(2).padStart(8, '0');
+        return '$' + v.toString(16).toUpperCase().padStart(4, '0') + '|' + v + binPart(v, 16);
+    return '$' + v.toString(16).toUpperCase().padStart(2, '0') + '|' + v + binPart(v, 8);
 }
 
 // Format an enum-typed value symbolically. Sequential enums map value->name;
@@ -1885,11 +1892,11 @@ function formatScalar(typeName, mem, offset, size) {
         const sv = (isSigned && v > 127) ? v - 256 : v;
         // Show the ASCII glyph for any displayable byte value, whatever the type.
         const ch = (v >= 32 && v < 127) ? " '" + String.fromCharCode(v) + "'" : '';
-        return '$' + v.toString(16).toUpperCase().padStart(2, '0') + '|' + (isSigned ? sv : v) + '|%' + v.toString(2).padStart(8, '0') + ch;
+        return '$' + v.toString(16).toUpperCase().padStart(2, '0') + '|' + (isSigned ? sv : v) + binPart(v, 8) + ch;
     } else if (size === 2) {
         const w = (mem[offset] || 0) | ((mem[offset + 1] || 0) << 8);
         const sv = (isSigned && w > 32767) ? w - 65536 : w;
-        return '$' + w.toString(16).toUpperCase().padStart(4, '0') + '|' + (isSigned ? sv : w) + '|%' + w.toString(2).padStart(16, '0');
+        return '$' + w.toString(16).toUpperCase().padStart(4, '0') + '|' + (isSigned ? sv : w) + binPart(w, 16);
     }
     // Larger types: raw hex bytes.
     let hex = '';
@@ -2668,6 +2675,7 @@ const handlers = {
         logSessionBanner();
         moduleByteTrusted = true; // attaching to a running program — the module byte is already valid
         if (config.logLevel !== undefined) logLevel = config.logLevel;
+        if (config.showBinary !== undefined) showBinary = !!config.showBinary; // seed from the VS Code setting
         applyLogLevel(logLevel, true); // reflect the initial level in the status bar (don't re-persist)
         const host = config.host || 'localhost';
         const port = config.port || 6502;
@@ -2712,6 +2720,7 @@ const handlers = {
         logSessionBanner();
         moduleByteTrusted = false; // fresh boot — don't believe the module byte until the loader stamps it
         if (config.logLevel !== undefined) logLevel = config.logLevel;
+        if (config.showBinary !== undefined) showBinary = !!config.showBinary; // seed from the VS Code setting
         applyLogLevel(logLevel, true); // reflect the initial level in the status bar (don't re-persist)
         const port = config.port || 6502;
 
@@ -4157,6 +4166,14 @@ const handlers = {
             evalFailCache.add(expr);
         }
 
+        // Binary column toggle:  bin  |  bin on|off   (the |%binary in decoded values)
+        if ((m = expr.match(/^bin(?:\s+(on|off))?$/i))) {
+            if (m[1] !== undefined) showBinary = (m[1].toLowerCase() === 'on');
+            respond(req, { result: 'Binary in values: ' + (showBinary ? 'on' : 'off'), variablesReference: 0 });
+            evt('stopped', { reason: 'pause', threadId: 1, allThreadsStopped: true });
+            return;
+        }
+
         // Display format toggle: hex / dec
         if (expr === 'hex' || expr === 'dec') {
             displayHex = (expr === 'hex');
@@ -4350,6 +4367,15 @@ const handlers = {
     reloadSymbols(req) {
         const force = req.arguments && req.arguments.force;
         respond(req, reloadSymbols(force));
+    },
+
+    // -- Toggle the binary column in decoded values (custom request) --
+    // Pushed by the extension from the oric-debug.showBinary setting (at launch
+    // and on change) so the global preference applies live.
+    setShowBinary(req) {
+        showBinary = !!(req.arguments && req.arguments.on);
+        respond(req, { showBinary });
+        if (!running) evt('stopped', { reason: 'pause', threadId: 1, allThreadsStopped: true }); // repaint values
     },
 
     // -- Reset cycle counter (custom request) -------------------------
