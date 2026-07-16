@@ -1370,6 +1370,18 @@ function enumOfMember(name) {
     return null;
 }
 
+// Reverse lookup: the numeric value of an enum MEMBER name (first match), or
+// undefined. Lets a condition compare against an enum constant (KIND_DRAGON).
+function enumMemberValue(name) {
+    for (const src of [enumDefs, allEnumDefs]) {
+        for (const [, def] of src) {
+            if (!def.byValue) continue;
+            for (const [val, mname] of def.byValue) if (mname === name) return val;
+        }
+    }
+    return undefined;
+}
+
 // The enum a NAMED immediate operand belongs to (lda #FLAG_END_STREAM), read
 // from the SOURCE token at pc, or null. The disassembly only sees the literal
 // byte, so the type comes from the token. Shared by the register tagger and the
@@ -2559,53 +2571,218 @@ function hitTargetOf(hitCondition) {
     return m ? parseInt(m[1], 10) : 0;
 }
 
-// Rewrite a VS Code condition so C variables become memory reads the stub's cond
-// compiler understands. An identifier resolves, in order, to:
-//   - a local/parameter of the breakpoint's function -> *(*$fp:w + off)[:w]  (the
-//     local's address is frame-relative, so the deref must happen at eval time)
-//   - a global/asm symbol -> *$addr (1-byte) or *$addr:w (2-byte int / pointer)
+// Rewrite a VS Code condition so C variables become the memory reads the stub's
+// cond compiler understands. A variable reference (an identifier plus any
+// .member / ->member / [index] postfix) is turned into an address computation
+// wrapped in a load:
+//   - local/parameter   -> address is *$fp:w + off (frame-relative)
+//   - global/asm symbol -> address is the constant $addr
+//   - .field  adds the field offset; ->field derefs the pointer then adds it;
+//     [i] adds (index)*stride, index resolved by the same rewriter.
+// The final lvalue is read as *(addr) or *(addr):w by its scalar width.
 // Registers/flags, numbers and operators pass through untouched; the stub reports
-// genuinely unknown names. Aggregates (arrays/structs) and >2-byte scalars (long)
-// can't be compared as a single value, so they return a clear error rather than
-// silently wrong bytecode. Member/subscript expressions (e->hp, a[i]) aren't
-// resolved yet — only plain scalar variables. Returns { expr, error }.
+// genuinely unknown names. Aggregates (whole array/struct) and >2-byte scalars
+// (long) can't be compared as one value and return a clear error instead of
+// silently-wrong bytecode. Returns { expr, error }.
 function resolveCondSymbols(expr, locals, fpAddr, apAddr) {
     let out = '', i = 0, error = null;
+    const s = expr;
     const isHex = c => /[0-9a-fA-F]/.test(c), isDig = c => c >= '0' && c <= '9';
-    const isIdS = c => /[A-Za-z_]/.test(c), isId = c => /[A-Za-z0-9_]/.test(c);
+    const isIdS = c => /[A-Za-z_]/.test(c), isId = c => c && /[A-Za-z0-9_]/.test(c);
     const fail = m => { error = error || m; };
-    while (i < expr.length) {
-        const ch = expr[i];
-        if (ch === '$') { out += ch; i++; while (i < expr.length && isHex(expr[i])) out += expr[i++]; continue; }
-        if (ch === '0' && (expr[i + 1] === 'x' || expr[i + 1] === 'X')) { out += expr[i] + expr[i + 1]; i += 2; while (i < expr.length && isHex(expr[i])) out += expr[i++]; continue; }
-        if (isDig(ch)) { while (i < expr.length && isDig(expr[i])) out += expr[i++]; continue; }
-        if (isIdS(ch)) {
-            let s = ''; while (i < expr.length && isId(expr[i])) s += expr[i++];
-            const loc = locals && locals.find(l => l.cname === s);
-            if (loc) {
-                const baseAddr = loc.base === 'ap' ? apAddr : fpAddr;
-                if (typeof baseAddr !== 'number') fail("no frame pointer to resolve local '" + s + "'");
-                else if (loc.size > 2) fail("local '" + s + "' is " + loc.size + " bytes — conditions compare only 8/16-bit values");
-                else {
-                    const off = loc.offset | 0;
-                    const term = off >= 0 ? ' + ' + off : ' - ' + (-off);
-                    out += '*(*$' + (baseAddr & 0xFFFF).toString(16) + ':w' + term + ')' + (loc.size === 2 ? ':w' : '');
-                }
-                if (error) out += s;
+    const skipWs = () => { while (i < s.length && (s[i] === ' ' || s[i] === '\t')) i++; };
+
+    // Bytes a type occupies: pointer=2, T[N]=N*sizeof(T), struct via typeDefs,
+    // else scalar/enum. Tolerates an 'unsigned '/'signed ' prefix. 0 = unknown.
+    const typeSizeOf = t => {
+        if (!t) return 0;
+        if (t[0] === '*') return 2;
+        const am = t.match(/^(.+)\[(\d+)\]$/);
+        if (am) return parseInt(am[2], 10) * typeSizeOf(am[1]);
+        if (typeDefs.has(t)) return typeDefs.get(t).size;
+        const norm = t.replace(/\b(unsigned|signed)\s+/g, '');
+        return scalarSizeOf(t) || scalarSizeOf(norm);
+    };
+
+    // Base lvalue for an identifier: { addrExpr, type, size } or null (not a var).
+    const baseOf = name => {
+        const loc = locals && locals.find(l => l.cname === name);
+        if (loc) {
+            const baseAddr = loc.base === 'ap' ? apAddr : fpAddr;
+            if (typeof baseAddr !== 'number') { fail("no frame pointer to resolve local '" + name + "'"); return null; }
+            const off = loc.offset | 0;
+            const term = off >= 0 ? ' + ' + off : ' - ' + (-off);
+            return { addrExpr: '*$' + (baseAddr & 0xFFFF).toString(16) + ':w' + term, type: loc.type, size: loc.size };
+        }
+        let addr = symbols.get(name);
+        if (addr === undefined && name[0] !== '_') addr = symbols.get('_' + name);
+        if (addr !== undefined) {
+            const spec = renderSpec(name) || {};
+            return { addrExpr: '$' + (addr & 0xFFFF).toString(16), type: spec.type || 'uchar', size: spec.size || 1 };
+        }
+        return null;
+    };
+
+    // Read the identifier at the cursor plus its access chain, returning the cond
+    // read expression — or the bare name if it isn't a variable (register/flag/
+    // unknown; the stub decides). Advances the cursor `i`.
+    const consumeAccess = () => {
+        let name = ''; while (i < s.length && isId(s[i])) name += s[i++];
+        const base = baseOf(name);
+        if (!base) {
+            // Not a variable: an enum constant resolves to its value; anything else
+            // (register/flag, or a genuinely unknown name) passes through.
+            const ev = enumMemberValue(name);
+            return ev !== undefined ? String(ev) : name;
+        }
+        let cur = base;
+        for (;;) {
+            const save = i; skipWs();
+            if (s[i] === '.' || (s[i] === '-' && s[i + 1] === '>')) {
+                const arrow = s[i] === '-'; i += arrow ? 2 : 1; skipWs();
+                let fld = ''; while (i < s.length && isId(s[i])) fld += s[i++];
+                let structName, structAddr;
+                if (arrow) {
+                    if (cur.type[0] !== '*') { fail("'->' on non-pointer '" + cur.type + "'"); return name; }
+                    structName = cur.type.slice(1); structAddr = '*(' + cur.addrExpr + '):w';
+                } else { structName = cur.type; structAddr = cur.addrExpr; }
+                if (!typeDefs.has(structName)) { fail("'" + structName + "' is not a struct (for ." + fld + ")"); return name; }
+                const f = typeDefs.get(structName).fields.find(x => x.name === fld);
+                if (!f) { fail("no field '" + fld + "' in '" + structName + "'"); return name; }
+                cur = { addrExpr: f.offset ? structAddr + ' + ' + f.offset : structAddr, type: f.type, size: f.size };
                 continue;
             }
-            let addr = symbols.get(s);
-            if (addr === undefined && s[0] !== '_') addr = symbols.get('_' + s);
-            if (addr !== undefined) {
-                const sz = (renderSpec(s) || {}).size || 1;
-                if (sz > 2) { fail("'" + s + "' is " + sz + " bytes — conditions compare only 8/16-bit values"); out += s; }
-                else out += '*$' + (addr & 0xFFFF).toString(16) + (sz === 2 ? ':w' : '');
-            } else out += s;   // register/flag, or a genuinely unknown name the stub will reject
-            continue;
+            if (s[i] === '[') {
+                i++; let depth = 1; const start = i;
+                while (i < s.length && depth > 0) { if (s[i] === '[') depth++; else if (s[i] === ']') depth--; if (depth > 0) i++; }
+                const idxText = s.slice(start, i);
+                if (s[i] === ']') i++; else { fail("missing ']'"); return name; }
+                let elemType, elemBase;
+                if (cur.type[0] === '*') { elemType = cur.type.slice(1); elemBase = '*(' + cur.addrExpr + '):w'; }
+                else {
+                    const am = cur.type.match(/^(.+)\[(\d+)\]$/);
+                    if (!am) { fail("cannot index non-array '" + cur.type + "'"); return name; }
+                    elemType = am[1]; elemBase = cur.addrExpr;
+                }
+                const stride = typeSizeOf(elemType);
+                if (!stride) { fail("unknown element size for '" + elemType + "'"); return name; }
+                const idx = resolveCondSymbols(idxText, locals, fpAddr, apAddr);
+                if (idx.error) { fail(idx.error); return name; }
+                const term = stride === 1 ? '(' + idx.expr + ')' : '(' + idx.expr + ')*' + stride;
+                cur = { addrExpr: elemBase + ' + ' + term, type: elemType, size: stride };
+                continue;
+            }
+            i = save; break;   // no more postfix
         }
+        const w = cur.type[0] === '*' ? 2 : (cur.size === 1 ? 1 : (cur.size === 2 ? 2 : 0));
+        if (!w) { fail("'" + name + "' is a " + cur.size + "-byte " + cur.type + " — conditions compare only 8/16-bit values"); return name; }
+        // Plain global scalar (no deref): compact *$addr form; else a computed load.
+        if (cur === base && base.addrExpr[0] === '$') return '*' + base.addrExpr + (w === 2 ? ':w' : '');
+        return '*(' + cur.addrExpr + ')' + (w === 2 ? ':w' : '');
+    };
+
+    while (i < s.length) {
+        const ch = s[i];
+        if (ch === '$') { out += ch; i++; while (i < s.length && isHex(s[i])) out += s[i++]; continue; }
+        if (ch === '0' && (s[i + 1] === 'x' || s[i + 1] === 'X')) { out += s[i] + s[i + 1]; i += 2; while (i < s.length && isHex(s[i])) out += s[i++]; continue; }
+        if (isDig(ch)) { while (i < s.length && isDig(s[i])) out += s[i++]; continue; }
+        if (isIdS(ch)) { out += consumeAccess(); continue; }
         out += ch; i++;
     }
     return { expr: out, error };
+}
+
+// Bytes a C type occupies: pointer=2, T[N]=N*sizeof(T), struct via typeDefs, else
+// scalar/enum (tolerating an unsigned/signed prefix). 0 = unknown. Shared by the
+// Watch access evaluator below.
+function ctypeSizeOf(t) {
+    if (!t) return 0;
+    if (t[0] === '*') return 2;
+    const am = t.match(/^(.+)\[(\d+)\]$/);
+    if (am) return parseInt(am[2], 10) * ctypeSizeOf(am[1]);
+    if (typeDefs.has(t)) return typeDefs.get(t).size;
+    return scalarSizeOf(t) || scalarSizeOf(t.replace(/\b(unsigned|signed)\s+/g, ''));
+}
+
+// Runtime evaluator for a C variable access (ident + .member / ->member / [index])
+// used by Watch. Reads live memory to follow pointers and index variables and
+// returns { addr, type, size } for the final lvalue, or null if the head isn't a
+// variable (so the caller falls through to other forms). Throws Error(msg) on a
+// typed mistake (no such field, indexing a non-array, …).
+async function evalAccess(expr, locals, fpVal, apVal) {
+    let i = 0; const s = expr;
+    const isIdS = c => /[A-Za-z_]/.test(c), isId = c => c && /[A-Za-z0-9_]/.test(c);
+    const skipWs = () => { while (i < s.length && (s[i] === ' ' || s[i] === '\t')) i++; };
+    const readWord = async (addr, n) => { const m = await readMem(addr & 0xFFFF, n); return n >= 2 ? ((m[0] || 0) | ((m[1] || 0) << 8)) : (m[0] || 0); };
+
+    skipWs();
+    let name = ''; while (i < s.length && isId(s[i])) name += s[i++];
+    if (!name) return null;
+    let cur;
+    const loc = locals && locals.find(l => l.cname === name);
+    if (loc) {
+        const baseVal = loc.base === 'ap' ? apVal : fpVal;
+        cur = { addr: (baseVal + (loc.offset | 0)) & 0xFFFF, type: loc.type, size: loc.size };
+    } else {
+        let addr = symbols.get(name);
+        if (addr === undefined && name[0] !== '_') addr = symbols.get('_' + name);
+        if (addr === undefined) return null;
+        const spec = renderSpec(name) || {};
+        cur = { addr: addr & 0xFFFF, type: spec.type || 'uchar', size: spec.size || 1 };
+    }
+    for (;;) {
+        skipWs();
+        if (s[i] === '.' || (s[i] === '-' && s[i + 1] === '>')) {
+            const arrow = s[i] === '-'; i += arrow ? 2 : 1; skipWs();
+            let fld = ''; while (i < s.length && isId(s[i])) fld += s[i++];
+            let structName, structAddr;
+            if (arrow) {
+                if (cur.type[0] !== '*') throw new Error("'->' used on non-pointer '" + cur.type + "'");
+                structName = cur.type.slice(1); structAddr = await readWord(cur.addr, 2);
+            } else { structName = cur.type; structAddr = cur.addr; }
+            if (!typeDefs.has(structName)) throw new Error("'" + structName + "' is not a struct");
+            const f = typeDefs.get(structName).fields.find(x => x.name === fld);
+            if (!f) throw new Error("no field '" + fld + "' in '" + structName + "'");
+            cur = { addr: (structAddr + f.offset) & 0xFFFF, type: f.type, size: f.size };
+            continue;
+        }
+        if (s[i] === '[') {
+            i++; let depth = 1; const start = i;
+            while (i < s.length && depth > 0) { if (s[i] === '[') depth++; else if (s[i] === ']') depth--; if (depth > 0) i++; }
+            const idxText = s.slice(start, i);
+            if (s[i] === ']') i++; else throw new Error("missing ']'");
+            let elemType, baseAddr;
+            if (cur.type[0] === '*') { elemType = cur.type.slice(1); baseAddr = await readWord(cur.addr, 2); }
+            else {
+                const am = cur.type.match(/^(.+)\[(\d+)\]$/);
+                if (!am) throw new Error("cannot index non-array '" + cur.type + "'");
+                elemType = am[1]; baseAddr = cur.addr;
+            }
+            const stride = ctypeSizeOf(elemType);
+            if (!stride) throw new Error("unknown element size for '" + elemType + "'");
+            const idxVal = await evalIndexValue(idxText, locals, fpVal, apVal);
+            cur = { addr: (baseAddr + idxVal * stride) & 0xFFFF, type: elemType, size: stride };
+            continue;
+        }
+        break;
+    }
+    skipWs();
+    if (i < s.length) throw new Error("unexpected '" + s.slice(i) + "'");
+    return cur;
+}
+
+// Evaluate an array index to a number: a literal ($hex/0x/decimal) or a variable
+// whose current value is read from memory.
+async function evalIndexValue(text, locals, fpVal, apVal) {
+    const t = text.trim();
+    let m;
+    if ((m = t.match(/^(?:\$|0x)([0-9a-fA-F]+)$/i))) return parseInt(m[1], 16);
+    if (/^\d+$/.test(t)) return parseInt(t, 10);
+    const lv = await evalAccess(t, locals, fpVal, apVal);
+    if (!lv) throw new Error("index '" + t + "' is not a number or variable");
+    const w = lv.type[0] === '*' ? 2 : (lv.size <= 2 ? lv.size : 2);
+    const m2 = await readMem(lv.addr, w);
+    return w >= 2 ? ((m2[0] || 0) | ((m2[1] || 0) << 8)) : (m2[0] || 0);
 }
 
 // Attach a VS Code breakpoint condition / hit target to a JUST-ARMED stub
@@ -4362,6 +4539,28 @@ const handlers = {
                 memoryReference: '0x' + (castAddr & 0xFFFF).toString(16)
             });
             return;
+        }
+
+        // C variable access:  EXPR.member  EXPR->member  EXPR[index]  (and chains).
+        // Resolves the live address (reading fp for locals, following pointers and
+        // index variables) and renders through the one path, buildTypedVar — so a
+        // watched g_entities[i].hp reads exactly like the same node in the tree.
+        if (regs && /^[A-Za-z_]\w*\s*(\.|->|\[)/.test(expr)) {
+            let lv;
+            try {
+                const func = currentFunction(regs.pc);
+                const wlocals = func ? localDefs.get(func) : null;
+                const fpA = symbols.get('fp'), apA = symbols.get('ap');
+                let fpVal = 0, apVal = 0;
+                if (typeof fpA === 'number') { const mm = await readMem(fpA, 2); fpVal = (mm[0] || 0) | ((mm[1] || 0) << 8); }
+                if (typeof apA === 'number') { const mm = await readMem(apA, 2); apVal = (mm[0] || 0) | ((mm[1] || 0) << 8); }
+                lv = await evalAccess(expr, wlocals, fpVal, apVal);
+            } catch (e) { respond(req, {}, false, e.message); return; }
+            if (lv) {
+                const v = await buildTypedVar(expr, lv.addr, lv.type, lv.size, undefined);
+                respond(req, { result: v.value, variablesReference: v.variablesReference, memoryReference: '0x' + lv.addr.toString(16) });
+                return;
+            }
         }
 
         // Try as bare symbol name (also try with _ prefix for C variables)
