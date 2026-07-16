@@ -879,11 +879,16 @@ async function rearmModuleBreakpoints() {
                 else if (!desired && b.armed) { await disarmAddr(b.addr); b.armed = false; changed = true; }
             }
             if (changed) {
-                const verified = bp.bindings.some(b => b.armed);
+                const armedB = bp.bindings.find(b => b.armed);
+                const verified = !!armedB;
+                const dispB = armedB || bp.bindings[0];
+                const hex = '$' + (dispB.addr & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
+                const lbl = labelFor(dispB.addr);
+                const where = (lbl === hex ? hex : lbl + ' (' + hex + ')');
                 evt('breakpoint', { reason: 'changed', breakpoint: verified
-                    ? { id: bp.id, verified: true, line: bp.line, source: bp.source }
+                    ? { id: bp.id, verified: true, line: bp.line, source: bp.source, message: where }
                     : { id: bp.id, verified: false, line: bp.line, source: bp.source,
-                        message: 'Inactive module — binds when its overlay loads' } });
+                        message: where + ' — inactive module, binds when its overlay loads' } });
             }
         }
     }
@@ -2466,7 +2471,16 @@ async function armAddr(addr) {
     armedAddrs.set(addr, n + 1);
     if (n === 0) {
         const r = await gdbCmd('Z0,' + addr.toString(16) + ',1');
-        if (r !== 'OK') { armedAddrs.delete(addr); return false; } // roll back on failure
+        if (r !== 'OK') { // roll back on failure
+            armedAddrs.delete(addr);
+            // E20 = the stub's execution-breakpoint table is full. Surface it — an
+            // unarmed breakpoint otherwise just shows a silent gray marker.
+            log('FAILED to arm breakpoint at $' + (addr & 0xFFFF).toString(16).toUpperCase().padStart(4, '0') +
+                ' — stub reply "' + r + '"' + (r === 'E20'
+                    ? ' (Oricutron execution-breakpoint table FULL; ' + armedAddrs.size + ' armed)'
+                    : '') );
+            return false;
+        }
     }
     return true;
 }
@@ -3678,8 +3692,16 @@ const handlers = {
                     if (b.armed) anyArmed = true; else anyFail = true;
                 }
             }
-            const message = anyFail ? 'Failed to set breakpoint'
-                : (!activeInFile ? 'Inactive module (' + owners.map(m => moduleNames.get(m) || m).join('/') + ') — binds when it loads' : undefined);
+            // Location context for the native Breakpoints panel's hover — it has
+            // no function/address column, so put "func+$off ($addr)" in the message
+            // (shown in the breakpoint's tooltip). Prefer the active/resident binding.
+            const dispBind = bindings.find(b => b.module === 'R' || b.module === activeModuleId) || bindings[0];
+            const hex = '$' + (dispBind.addr & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
+            const lbl = labelFor(dispBind.addr);
+            const where = (lbl === hex ? hex : lbl + ' (' + hex + ')');
+            const status = anyFail ? 'failed to arm (Oricutron breakpoint table full?)'
+                : (!activeInFile ? 'inactive module (' + owners.map(m => moduleNames.get(m) || m).join('/') + ') — binds when it loads' : '');
+            const message = status ? where + ' — ' + status : where;
             // logMessage (VS Code "Logpoint"): this bp doesn't stop — on hit it
             // prints the interpolated message and resumes (see onStopReply).
             newBps.push({ id, line: dispLine, source: args.source, bindings, logMessage: sbp.logMessage || null });
