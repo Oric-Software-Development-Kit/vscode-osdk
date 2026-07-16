@@ -894,7 +894,7 @@ async function rearmModuleBreakpoints() {
             let changed = false;
             for (const b of bp.bindings) {
                 const desired = (b.module === 'R' || b.module === activeModuleId);
-                if (desired && !b.armed) { b.armed = await armAddr(b.addr); changed = true; }
+                if (desired && !b.armed) { b.armed = await armAddr(b.addr); if (b.armed) await sendCond(b.addr, bp.condExpr, bp.hitTarget); changed = true; }
                 else if (!desired && b.armed) { await disarmAddr(b.addr); b.armed = false; changed = true; }
             }
             if (changed) {
@@ -2551,6 +2551,31 @@ async function disarmAddr(addr) {
     }
 }
 
+// VS Code hitCondition ("5", ">=5", "> 5"…) -> a numeric hit target (fire on/after
+// the Nth qualifying hit; 0 = none). The stub does ">= target" semantics.
+function hitTargetOf(hitCondition) {
+    if (!hitCondition) return 0;
+    const m = String(hitCondition).match(/(\d+)/);
+    return m ? parseInt(m[1], 10) : 0;
+}
+
+// Attach a VS Code breakpoint condition / hit target to a JUST-ARMED stub
+// breakpoint at addr. The stub compiles the expression with the SAME cond_compile
+// the monitor uses (no duplicated JS compiler); a bad expression comes back as
+// "E cond: <msg>", which we surface. Nothing to send when unconditional — arming
+// already cleared the slot's condition. Returns an error string or null.
+async function sendCond(addr, condExpr, hitTarget) {
+    if (!condExpr && !hitTarget) return null;
+    const hex = condExpr ? Buffer.from(condExpr, 'utf8').toString('hex') : '';
+    const r = await gdbCmd('qOricCond,' + (addr & 0xFFFF).toString(16) + ',' + ((hitTarget || 0)).toString(16) + ',' + hex);
+    if (typeof r === 'string' && r.indexOf('E cond:') === 0) {
+        const msg = r.slice(7).trim();
+        log('condition "' + condExpr + '" rejected: ' + msg);
+        return msg;
+    }
+    return null;
+}
+
 // Check if any user-set breakpoint is armed (live in the stub) at this address.
 // Disarmed source breakpoints (inactive overlay module) don't count.
 function isBreakpointAt(addr) {
@@ -2807,6 +2832,12 @@ const handlers = {
         respond(req, {
             supportsConfigurationDoneRequest: true,
             supportsFunctionBreakpoints: true,
+            // Conditions/hit-counts are evaluated natively inside Oricutron (the
+            // cond bytecode VM), so no per-hit debugger round-trip. VS Code will
+            // grey out "Edit Breakpoint > Expression/Hit Count" unless these are
+            // advertised here.
+            supportsConditionalBreakpoints: true,
+            supportsHitConditionalBreakpoints: true,
             supportsReadMemoryRequest: true,
             supportsWriteMemoryRequest: true,
             // Off on purpose: this extension provides its own "Oric Disassembly"
@@ -3722,6 +3753,8 @@ const handlers = {
 
         for (const sbp of (args.breakpoints || [])) {
             const reqLine = sbp.line;
+            const condExpr = sbp.condition || null;    // VS Code's condition string (compiled by the stub)
+            const hitTarget = hitTargetOf(sbp.hitCondition);
             const bindings = [];
             let dispLine = -1;
 
@@ -3747,7 +3780,8 @@ const handlers = {
             for (const b of bindings) {
                 if (b.module === 'R' || b.module === activeModuleId) {
                     b.armed = await armAddr(b.addr);
-                    if (b.armed) anyArmed = true; else anyFail = true;
+                    if (b.armed) { anyArmed = true; await sendCond(b.addr, condExpr, hitTarget); }
+                    else anyFail = true;
                 }
             }
             // Location context for the native Breakpoints panel's hover — it has
@@ -3769,7 +3803,7 @@ const handlers = {
             const shownLine = (dispLine >= reqLine) ? dispLine : reqLine;
             // logMessage (VS Code "Logpoint"): this bp doesn't stop — on hit it
             // prints the interpolated message and resumes (see onStopReply).
-            newBps.push({ id, line: shownLine, source: args.source, bindings, logMessage: sbp.logMessage || null });
+            newBps.push({ id, line: shownLine, source: args.source, bindings, logMessage: sbp.logMessage || null, condExpr, hitTarget });
             result.push({ id, verified: anyArmed, line: shownLine, source: args.source, message });
         }
         srcBps.set(norm, newBps);

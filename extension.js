@@ -4436,6 +4436,15 @@ function activate(context) {
 
     const linesOf = f => f.lineArr;
     const enabledCount = lines => lines.filter(l => l.bps.some(b => b.enabled)).length;
+    // Condition / hit-count shown as their OWN child rows under the breakpoint, so
+    // a long expression gets a full line of its own instead of being pushed off to
+    // the right of the code. Icon carries an at-a-glance cue; text is the label.
+    const lineDetails = L => {
+        const rep = L.bps[0], out = [];
+        if (rep.condition) out.push({ text: 'if ' + rep.condition, icon: 'debug-breakpoint-conditional' });
+        if (rep.hitCondition) out.push({ text: 'hit count ' + rep.hitCondition, icon: 'symbol-number' });
+        return out;
+    };
 
     const bpTreeProvider = {
         onDidChangeTreeData: bpTreeEmitter.event,
@@ -4447,9 +4456,20 @@ function activate(context) {
             }
             if (el.kind === 'module') return el.mod.fileArr.map(f => ({ kind: 'file', file: f, mod: el.mod }));
             if (el.kind === 'file') return el.file.lineArr.map(l => ({ kind: 'line', ln: l, file: el.file, mod: el.mod }));
+            if (el.kind === 'line') return lineDetails(el.ln).map((d, i) => ({ kind: 'detail', ln: el.ln, el, idx: i, ...d }));
             return [];
         },
         getTreeItem(el) {
+            if (el.kind === 'detail') {
+                const it = new vscode.TreeItem(el.text);
+                it.iconPath = new vscode.ThemeIcon(el.icon);
+                it.contextValue = 'oricBpDetail';
+                const L = el.ln;
+                it.id = 'detail:' + el.el.mod.key + ':' + el.el.file.uri.fsPath + ':' + L.line + ':' + L.col + ':' + el.idx;
+                it.command = { command: 'vscode.open', title: 'Reveal',
+                    arguments: [L.uri, { selection: new vscode.Range(L.line - 1, L.col, L.line - 1, L.col) }] };
+                return it;
+            }
             if (el.kind === 'module') {
                 const lines = el.mod.fileArr.flatMap(linesOf);
                 const isActive = activeOricModuleId != null && String(activeOricModuleId) === el.mod.key;
@@ -4484,13 +4504,15 @@ function activate(context) {
             const marks = [];
             if (here) marks.push('▶ stopped here');
             if (rep.logMessage) marks.push('log');
-            if (rep.condition) marks.push('if ' + rep.condition);
-            if (rep.hitCondition) marks.push('×' + rep.hitCondition);
             if (L.bps.length > 1) marks.push(L.bps.length + ' bps');
+            // Condition/hit-count are NOT put here — they get their own child rows
+            // (see lineDetails) so a long expression is fully visible on its own line.
+            const details = lineDetails(L);
             // Line number FIRST in the label so it stays visible — long code would
             // otherwise push a trailing line number off-screen. Code follows it and
             // just truncates when long; markers ride in the gray description.
-            const it = new vscode.TreeItem(L.text ? (lineTag + ':  ' + L.text) : ('Line ' + lineTag));
+            const it = new vscode.TreeItem(L.text ? (lineTag + ':  ' + L.text) : ('Line ' + lineTag),
+                details.length ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
             it.description = marks.join('  ');
             it.contextValue = 'oricBp';
             it.checkboxState = enabled ? vscode.TreeItemCheckboxState.Checked : vscode.TreeItemCheckboxState.Unchecked;
