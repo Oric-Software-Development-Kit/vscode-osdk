@@ -2540,6 +2540,8 @@ let stepModeStatusBar = null; // created in activate(); reflects/toggles the mod
 let oricDebugStopped = false; // true between 'stopped' and 'continued' events — gates all line actions
 let lineActionLens = null;    // created in activate(); refreshed on stop/continue/selection change
 let currentStopLoc = null;    // {path, line} of the top stack frame while stopped (null = no source)
+let bpTreeEmitter = null;     // Oric Breakpoints tree refresh signal (created in activate)
+let activeOricModuleId = null; // active overlay module id (for the breakpoint tree's follow/highlight)
 
 // Central stopped-state switch: gates the source CodeLens AND the disasm
 // panel's line actions (the webview hides its buttons/menu while the program
@@ -2548,6 +2550,7 @@ function setOricDebugStopped(v) {
     oricDebugStopped = !!v;
     if (!oricDebugStopped) { currentStopLoc = null; updatePcLineContext(); }
     if (lineActionLens) lineActionLens.refresh();
+    if (bpTreeEmitter) bpTreeEmitter.fire();   // clear/redraw the "stopped here" marker
     pushDebugStateToDisasm();
 }
 
@@ -4334,6 +4337,203 @@ function activate(context) {
         vscode.window.registerWebviewViewProvider('oricCurrentInstr', currentInstrProvider)
     );
 
+    // --- Oric Breakpoints tree (module-grouped enable/disable) ----------------
+    // Source breakpoints grouped by the overlay module that owns their file (the
+    // adapter's fileToModules). Three tiers of enable/disable: all (view title),
+    // per module (row actions / right-click), per breakpoint (checkbox). Every
+    // toggle flips VS Code's own `enabled` flag (remove + re-add), so the native
+    // Breakpoints panel stays in sync. Module grouping needs a live oric session
+    // (that's where the module map lives); without one it's a flat list.
+    let bpTreeModel = { modules: [], grouped: false };
+    let bpTreeGen = 0;             // rebuild generation — drops superseded async rebuilds
+    bpTreeEmitter = new vscode.EventEmitter();
+
+    // Toggle by LOCATION against the LIVE breakpoint list, not the passed model
+    // instances (which may be stale between a change and the tree rebuild). This
+    // is idempotent: a breakpoint in a file shared by two modules is the SAME
+    // object, so toggling either module — even in quick succession — converges
+    // instead of re-adding a duplicate.
+    const bpKey = bp => bp.location.uri.fsPath + ':' + bp.location.range.start.line + ':' + bp.location.range.start.character;
+    function setBpsEnabled(targets, enabled) {
+        const keys = new Set(targets.map(bpKey));
+        const rem = [], add = [];
+        for (const bp of vscode.debug.breakpoints) {
+            if (!(bp instanceof vscode.SourceBreakpoint) || !keys.has(bpKey(bp)) || bp.enabled === enabled) continue;
+            rem.push(bp);
+            add.push(new vscode.SourceBreakpoint(bp.location, enabled, bp.condition, bp.hitCondition, bp.logMessage));
+        }
+        if (rem.length) { vscode.debug.removeBreakpoints(rem); vscode.debug.addBreakpoints(add); }
+    }
+
+    async function rebuildBpTree() {
+        const gen = ++bpTreeGen;
+        const all = vscode.debug.breakpoints.filter(b => b instanceof vscode.SourceBreakpoint);
+        const session = vscode.debug.activeDebugSession;
+        let modulesMeta = [{ id: 'R', name: 'Resident' }];
+        let byFile = {};
+        if (session && session.type === 'oric-debug' && all.length) {
+            const files = [...new Set(all.map(b => b.location.uri.fsPath))];
+            try {
+                const r = await session.customRequest('getBreakpointModules', { files });
+                if (r && r.modules) modulesMeta = r.modules;
+                if (r && r.byFile) byFile = r.byFile;
+            } catch (e) { /* adapter unavailable: fall back to a flat list */ }
+        }
+        if (gen !== bpTreeGen) return;   // a newer rebuild started during the await — let it win
+        const nameOf = new Map(modulesMeta.map(m => [String(m.id), m.name]));
+        // module -> { files: fsPath -> { uri, name, lines: locKey -> { line, col, uri, bps:[] } } }
+        const mods = new Map();
+        const ensureMod = key => {
+            const k = String(key);
+            if (!mods.has(k)) mods.set(k, { key: k, name: nameOf.get(k) || ('Module ' + k), files: new Map() });
+            return mods.get(k);
+        };
+        for (const b of all) {
+            const fsPath = b.location.uri.fsPath;
+            const owners = (byFile[fsPath] && byFile[fsPath].length) ? byFile[fsPath] : ['R'];
+            const line = b.location.range.start.line + 1;
+            const col = b.location.range.start.character;
+            const locKey = line + ':' + col;
+            const name = b.location.uri.path.split('/').pop();
+            for (const owner of owners) {
+                const M = ensureMod(owner);
+                let F = M.files.get(fsPath);
+                if (!F) { F = { uri: b.location.uri, name, lines: new Map() }; M.files.set(fsPath, F); }
+                let L = F.lines.get(locKey);
+                if (!L) { L = { line, col, uri: b.location.uri, bps: [] }; F.lines.set(locKey, L); }
+                L.bps.push(b);   // >1 = duplicate/column-distinct bps at one location
+            }
+        }
+        const modArr = [...mods.values()].sort((a, b) =>
+            a.key === 'R' ? 1 : b.key === 'R' ? -1 : (Number(a.key) - Number(b.key)));
+        for (const M of modArr) {
+            M.fileArr = [...M.files.values()].sort((a, b) => a.name.localeCompare(b.name));
+            for (const F of M.fileArr) F.lineArr = [...F.lines.values()].sort((a, b) => a.line - b.line || a.col - b.col);
+        }
+        // Show breakpoints NOW — the async source-text enrichment below must never
+        // hide or delay them (that async work is exactly what let rebuilds race).
+        bpTreeModel = { modules: modArr, grouped: modArr.length > 1 };
+        bpTreeEmitter.fire();
+
+        // Enrich each line with its trimmed source ("236:  if (SetupColors(..."),
+        // then refresh again. Bail if a newer rebuild has superseded us.
+        const docCache = new Map();
+        const lineText = async (uri, ln) => {
+            const k = uri.fsPath;
+            if (!docCache.has(k)) {
+                try { docCache.set(k, await vscode.workspace.openTextDocument(uri)); }
+                catch (e) { docCache.set(k, null); }
+            }
+            const doc = docCache.get(k);
+            return (doc && ln >= 1 && ln <= doc.lineCount) ? doc.lineAt(ln - 1).text.trim() : '';
+        };
+        for (const M of modArr) for (const F of M.fileArr) for (const L of F.lineArr) {
+            if (gen !== bpTreeGen) return;
+            L.text = await lineText(L.uri, L.line);
+        }
+        if (gen === bpTreeGen) bpTreeEmitter.fire();
+    }
+
+    const linesOf = f => f.lineArr;
+    const enabledCount = lines => lines.filter(l => l.bps.some(b => b.enabled)).length;
+
+    const bpTreeProvider = {
+        onDidChangeTreeData: bpTreeEmitter.event,
+        getChildren(el) {
+            if (!el) {
+                if (bpTreeModel.grouped) return bpTreeModel.modules.map(m => ({ kind: 'module', mod: m }));
+                const m = bpTreeModel.modules[0];   // single group: skip the module level
+                return m ? m.fileArr.map(f => ({ kind: 'file', file: f, mod: m })) : [];
+            }
+            if (el.kind === 'module') return el.mod.fileArr.map(f => ({ kind: 'file', file: f, mod: el.mod }));
+            if (el.kind === 'file') return el.file.lineArr.map(l => ({ kind: 'line', ln: l, file: el.file, mod: el.mod }));
+            return [];
+        },
+        getTreeItem(el) {
+            if (el.kind === 'module') {
+                const lines = el.mod.fileArr.flatMap(linesOf);
+                const isActive = activeOricModuleId != null && String(activeOricModuleId) === el.mod.key;
+                // Follow the active module (setting): expand it, collapse the rest.
+                // Encoding active/inactive in the id makes VS Code re-apply this on
+                // each module switch while still honouring a manual expand between
+                // switches (the id is stable until the active module changes).
+                const follow = vscode.workspace.getConfiguration('oric-debug').get('breakpointsFollowActiveModule', true);
+                const it = new vscode.TreeItem(
+                    isActive ? { label: el.mod.name, highlights: [[0, el.mod.name.length]] } : el.mod.name,
+                    (follow && !isActive) ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.Expanded);
+                it.description = (isActive ? 'active · ' : '') + enabledCount(lines) + '/' + lines.length + ' enabled';
+                it.contextValue = 'oricModule';
+                it.iconPath = new vscode.ThemeIcon('layers', isActive ? new vscode.ThemeColor('list.highlightForeground') : undefined);
+                it.id = 'mod:' + el.mod.key + (follow ? (isActive ? ':A' : ':I') : '');
+                return it;
+            }
+            if (el.kind === 'file') {
+                const it = new vscode.TreeItem(el.file.name, vscode.TreeItemCollapsibleState.Expanded);
+                it.description = enabledCount(el.file.lineArr) + '/' + el.file.lineArr.length + ' enabled';
+                it.contextValue = 'oricFile';
+                it.iconPath = vscode.ThemeIcon.File;
+                it.resourceUri = el.file.uri;
+                it.id = 'file:' + el.mod.key + ':' + el.file.uri.fsPath;
+                return it;
+            }
+            const L = el.ln, rep = L.bps[0];
+            const enabled = L.bps.some(b => b.enabled);
+            const here = oricDebugStopped && currentStopLoc && currentStopLoc.line === L.line
+                && canonPath(currentStopLoc.path) === canonPath(L.uri.fsPath);
+            const lineTag = L.line + (L.col ? ':' + L.col : '');
+            const marks = [];
+            if (here) marks.push('▶ stopped here');
+            if (rep.logMessage) marks.push('log');
+            if (rep.condition) marks.push('if ' + rep.condition);
+            if (rep.hitCondition) marks.push('×' + rep.hitCondition);
+            if (L.bps.length > 1) marks.push(L.bps.length + ' bps');
+            // Line number FIRST in the label so it stays visible — long code would
+            // otherwise push a trailing line number off-screen. Code follows it and
+            // just truncates when long; markers ride in the gray description.
+            const it = new vscode.TreeItem(L.text ? (lineTag + ':  ' + L.text) : ('Line ' + lineTag));
+            it.description = marks.join('  ');
+            it.contextValue = 'oricBp';
+            it.checkboxState = enabled ? vscode.TreeItemCheckboxState.Checked : vscode.TreeItemCheckboxState.Unchecked;
+            const base = rep.logMessage ? 'debug-breakpoint-log' : (rep.condition ? 'debug-breakpoint-conditional' : 'debug-breakpoint');
+            it.iconPath = here
+                ? new vscode.ThemeIcon('debug-stackframe', new vscode.ThemeColor('debugIcon.breakpointCurrentStackframeForeground'))
+                : new vscode.ThemeIcon(enabled ? base : base + '-disabled',
+                    new vscode.ThemeColor(enabled ? 'debugIcon.breakpointForeground' : 'debugIcon.breakpointDisabledForeground'));
+            it.id = 'line:' + el.mod.key + ':' + el.file.uri.fsPath + ':' + L.line + ':' + L.col;
+            it.command = { command: 'vscode.open', title: 'Reveal',
+                arguments: [L.uri, { selection: new vscode.Range(L.line - 1, L.col, L.line - 1, L.col) }] };
+            return it;
+        }
+    };
+
+    const bpTree = vscode.window.createTreeView('oricBreakpoints',
+        { treeDataProvider: bpTreeProvider, showCollapseAll: true });
+    bpTree.onDidChangeCheckboxState(ev => {
+        for (const [node, state] of ev.items)
+            if (node.kind === 'line') setBpsEnabled(node.ln.bps, state === vscode.TreeItemCheckboxState.Checked);
+    });
+    const modBps = m => m.fileArr.flatMap(f => f.lineArr.flatMap(l => l.bps));
+    const fileBps = f => f.lineArr.flatMap(l => l.bps);
+    const allBps = () => bpTreeModel.modules.flatMap(modBps);
+    context.subscriptions.push(
+        bpTree,
+        vscode.debug.onDidChangeBreakpoints(() => rebuildBpTree()),
+        // Rebuild now AND after the session settles: at start, VS Code is still
+        // restoring/verifying imported breakpoints, so an immediate read can catch
+        // a transient (pre-verification) line. The delayed pass re-reads the
+        // settled locations — matching the native panel — without needing a manual
+        // breakpoint edit.
+        vscode.debug.onDidStartDebugSession(() => { rebuildBpTree(); setTimeout(rebuildBpTree, 1500); }),
+        vscode.debug.onDidTerminateDebugSession(() => { activeOricModuleId = null; rebuildBpTree(); }),
+        vscode.commands.registerCommand('oric-debug.bpEnableModule', node => { if (node && node.mod) setBpsEnabled(modBps(node.mod), true); }),
+        vscode.commands.registerCommand('oric-debug.bpDisableModule', node => { if (node && node.mod) setBpsEnabled(modBps(node.mod), false); }),
+        vscode.commands.registerCommand('oric-debug.bpEnableFile', node => { if (node && node.file) setBpsEnabled(fileBps(node.file), true); }),
+        vscode.commands.registerCommand('oric-debug.bpDisableFile', node => { if (node && node.file) setBpsEnabled(fileBps(node.file), false); }),
+        vscode.commands.registerCommand('oric-debug.bpEnableAll', () => setBpsEnabled(allBps(), true)),
+        vscode.commands.registerCommand('oric-debug.bpDisableAll', () => setBpsEnabled(allBps(), false))
+    );
+    rebuildBpTree();
+
     // Re-read source @annotations into the running adapter — no rebuild, no lost
     // debugger state. Panels/watch refresh via the adapter's oricSymbolsChanged
     // event; refreshAll() also updates registers + the inline instruction hint.
@@ -5037,6 +5237,7 @@ function activate(context) {
                                 ? { path: f.source.path, line: f.line } : null;
                             updatePcLineContext();
                             if (lineActionLens) lineActionLens.refresh();
+                            if (bpTreeEmitter) bpTreeEmitter.fire();   // highlight the matching breakpoint
                         }
                         // Intercept VS Code's own stackTrace response — the UI
                         // now has frame data, so opening disassembly will work.
@@ -5072,6 +5273,8 @@ function activate(context) {
                         if (msg.type === 'event' && msg.event === 'oricActiveModule' && msg.body) {
                             moduleStatusBar.text = '$(layers) Module: ' + msg.body.name;
                             moduleStatusBar.show();
+                            activeOricModuleId = (msg.body.id !== undefined ? msg.body.id : null);
+                            if (bpTreeEmitter) bpTreeEmitter.fire();   // re-highlight / re-fold the active module
                         }
                         // Symbols (re)loaded or module switched — the cached symbol
                         // table is stale NOW, panel visible or not (the hover
@@ -5081,6 +5284,7 @@ function activate(context) {
                             symbolCache.clear();
                             refreshSymbolsPanel(session);
                             refreshWatchValues(session); // re-sort active/inactive on module switch
+                            rebuildBpTree();             // module map may now be available/changed
                         }
                         // Log verbosity changed (initial config, status bar, or console) — reflect it
                         if (msg.type === 'event' && msg.event === 'oricLogLevel' && msg.body) {
