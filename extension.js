@@ -4180,44 +4180,42 @@ function activate(context) {
 
     context.subscriptions.push(
         cycleDecorationType,
-        vscode.window.onDidChangeVisibleTextEditors(() => { applyCycleDecorations(); applyInstrDecoration(); })
+        vscode.window.onDidChangeVisibleTextEditors(() => { applyCycleDecorations(); })
     );
 
-    // --- Instruction annotation decoration (resolved operands) ---
-    const instrDecorationType = vscode.window.createTextEditorDecorationType({
-        after: {
-            color: '#888888',
-            fontStyle: 'italic',
-            margin: '0 0 0 3em'
-        },
-        isWholeLine: true
-    });
+    // --- Current-instruction view (bottom-panel webview) ---------------------
+    // The resolved-operand annotation for the paused PC can be long and richly
+    // structured (dereferences, decoded commands, enum operands). Inline editor
+    // text (CodeLens / decorations) can neither wrap nor colour segments, so it
+    // lives in a dedicated always-on panel that rewrites in place on each stop —
+    // coloured and wrapped, no scrolling log, no hover dependency.
     let instrDecoFile = null;
     let instrDecoLine = -1;
     let instrDecoText = '';
+    let instrDecoSrc = '';         // the source-line text at the PC (shown above the decode)
+    let instrDecoComment = '';     // trailing comment split off that line (its own row)
+    let currentInstrView = null;   // WebviewView, set once the panel is resolved
 
-    function applyInstrDecoration() {
-        for (const editor of vscode.window.visibleTextEditors) {
-            const filePath = editor.document.uri.fsPath;
-            if (canonPath(filePath) === canonPath(instrDecoFile) && instrDecoLine > 0 && instrDecoText) {
-                const range = new vscode.Range(instrDecoLine - 1, 0, instrDecoLine - 1, 0);
-                editor.setDecorations(instrDecorationType, [{
-                    range,
-                    renderOptions: { after: { contentText: instrDecoText } }
-                }]);
-            } else {
-                editor.setDecorations(instrDecorationType, []);
-            }
-        }
+    function renderCurrentInstr() {
+        if (!currentInstrView) return;
+        currentInstrView.webview.postMessage({
+            type: 'instr',
+            pc: (typeof lastPcAddr === 'number') ? lastPcAddr : null,
+            file: instrDecoFile,
+            line: instrDecoLine,
+            src: instrDecoSrc || '',
+            comment: instrDecoComment || '',
+            annotation: instrDecoText || ''
+        });
     }
 
     function clearInstrDecoration() {
         instrDecoFile = null;
         instrDecoLine = -1;
         instrDecoText = '';
-        for (const editor of vscode.window.visibleTextEditors) {
-            editor.setDecorations(instrDecorationType, []);
-        }
+        instrDecoSrc = '';
+        instrDecoComment = '';
+        renderCurrentInstr();
     }
 
     function refreshInstructionAnnotation(session) {
@@ -4227,10 +4225,11 @@ function activate(context) {
                 instrDecoFile = resp.file;
                 instrDecoLine = resp.line;
                 instrDecoText = resp.annotation;
-                // Also auto-highlight PC on heatmap
+                instrDecoSrc = resp.srcLine || '';
+                instrDecoComment = resp.srcComment || '';
                 lastPcAddr = resp.pc;
                 highlightHeatmapAddr(resp.pc);
-                applyInstrDecoration();
+                renderCurrentInstr();
             } else {
                 if (resp && typeof resp.pc === 'number') {
                     lastPcAddr = resp.pc;
@@ -4241,7 +4240,99 @@ function activate(context) {
         }).catch(() => { clearInstrDecoration(); });
     }
 
-    context.subscriptions.push(instrDecorationType);
+    function currentInstrHtml() {
+        // .replace(/\r/g,'') guards the CRLF-in-template webview bug: a stray \r
+        // inside the delivered <script> can break it silently.
+        return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+            body { font-family: var(--vscode-editor-font-family, monospace);
+                   font-size: var(--vscode-editor-font-size, 13px);
+                   color: var(--vscode-editor-foreground); padding: 6px 10px; margin: 0; }
+            #hdr { color: #808080; font-size: 0.85em; padding-bottom: 5px; margin-bottom: 6px;
+                   border-bottom: 1px solid var(--vscode-panel-border, #80808040); }
+            #src { white-space: pre-wrap; word-break: break-word; padding-bottom: 6px; margin-bottom: 6px;
+                   border-bottom: 1px solid var(--vscode-panel-border, #80808040); opacity: 0.9; }
+            #ann { white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
+            #cmt { color: #6A9955; font-style: italic; margin-bottom: 5px;
+                   white-space: pre-wrap; word-break: break-word; }
+            body.vscode-light #cmt { color: #008000; }
+            .empty { color: #808080; font-style: italic; }
+            .val { color: #B5CEA8; } .kw { color: #C586C0; } .sym { color: #9CDCFE; } .op { color: #808080; }
+            .mne { color: #569CD6; }
+            body.vscode-light .val { color: #098658; } body.vscode-light .kw { color: #AF00DB; }
+            body.vscode-light .sym { color: #001080; } body.vscode-light .op { color: #6A737D; }
+            body.vscode-light .mne { color: #0000FF; }
+        </style></head><body>
+            <div id="hdr"></div>
+            <div id="cmt"></div>
+            <div id="src"></div>
+            <div id="ann"><span class="empty">— no instruction —</span></div>
+            <script>
+                const vs = acquireVsCodeApi();
+                const hdr = document.getElementById('hdr');
+                const cmt = document.getElementById('cmt');
+                const src = document.getElementById('src');
+                const ann = document.getElementById('ann');
+                function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+                function classify(id){
+                    if (/^e_/.test(id)) return 'kw';
+                    if (id === id.toUpperCase() && /_/.test(id)) return 'kw';
+                    return 'sym';
+                }
+                // Shared token walker: values ($hex/decimal) and operators are fixed;
+                // identifiers are classed by the caller (annotation = enum-aware,
+                // asm = plain symbols) so both decode consistently.
+                function tokenize(text, idClass){
+                    const re = /(\\$[0-9A-Fa-f]+)|([A-Za-z_][A-Za-z0-9_.]*)|(\\d+)|(#|→|=|\\||\\+|\\(|\\)|,)/g;
+                    let out = '', last = 0, m;
+                    while ((m = re.exec(text)) !== null){
+                        if (m.index > last) out += esc(text.slice(last, m.index));
+                        if (m[1]) out += '<span class="val">' + esc(m[1]) + '</span>';
+                        else if (m[2]) out += '<span class="' + idClass(m[2]) + '">' + esc(m[2]) + '</span>';
+                        else if (m[3]) out += '<span class="val">' + esc(m[3]) + '</span>';
+                        else out += '<span class="op">' + esc(m[4]) + '</span>';
+                        last = re.lastIndex;
+                    }
+                    if (last < text.length) out += esc(text.slice(last));
+                    return out;
+                }
+                function colorize(text){ return tokenize(text, classify); }
+                // Lightweight 6502-asm colouring (not the editor's TextMate grammar):
+                // first token = mnemonic, the rest are plain symbols/values/operators.
+                function colorizeAsm(text){
+                    const mm = text.match(/^(\\s*)([A-Za-z_.][\\w.]*)/);
+                    if (!mm) return tokenize(text, function(){ return 'sym'; });
+                    return esc(mm[1]) + '<span class="mne">' + esc(mm[2]) + '</span>'
+                         + tokenize(text.slice(mm[0].length), function(){ return 'sym'; });
+                }
+                window.addEventListener('message', function(e){
+                    const d = e.data;
+                    if (!d || d.type !== 'instr') return;
+                    if (!d.annotation){ hdr.style.display='none'; cmt.style.display='none'; src.style.display='none'; ann.innerHTML='<span class="empty">— no instruction —</span>'; return; }
+                    let h = '';
+                    if (typeof d.pc === 'number') h += '$' + (d.pc & 0xFFFF).toString(16).toUpperCase().padStart(4,'0');
+                    if (d.file && d.line){ const base = String(d.file).split(/[\\\\/]/).pop(); h += (h?'  ·  ':'') + base + ':' + d.line; }
+                    hdr.textContent = h; hdr.style.display = '';
+                    cmt.textContent = d.comment || ''; cmt.style.display = d.comment ? '' : 'none';
+                    src.innerHTML = colorizeAsm(d.src || ''); src.style.display = d.src ? '' : 'none';
+                    ann.innerHTML = colorize(d.annotation);
+                });
+                vs.postMessage({ type: 'ready' });
+            </script>
+        </body></html>`.replace(/\r/g, '');
+    }
+
+    const currentInstrProvider = {
+        resolveWebviewView(view) {
+            currentInstrView = view;
+            view.webview.options = { enableScripts: true };
+            view.webview.onDidReceiveMessage(msg => { if (msg && msg.type === 'ready') renderCurrentInstr(); });
+            view.onDidDispose(() => { if (currentInstrView === view) currentInstrView = null; });
+            view.webview.html = currentInstrHtml();
+        }
+    };
+    context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider('oricCurrentInstr', currentInstrProvider)
+    );
 
     // Re-read source @annotations into the running adapter — no rebuild, no lost
     // debugger state. Panels/watch refresh via the adapter's oricSymbolsChanged

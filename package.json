@@ -91,6 +91,15 @@
         "breakpoints": [
             { "language": "osdk" }
         ],
+        "viewsContainers": {
+            "panel": [
+                {
+                    "id": "oricDebugPanel",
+                    "title": "Oric Debug",
+                    "icon": "images/oric-icon.png"
+                }
+            ]
+        },
         "views": {
             "debug": [
                 {
@@ -102,6 +111,14 @@
                     "id": "oricPeripherals",
                     "name": "Oric Peripherals",
                     "type": "webview"
+                }
+            ],
+            "oricDebugPanel": [
+                {
+                    "id": "oricCurrentInstr",
+                    "name": "Current Instruction",
+                    "type": "webview",
+                    "when": "inDebugMode && debugType == 'oric-debug'"
                 }
             ]
         },
