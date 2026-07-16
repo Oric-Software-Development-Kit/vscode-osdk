@@ -2559,14 +2559,72 @@ function hitTargetOf(hitCondition) {
     return m ? parseInt(m[1], 10) : 0;
 }
 
+// Rewrite a VS Code condition so C variables become memory reads the stub's cond
+// compiler understands. An identifier resolves, in order, to:
+//   - a local/parameter of the breakpoint's function -> *(*$fp:w + off)[:w]  (the
+//     local's address is frame-relative, so the deref must happen at eval time)
+//   - a global/asm symbol -> *$addr (1-byte) or *$addr:w (2-byte int / pointer)
+// Registers/flags, numbers and operators pass through untouched; the stub reports
+// genuinely unknown names. Aggregates (arrays/structs) and >2-byte scalars (long)
+// can't be compared as a single value, so they return a clear error rather than
+// silently wrong bytecode. Member/subscript expressions (e->hp, a[i]) aren't
+// resolved yet — only plain scalar variables. Returns { expr, error }.
+function resolveCondSymbols(expr, locals, fpAddr, apAddr) {
+    let out = '', i = 0, error = null;
+    const isHex = c => /[0-9a-fA-F]/.test(c), isDig = c => c >= '0' && c <= '9';
+    const isIdS = c => /[A-Za-z_]/.test(c), isId = c => /[A-Za-z0-9_]/.test(c);
+    const fail = m => { error = error || m; };
+    while (i < expr.length) {
+        const ch = expr[i];
+        if (ch === '$') { out += ch; i++; while (i < expr.length && isHex(expr[i])) out += expr[i++]; continue; }
+        if (ch === '0' && (expr[i + 1] === 'x' || expr[i + 1] === 'X')) { out += expr[i] + expr[i + 1]; i += 2; while (i < expr.length && isHex(expr[i])) out += expr[i++]; continue; }
+        if (isDig(ch)) { while (i < expr.length && isDig(expr[i])) out += expr[i++]; continue; }
+        if (isIdS(ch)) {
+            let s = ''; while (i < expr.length && isId(expr[i])) s += expr[i++];
+            const loc = locals && locals.find(l => l.cname === s);
+            if (loc) {
+                const baseAddr = loc.base === 'ap' ? apAddr : fpAddr;
+                if (typeof baseAddr !== 'number') fail("no frame pointer to resolve local '" + s + "'");
+                else if (loc.size > 2) fail("local '" + s + "' is " + loc.size + " bytes — conditions compare only 8/16-bit values");
+                else {
+                    const off = loc.offset | 0;
+                    const term = off >= 0 ? ' + ' + off : ' - ' + (-off);
+                    out += '*(*$' + (baseAddr & 0xFFFF).toString(16) + ':w' + term + ')' + (loc.size === 2 ? ':w' : '');
+                }
+                if (error) out += s;
+                continue;
+            }
+            let addr = symbols.get(s);
+            if (addr === undefined && s[0] !== '_') addr = symbols.get('_' + s);
+            if (addr !== undefined) {
+                const sz = (renderSpec(s) || {}).size || 1;
+                if (sz > 2) { fail("'" + s + "' is " + sz + " bytes — conditions compare only 8/16-bit values"); out += s; }
+                else out += '*$' + (addr & 0xFFFF).toString(16) + (sz === 2 ? ':w' : '');
+            } else out += s;   // register/flag, or a genuinely unknown name the stub will reject
+            continue;
+        }
+        out += ch; i++;
+    }
+    return { expr: out, error };
+}
+
 // Attach a VS Code breakpoint condition / hit target to a JUST-ARMED stub
-// breakpoint at addr. The stub compiles the expression with the SAME cond_compile
-// the monitor uses (no duplicated JS compiler); a bad expression comes back as
-// "E cond: <msg>", which we surface. Nothing to send when unconditional — arming
-// already cleared the slot's condition. Returns an error string or null.
+// breakpoint at addr. C globals in the expression are resolved to memory reads
+// here; the stub then compiles it with the SAME cond_compile the monitor uses
+// (no duplicated JS compiler). A bad expression comes back as "E cond: <msg>",
+// which we surface. Nothing to send when unconditional — arming already cleared
+// the slot's condition. Returns an error string or null.
 async function sendCond(addr, condExpr, hitTarget) {
     if (!condExpr && !hitTarget) return null;
-    const hex = condExpr ? Buffer.from(condExpr, 'utf8').toString('hex') : '';
+    let sendExpr = condExpr;
+    if (condExpr) {
+        const func = currentFunction(addr);
+        const locals = func ? localDefs.get(func) : null;
+        const r = resolveCondSymbols(condExpr, locals, symbols.get('fp'), symbols.get('ap'));
+        if (r.error) { log('condition "' + condExpr + '" rejected: ' + r.error); return r.error; }
+        sendExpr = r.expr;
+    }
+    const hex = sendExpr ? Buffer.from(sendExpr, 'utf8').toString('hex') : '';
     const r = await gdbCmd('qOricCond,' + (addr & 0xFFFF).toString(16) + ',' + ((hitTarget || 0)).toString(16) + ',' + hex);
     if (typeof r === 'string' && r.indexOf('E cond:') === 0) {
         const msg = r.slice(7).trim();
