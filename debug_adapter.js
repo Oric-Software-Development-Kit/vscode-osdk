@@ -1321,6 +1321,23 @@ function fieldAtOffset(structName, y) {
              index: elemSize > 0 ? Math.floor(within / elemSize) : 0 };
 }
 
+// Which local/parameter of `func` a (fp),y / (ap),y access lands in: the C frame
+// pointer holds the frame base, so Y IS the frame offset. `basePtr` is 'fp' or
+// 'ap'. Mirrors fieldAtOffset but for a stack frame — returns { local, within,
+// isArray, base (element/scalar type), elemSize, index } or null.
+function localAtFrameOffset(func, basePtr, off) {
+    const locals = func ? localDefs.get(func) : null;
+    if (!locals) return null;
+    const l = locals.find(x => x.base === basePtr && off >= x.offset && off < x.offset + x.size);
+    if (!l) return null;
+    const am = l.type.match(/^(.+)\[(\d+)\]$/);
+    const count = am ? parseInt(am[2], 10) : 1;
+    const elemSize = am ? (Math.floor(l.size / count) || 1) : l.size;
+    const within = off - l.offset;
+    return { local: l, within, isArray: !!am, base: am ? am[1] : l.type,
+             elemSize, index: elemSize > 0 ? Math.floor(within / elemSize) : 0 };
+}
+
 // The `@enum <E>` type named on the source CODE LINE at `pc`, or null. Explicit
 // intent for the value an instruction fetches (covers indexed/indirect reads the
 // operand's own type can't cover). One place, so the register tag and the inline
@@ -2783,6 +2800,27 @@ async function evalIndexValue(text, locals, fpVal, apVal) {
     const w = lv.type[0] === '*' ? 2 : (lv.size <= 2 ? lv.size : 2);
     const m2 = await readMem(lv.addr, w);
     return w >= 2 ? ((m2[0] || 0) | ((m2[1] || 0) << 8)) : (m2[0] || 0);
+}
+
+// Pull the variable-access expressions out of a C source line for the Current
+// Instruction panel: each maximal identifier + .member/->member/[index] chain,
+// plus any bare identifier used as an array index. Non-variables (macros, field
+// names, function calls) are filtered later by evalAccess returning null. String
+// and char literals are blanked first so their contents aren't matched. Deduped,
+// source order.
+function extractLineExprs(line) {
+    const clean = line.replace(/"(\\.|[^"\\])*"/g, '""').replace(/'(\\.|[^'\\])*'/g, "''");
+    const seen = new Set(), out = [];
+    const add = e => { e = e.replace(/\s+/g, ''); if (e && !seen.has(e)) { seen.add(e); out.push(e); } };
+    let m;
+    const CHAIN = /[A-Za-z_]\w*(?:\s*(?:\.\w+|->\w+|\[[^\][]*\]))*/g;
+    while ((m = CHAIN.exec(clean))) {
+        if (clean[CHAIN.lastIndex] === '(') continue;   // a function call, not a variable
+        add(m[0]);
+    }
+    const IDX = /\[([^\][]*)\]/g;
+    while ((m = IDX.exec(clean))) { let im; const ID = /[A-Za-z_]\w*/g; while ((im = ID.exec(m[1]))) add(im[0]); }
+    return out;
 }
 
 // Attach a VS Code breakpoint condition / hit target to a JUST-ARMED stub
@@ -5294,6 +5332,26 @@ const handlers = {
                     // struct syntax — this is where "ldy #4" gets its meaning back.
                     const pname = sym(lo);
                     const pann = pname ? annForSymbol(pname) : null;
+                    // (fp),y / (ap),y is a C frame access: Y is the frame offset, so
+                    // name the local/parameter it lands in and decode it with its C
+                    // type — "(fp→i)=$0002 int" instead of a raw pointer+offset.
+                    if (pname === 'fp' || pname === 'ap') {
+                        const li = localAtFrameOffset(currentFunction(pc), pname, regs.y);
+                        if (li) {
+                            const l = li.local;
+                            const fann = annForSymbol(l.cname);
+                            if (li.isArray) {
+                                const ev = await buildTypedVar('', ea, li.base, li.elemSize, fann, { omitAddr: true });
+                                annotation = '(' + pname + '→' + l.cname + '[' + li.index + '] @ $' + h4(ea) + ')=' + ev.value;
+                            } else {
+                                const localAddr = (ptr + l.offset) & 0xFFFF;
+                                const fv = await buildTypedVar('', localAddr, l.type, l.size, fann, { omitAddr: true });
+                                annotation = '(' + pname + '→' + l.cname + (li.within ? '+' + li.within : '')
+                                    + ' @ $' + h4(ea) + ')=' + fv.value;
+                            }
+                            break;
+                        }
+                    }
                     // @stream pointer: when it sits AT a decodable command (a
                     // boundary — e.g. the opcode fetch, or a handler peeking a
                     // param of the current command), show that command and which
@@ -5407,13 +5465,47 @@ const handlers = {
             srcComment = srcLine.slice(cmatch.index + cmatch[1].length).trim();
             srcLine = srcLine.slice(0, cmatch.index).trim();
         }
+        // On a C source line, auto-decode the variable expressions on it (like
+        // Watch entries) so the panel shows C-level state instead of the lone
+        // 6502 op, which is meaningless mid-statement.
+        const isC = !!(src && /\.(c|h|cc|cpp|i)$/i.test(src.file));
+        let lineVars = null;
+        if (isC && srcLine) {
+            const exprs = extractLineExprs(srcLine);
+            if (exprs.length) {
+                const func = currentFunction(pc);
+                const locals = func ? localDefs.get(func) : null;
+                const fpA = symbols.get('fp'), apA = symbols.get('ap');
+                let fpVal = 0, apVal = 0;
+                if (typeof fpA === 'number') { const mm = await readMem(fpA, 2); fpVal = (mm[0] || 0) | ((mm[1] || 0) << 8); }
+                if (typeof apA === 'number') { const mm = await readMem(apA, 2); apVal = (mm[0] || 0) | ((mm[1] || 0) << 8); }
+                const rows = [];
+                for (const e of exprs) {
+                    if (rows.length >= 12) break;
+                    try {
+                        const lv = await evalAccess(e, locals, fpVal, apVal);
+                        if (!lv) continue;
+                        const v = await buildTypedVar(e, lv.addr, lv.type, lv.size, undefined, { omitAddr: true });
+                        rows.push({ expr: e, value: (v.value || '').trim() });
+                    } catch (_) { /* skip an expression that can't be evaluated */ }
+                }
+                if (rows.length) lineVars = rows;
+            }
+        }
+        // The actual 6502 instruction text at PC (mnemonic + operand). Shown below
+        // the C decode so you still see exactly which instruction you're on.
+        const operandTxt = fmtOp(mode, lo, hi, pc);
+        const disasm = mne.toUpperCase() + (operandTxt ? ' ' + operandTxt : '');
         respond(req, {
             annotation,
             pc,
             file: src ? src.file : null,
             line: src ? src.line : 0,
             srcLine,
-            srcComment
+            srcComment,
+            isC,
+            lineVars,
+            disasm
         });
     },
 

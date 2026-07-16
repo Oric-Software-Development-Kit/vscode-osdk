@@ -4197,6 +4197,9 @@ function activate(context) {
     let instrDecoText = '';
     let instrDecoSrc = '';         // the source-line text at the PC (shown above the decode)
     let instrDecoComment = '';     // trailing comment split off that line (its own row)
+    let instrDecoVars = null;      // on a C line: [{expr,value}] auto-decoded like Watch entries
+    let instrDecoIsC = false;      // current line is C source (colorize as C, show vars not the asm op)
+    let instrDecoDisasm = '';      // the 6502 instruction text at PC (shown below the C decode)
     let currentInstrView = null;   // WebviewView, set once the panel is resolved
 
     function renderCurrentInstr() {
@@ -4208,7 +4211,10 @@ function activate(context) {
             line: instrDecoLine,
             src: instrDecoSrc || '',
             comment: instrDecoComment || '',
-            annotation: instrDecoText || ''
+            annotation: instrDecoText || '',
+            lineVars: instrDecoVars || null,
+            isC: instrDecoIsC,
+            disasm: instrDecoDisasm || ''
         });
     }
 
@@ -4216,6 +4222,9 @@ function activate(context) {
         instrDecoFile = null;
         instrDecoLine = -1;
         instrDecoText = '';
+        instrDecoVars = null;
+        instrDecoIsC = false;
+        instrDecoDisasm = '';
         instrDecoSrc = '';
         instrDecoComment = '';
         renderCurrentInstr();
@@ -4224,10 +4233,14 @@ function activate(context) {
     function refreshInstructionAnnotation(session) {
         if (!session || session.type !== 'oric-debug') { clearInstrDecoration(); return; }
         session.customRequest('resolveInstruction').then(resp => {
-            if (resp && resp.annotation && resp.file && resp.line > 0) {
+            const hasVars = resp && resp.lineVars && resp.lineVars.length > 0;
+            if (resp && (resp.annotation || hasVars) && resp.file && resp.line > 0) {
                 instrDecoFile = resp.file;
                 instrDecoLine = resp.line;
                 instrDecoText = resp.annotation;
+                instrDecoVars = hasVars ? resp.lineVars : null;
+                instrDecoIsC = !!resp.isC;
+                instrDecoDisasm = resp.disasm || '';
                 instrDecoSrc = resp.srcLine || '';
                 instrDecoComment = resp.srcComment || '';
                 lastPcAddr = resp.pc;
@@ -4255,6 +4268,12 @@ function activate(context) {
             #src { white-space: pre-wrap; word-break: break-word; padding-bottom: 6px; margin-bottom: 6px;
                    border-bottom: 1px solid var(--vscode-panel-border, #80808040); opacity: 0.9; }
             #ann { white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
+            .vrow { white-space: pre; line-height: 1.55; }
+            .vrow .op { padding: 0 3px; }
+            #asm { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--vscode-panel-border, #80808040);
+                   white-space: pre-wrap; word-break: break-word; }
+            #asm .lbl { color: #808080; font-size: 0.85em; }
+            #asmann { color: #808080; }
             #cmt { color: #6A9955; font-style: italic; margin-bottom: 5px;
                    white-space: pre-wrap; word-break: break-word; }
             body.vscode-light #cmt { color: #008000; }
@@ -4269,12 +4288,14 @@ function activate(context) {
             <div id="cmt"></div>
             <div id="src"></div>
             <div id="ann"><span class="empty">— no instruction —</span></div>
+            <div id="asm" style="display:none"></div>
             <script>
                 const vs = acquireVsCodeApi();
                 const hdr = document.getElementById('hdr');
                 const cmt = document.getElementById('cmt');
                 const src = document.getElementById('src');
                 const ann = document.getElementById('ann');
+                const asm = document.getElementById('asm');
                 function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
                 function classify(id){
                     if (/^e_/.test(id)) return 'kw';
@@ -4299,6 +4320,17 @@ function activate(context) {
                     return out;
                 }
                 function colorize(text){ return tokenize(text, classify); }
+                // Watch-style value rows for a C line: each variable expression on
+                // the left (padded to align), its decoded value on the right.
+                function renderVars(list){
+                    let w = 0; for (const r of list) if (r.expr.length > w) w = r.expr.length;
+                    let html = '';
+                    for (const r of list){
+                        const pad = r.expr + ' '.repeat(Math.max(0, w - r.expr.length));
+                        html += '<div class="vrow"><span class="sym">' + esc(pad) + '</span><span class="op">=</span>' + colorize(r.value) + '</div>';
+                    }
+                    return html;
+                }
                 // Lightweight 6502-asm colouring (not the editor's TextMate grammar):
                 // first token = mnemonic, the rest are plain symbols/values/operators.
                 function colorizeAsm(text){
@@ -4310,14 +4342,25 @@ function activate(context) {
                 window.addEventListener('message', function(e){
                     const d = e.data;
                     if (!d || d.type !== 'instr') return;
-                    if (!d.annotation){ hdr.style.display='none'; cmt.style.display='none'; src.style.display='none'; ann.innerHTML='<span class="empty">— no instruction —</span>'; return; }
+                    const hasVars = d.lineVars && d.lineVars.length;
+                    if (!d.annotation && !hasVars){ hdr.style.display='none'; cmt.style.display='none'; src.style.display='none'; ann.innerHTML='<span class="empty">— no instruction —</span>'; return; }
                     let h = '';
                     if (typeof d.pc === 'number') h += '$' + (d.pc & 0xFFFF).toString(16).toUpperCase().padStart(4,'0');
                     if (d.file && d.line){ const base = String(d.file).split(/[\\\\/]/).pop(); h += (h?'  ·  ':'') + base + ':' + d.line; }
                     hdr.textContent = h; hdr.style.display = '';
                     cmt.textContent = d.comment || ''; cmt.style.display = d.comment ? '' : 'none';
-                    src.innerHTML = colorizeAsm(d.src || ''); src.style.display = d.src ? '' : 'none';
-                    ann.innerHTML = colorize(d.annotation);
+                    // C source colorizes as C (plain identifiers); asm as a mnemonic line.
+                    src.innerHTML = d.isC ? colorize(d.src || '') : colorizeAsm(d.src || ''); src.style.display = d.src ? '' : 'none';
+                    // On a C line show the auto-decoded variable values (Watch-style);
+                    // otherwise the single-instruction operand decode.
+                    ann.innerHTML = hasVars ? renderVars(d.lineVars) : colorize(d.annotation);
+                    // On a C line, also show the current 6502 instruction below a
+                    // separator, so you still see exactly where you are mid-statement.
+                    if (d.isC && d.disasm){
+                        let a = '<div class="lbl">current instruction</div>' + colorizeAsm(d.disasm);
+                        if (d.annotation) a += '<div id="asmann">' + colorize(d.annotation) + '</div>';
+                        asm.innerHTML = a; asm.style.display = '';
+                    } else { asm.style.display = 'none'; asm.innerHTML = ''; }
                 });
                 vs.postMessage({ type: 'ready' });
             </script>
