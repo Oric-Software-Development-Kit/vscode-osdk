@@ -562,6 +562,19 @@ let pendingStop = null;       // deferred stopped event body
 let srcBps     = new Map();   // file -> [{id, line, source, bindings:[{addr,module,armed}]}] — one binding per owning overlay (shared files span several)
 let dataBps    = new Map();   // id -> { addr, accessType, gdbType } (data breakpoints)
 let armedAddrs = new Map();   // addr -> refcount of execution breakpoints armed in the stub
+let bpLock     = Promise.resolve();  // serialization gate for breakpoint / arm-state mutations
+// Run an arm-state mutation serialized behind bpLock. VS Code bursts many
+// setBreakpoints on a bulk enable/disable, and a module switch can overlap a
+// breakpoint edit; running them concurrently interleaves armedAddrs/srcBps/
+// bindings and leaves breakpoints armed nondeterministically. Callers must NOT
+// already hold the lock — every locked function reaches only the atomic
+// armAddr/disarmAddr/gdbCmd leaves (audited), so this never nests or deadlocks.
+function withBpLock(fn) {
+    const prev = bpLock;
+    let release;
+    bpLock = new Promise(r => { release = r; });
+    return prev.then(fn).finally(release);
+}
 let moduleWatchAddr = -1;     // addr of the hidden _osdk_dbg_module write-watch (-1 = none); arms overlays on load
 let moduleWatchPending = false; // true between the module-watch stop and the dobp=FALSE step that commits the write
 let moduleByteTrusted = false; // false until we KNOW _osdk_dbg_module is meaningful (a write was observed, or we attached to a running program). At cold boot the byte is uninitialized RAM — its value must not be believed.
@@ -867,6 +880,12 @@ async function checkModuleSwitch(force) {
 // module breakpoints in the stub, disarm the rest. Called after the active module
 // changes so a breakpoint in an overlay only fires while that overlay is loaded.
 async function rearmModuleBreakpoints() {
+  // Serialized with setBreakpoints (and itself): a module switch overlapping a
+  // breakpoint edit would otherwise interleave this srcBps walk with srcBps.set
+  // and double-flip binding.armed / armedAddrs. Callers (checkModuleSwitch,
+  // setActiveModule) stay UNLOCKED so this never nests. It's still awaited before
+  // the resume in onStopReply, so a brief queue behind a burst is safe.
+  return withBpLock(async () => {
     for (const [, arr] of srcBps) {
         for (const bp of arr) {
             // A source breakpoint has one binding per owning module (shared files
@@ -892,6 +911,7 @@ async function rearmModuleBreakpoints() {
             }
         }
     }
+  });
 }
 
 function loadSymbols(file) {
@@ -3673,6 +3693,10 @@ const handlers = {
     // -- Breakpoints ----------------------------------------------
 
     async setBreakpoints(req) {
+        // Serialized: on a bulk enable/disable VS Code fires a burst of setBreakpoints
+        // for the same file (one per removed/added bp); concurrent runs interleave the
+        // disarm/re-arm and the srcBps[file] rebuild, leaving breakpoints armed at random.
+        return withBpLock(async () => {
         const args = req.arguments;
         const srcPath = args.source && args.source.path ? args.source.path : '';
         // Key srcBps by the normalized path so a re-cased/non-canonical path for the
@@ -3750,9 +3774,11 @@ const handlers = {
         }
         srcBps.set(norm, newBps);
         respond(req, { breakpoints: result });
+        });
     },
 
     async setFunctionBreakpoints(req) {
+      return withBpLock(async () => {
         // Clear all existing function breakpoints from the stub
         for (const [, bp] of bps) {
             await disarmAddr(bp.addr);
@@ -3782,6 +3808,7 @@ const handlers = {
             }
         }
         respond(req, { breakpoints: result });
+      });
     },
 
     setExceptionBreakpoints(req) {
@@ -3789,6 +3816,7 @@ const handlers = {
     },
 
     async setInstructionBreakpoints(req) {
+      return withBpLock(async () => {
         // Clear existing instruction breakpoints
         for (const [, bp] of ibps) {
             await disarmAddr(bp.addr);
@@ -3809,6 +3837,7 @@ const handlers = {
             });
         }
         respond(req, { breakpoints: result });
+      });
     },
 
     // -- Memory / Disassembly -------------------------------------
@@ -4735,6 +4764,7 @@ const handlers = {
     },
 
     async setDataBreakpoints(req) {
+      return withBpLock(async () => {
         // Clear all existing data breakpoints
         for (const [, bp] of dataBps) {
             await gdbCmd('z' + bp.gdbType + ',' + bp.addr.toString(16) + ',1');
@@ -4763,6 +4793,7 @@ const handlers = {
             });
         }
         respond(req, { breakpoints: result });
+      });
     },
 
     // -- Resolve current instruction operands (custom request) --------
