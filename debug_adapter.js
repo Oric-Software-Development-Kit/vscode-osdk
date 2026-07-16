@@ -3736,10 +3736,17 @@ const handlers = {
             const status = anyFail ? 'failed to arm (Oricutron breakpoint table full?)'
                 : (!activeInFile ? 'inactive module (' + owners.map(m => moduleNames.get(m) || m).join('/') + ') — binds when it loads' : '');
             const message = status ? where + ' — ' + status : where;
+            // Resolution snaps to the nearest #LINES entry. A FORWARD snap (to the
+            // next code line) is useful feedback, but a BACKWARD snap — no entry at
+            // or after the requested line, so it fell to an earlier one — reports a
+            // misleading earlier line (e.g. a bp on 262 shown as 256/void main) even
+            // though it binds and fires correctly at the requested code. Keep the
+            // requested line in that case.
+            const shownLine = (dispLine >= reqLine) ? dispLine : reqLine;
             // logMessage (VS Code "Logpoint"): this bp doesn't stop — on hit it
             // prints the interpolated message and resumes (see onStopReply).
-            newBps.push({ id, line: dispLine, source: args.source, bindings, logMessage: sbp.logMessage || null });
-            result.push({ id, verified: anyArmed, line: dispLine, source: args.source, message });
+            newBps.push({ id, line: shownLine, source: args.source, bindings, logMessage: sbp.logMessage || null });
+            result.push({ id, verified: anyArmed, line: shownLine, source: args.source, message });
         }
         srcBps.set(norm, newBps);
         respond(req, { breakpoints: result });
@@ -4479,6 +4486,20 @@ const handlers = {
     // -- Multi-module symbol selection (custom requests) --------------
     getModules(req) {
         respond(req, { modules: listModules(), active: activeModuleId });
+    },
+
+    // For the Oric Breakpoints tree: which module(s) own each given source file.
+    // The extension groups its breakpoints by this. Path normalization is done
+    // here (fileToModules is keyed by our canonPath) and returned keyed by the
+    // exact input path so the caller can join without re-normalizing. Files in
+    // no #MODULE section (or with no module info) are resident ('R').
+    getBreakpointModules(req) {
+        const files = (req.arguments && req.arguments.files) || [];
+        const byFile = {};
+        for (const f of files) byFile[f] = fileToModules.get(canonPath(f)) || ['R'];
+        const modules = [{ id: 'R', name: 'Resident' }];
+        for (const [id, name] of moduleNames) modules.push({ id, name });
+        respond(req, { modules, byFile });
     },
 
     async setActiveModule(req) {
