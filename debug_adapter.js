@@ -1334,12 +1334,46 @@ function lineDirectivesOf(pc) {
     return dirs;
 }
 
+// Reverse lookup: the enum type that declares a member NAME (first match), or
+// null. Enums are stored value->name, so we scan. Used to tag a register loaded
+// with an enum constant as an immediate (lda #FLAG_END_STREAM): the disassembly
+// only sees the literal value, so the name comes from the SOURCE operand token.
+function enumOfMember(name) {
+    for (const src of [enumDefs, allEnumDefs]) {
+        for (const [ename, def] of src) {
+            if (!def.byValue) continue;
+            for (const mname of def.byValue.values()) {
+                if (mname === name) return ename;
+            }
+        }
+    }
+    return null;
+}
+
+// The enum a NAMED immediate operand belongs to (lda #FLAG_END_STREAM), read
+// from the SOURCE token at pc, or null. The disassembly only sees the literal
+// byte, so the type comes from the token. Shared by the register tagger and the
+// instruction annotation so both decode the immediate identically (DRY).
+function immediateTokenEnum(pc) {
+    const s = sourceFor(pc);
+    const text = s ? getSourceLine(s.file, s.line) : null;
+    const mo = text && text.match(/#\s*([A-Za-z_]\w*)/);
+    if (!mo) return null;
+    const en = enumOfMember(mo[1]);
+    return en ? { enumName: en, member: mo[1] } : null;
+}
+
 // The enum tag a load instruction confers, or null. Line annotation first
 // (explicit intent, covers indirect fetches like the byte-stream readers),
-// else registry inference from a direct-address operand's symbol.
+// else a named immediate's enum, else registry inference from a direct-address
+// operand's symbol.
 function tagForLoad(prevPc, mode, lo, hi) {
     const le = lineEnumOf(prevPc);
     if (le) return { enumName: le, source: 'line' };
+    if (mode === '#') {
+        const t = immediateTokenEnum(prevPc);
+        return t ? { enumName: t.enumName, source: t.member } : null;
+    }
     let operand = -1;
     if (mode === 'z') operand = lo;
     else if (mode === 'a') operand = (hi << 8) | lo;
@@ -4836,16 +4870,15 @@ const handlers = {
         try {
             switch (mode) {
                 case '#': { // immediate
-                    // A "; @enum <E>" on the line decodes the immediate as that enum
-                    // (an immediate carries no inherent type — e.g. lda #FLAG_END_STREAM
-                    // shows FLAG_END_STREAM). @word/@stream don't apply (no address).
+                    // Decode the immediate as an enum when the intent is known:
+                    // an explicit "; @enum <E>" on the line, else the NAMED operand
+                    // token (lda #FLAG_END_STREAM) via the same lookup the register
+                    // tagger uses — so both show "FLAG_END_STREAM  stream_stop_flags".
                     const enumDir = lineDirs.find(d => d.kind === 'enum');
-                    if (enumDir) {
-                        const ed = resolveEnum(enumDir.enumName, lo);
-                        annotation = '#' + (ed ? formatEnum(ed, [lo], 0, 1) + '  ' + enumDir.enumName : fmtVal(lo));
-                    } else {
-                        annotation = '#' + fmtVal(lo);
-                    }
+                    let en = enumDir ? enumDir.enumName : null;
+                    if (!en) { const t = immediateTokenEnum(pc); if (t) en = t.enumName; }
+                    const ed = en ? resolveEnum(en, lo) : null;
+                    annotation = '#' + (ed ? formatEnum(ed, [lo], 0, 1) + '  ' + en : fmtVal(lo));
                     break;
                 }
                 case 'z': { // zero page
@@ -5019,11 +5052,25 @@ const handlers = {
         } catch (_) { /* annotation stays empty */ }
 
         const src = sourceFor(pc);
+        // Collapse indentation/alignment runs to single spaces: whitespace that
+        // keeps many source lines aligned is just noise for one line lifted into a
+        // small view ("   LDA #X       ; c" -> "LDA #X ; c"). Then split off a
+        // trailing comment (; or //) so the view can show the human description on
+        // its own line, above the code.
+        let srcLine = src ? (getSourceLine(src.file, src.line) || '').replace(/\s+/g, ' ').trim() : '';
+        let srcComment = '';
+        const cmatch = srcLine.match(/(;|\/\/)/);
+        if (cmatch) {
+            srcComment = srcLine.slice(cmatch.index + cmatch[1].length).trim();
+            srcLine = srcLine.slice(0, cmatch.index).trim();
+        }
         respond(req, {
             annotation,
             pc,
             file: src ? src.file : null,
-            line: src ? src.line : 0
+            line: src ? src.line : 0,
+            srcLine,
+            srcComment
         });
     },
 
