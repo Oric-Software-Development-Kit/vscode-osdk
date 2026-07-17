@@ -2522,7 +2522,12 @@ window.addEventListener('message', e => {
 // Oric Disassembly Panel (custom webview, persists across reloads)
 // ----------------------------------------------------------------
 
-let disasmPanel = null;
+// All open Oric Disassembly panels. It's meant to be a singleton, but VS Code can
+// restore a previously-open tab on window reload (deserializeWebviewPanel) — and if
+// more than one ever exists, EVERY one must receive updates, or the untracked tab
+// goes stale (shows the trace via Oricutron but its own view never moves). So track
+// the set and post to all of them.
+let disasmPanels = new Set();
 let disasmCenterAddr = null;
 
 // "Instruction-step mode": F10/F11 do instruction steps (keybindings gate on
@@ -2566,7 +2571,7 @@ function updatePcLineContext() {
     vscode.commands.executeCommand('setContext', 'oric-debug.pcEditorLines', match ? [currentStopLoc.line] : []);
 }
 function pushDebugStateToDisasm() {
-    if (disasmPanel) disasmPanel.webview.postMessage({ type: 'debugState', stopped: oricDebugStopped });
+    for (const p of disasmPanels) p.webview.postMessage({ type: 'debugState', stopped: oricDebugStopped });
 }
 function setInstrStepMode(on) {
     on = !!on;
@@ -2944,25 +2949,34 @@ function refreshSymbolsPanel(session) {
 // Oric Disassembly Panel — create / refresh / HTML
 // ----------------------------------------------------------------
 
-function createDisasmPanel() {
-    if (disasmPanel) { disasmPanel.reveal(); return; }
-    disasmPanel = vscode.window.createWebviewPanel(
-        'oricDisassembly', 'Oric Disassembly',
-        vscode.ViewColumn.Two,
-        { enableScripts: true, retainContextWhenHidden: true }
-    );
-    disasmPanel.webview.html = disasmPanelHtml();
-    disasmPanel.onDidDispose(() => { disasmPanel = null; setInstrStepMode(false); });
+// Wire a (new or VS-Code-restored) disassembly panel: render it, track it, and hook
+// its lifecycle + message handler. Shared by createDisasmPanel and the serializer so
+// restored panels are first-class (and receive updates) instead of orphaned.
+function adoptDisasmPanel(panel) {
+    disasmPanels.add(panel);
+    panel.webview.options = { enableScripts: true, retainContextWhenHidden: true };
+    panel.webview.html = disasmPanelHtml();
+    panel.onDidDispose(() => { disasmPanels.delete(panel); if (disasmPanels.size === 0) setInstrStepMode(false); });
     // Selecting the disassembly enters instruction mode. We only flip to instruction on
     // activation here; returning to statement mode happens when the user clicks a source
     // editor (onDidChangeActiveTextEditor), NOT when the panel merely loses focus — so
     // VS Code's reveal-on-stop can't knock us out of instruction stepping.
-    disasmPanel.onDidChangeViewState(e => { if (e.webviewPanel.active) setInstrStepMode(true); });
-    setInstrStepMode(true); // the user just opened it
-    setupDisasmMessageHandler(disasmPanel);
-
+    panel.onDidChangeViewState(e => { if (e.webviewPanel.active) setInstrStepMode(true); });
+    setupDisasmMessageHandler(panel);
     const session = vscode.debug.activeDebugSession;
     if (session && session.type === 'oric-debug') refreshDisasmPanel(session);
+}
+
+function createDisasmPanel() {
+    // Reveal the existing one rather than spawning a duplicate.
+    if (disasmPanels.size) { [...disasmPanels][0].reveal(); return; }
+    const panel = vscode.window.createWebviewPanel(
+        'oricDisassembly', 'Oric Disassembly',
+        vscode.ViewColumn.Two,
+        { enableScripts: true, retainContextWhenHidden: true }
+    );
+    adoptDisasmPanel(panel);
+    setInstrStepMode(true); // the user just opened it
 }
 
 function setupDisasmMessageHandler(panel) {
@@ -3093,15 +3107,15 @@ function doToggleWarp() {
 }
 
 function refreshDisasmPanel(session) {
-    if (!disasmPanel) return;
+    if (!disasmPanels.size) return;
     if (!session || session.type !== 'oric-debug') {
-        disasmPanel.webview.postMessage({ type: 'disasm', data: null });
+        for (const p of disasmPanels) p.webview.postMessage({ type: 'disasm', data: null });
         return;
     }
     session.customRequest('disassembleRange', {
         address: disasmCenterAddr, count: 64, before: 24
     }).then(resp => {
-        if (disasmPanel) disasmPanel.webview.postMessage({ type: 'disasm', data: resp });
+        for (const p of disasmPanels) p.webview.postMessage({ type: 'disasm', data: resp });
     }).catch(() => {});
 }
 
@@ -3142,7 +3156,7 @@ body {
     color: var(--vscode-descriptionForeground, #888);
     font-size: 0.9em; margin-left: auto;
 }
-table { width: 100%; border-collapse: collapse; user-select: none; table-layout: fixed; }
+table { width: 100%; border-collapse: collapse; user-select: text; table-layout: fixed; }
 tr { height: 20px; }
 /* Hover highlight marks the row the line actions will target — only while the
    debuggee is STOPPED (body.dbg-stopped, pushed by the extension); the PC row
@@ -3168,10 +3182,10 @@ td.bytes { color: var(--vscode-descriptionForeground, #666); width: 75px; }
 td.label-col { color: var(--vscode-symbolIcon-functionForeground, #75beff); font-weight: bold; width: 140px; overflow: hidden; text-overflow: ellipsis; }
 td.mnemonic { color: var(--vscode-symbolIcon-keywordForeground, #c586c0); font-weight: bold; width: 36px; }
 td.operand { color: var(--vscode-foreground); }
-td.pc-arrow { width: 18px; color: var(--vscode-debugIcon-startForeground, #89d185); font-weight: bold; }
+td.pc-arrow { width: 18px; color: var(--vscode-debugIcon-startForeground, #89d185); font-weight: bold; user-select: none; }
 /* Line-action buttons sit right after the operand text (6502 lines are short —
    far-right buttons were a mile from the instruction). */
-td.operand .acts { margin-left: 16px; }
+td.operand .acts { margin-left: 16px; user-select: none; }
 td.operand .act {
     visibility: hidden; cursor: pointer; padding: 0 6px;
     color: var(--vscode-descriptionForeground, #888);
@@ -5247,20 +5261,14 @@ function activate(context) {
     });
     vscode.window.registerWebviewPanelSerializer('oricDisassembly', {
         async deserializeWebviewPanel(panel) {
-            disasmPanel = panel;
-            panel.webview.options = { enableScripts: true, retainContextWhenHidden: true };
-            panel.webview.html = disasmPanelHtml();
-            panel.onDidDispose(() => { disasmPanel = null; setInstrStepMode(false); });
-            panel.onDidChangeViewState(e => { if (e.webviewPanel.active) setInstrStepMode(true); });
+            adoptDisasmPanel(panel);
             if (panel.active) setInstrStepMode(true);
-            setupDisasmMessageHandler(panel);
-            const session = vscode.debug.activeDebugSession;
-            if (session && session.type === 'oric-debug') refreshDisasmPanel(session);
         }
     });
 
     function isDisasmFocused() {
-        return disasmPanel && disasmPanel.active;
+        for (const p of disasmPanels) if (p.active) return true;
+        return false;
     }
 
     function refreshAll() {
