@@ -3172,20 +3172,29 @@ function routineBaseOf(addr) {
     return null;
 }
 
+// True when `addr` is EXACTLY a routine entry (a symbol sits right there), build
+// symbol or ROM symbol. A real `JSR foo` targets foo's entry; that's the signal we
+// use to tell a genuine return address from stack garbage.
+function isCallTarget(addr) {
+    return routineBaseOf(addr & 0xFFFF) === (addr & 0xFFFF);
+}
+
 // Walk the hardware stack (page 1) and identify JSR return addresses.
 //
 // JSR pushes (PC+2) — the last byte of the JSR — so a return address is
-// (stack word) + 1 and the JSR itself is 3 bytes before it. Scanning the raw
-// stack for that pattern gives false positives: deep in a routine the stack is
-// full of PHA/PHP saves and locals that coincidentally point 3 bytes past a $20.
+// (stack word) + 1 and the JSR itself is 3 bytes before it. Scanning the raw stack
+// for that pattern gives false positives: deep in a routine the stack is full of
+// PHA/PHP saves and locals that coincidentally point 3 bytes past a $20.
 //
-// To reject those, we require CHAIN CONSISTENCY: the JSR that produced a frame
-// must target the routine that contains the inner (callee) frame. Concretely, the
-// JSR operand's owning routine must equal the owning routine of the address one
-// level in (the current PC for the first frame; the previous return address after
-// that). This is what prunes the bogus $3101/$DF3E/... frames when stopped in a
-// ROM routine. When neither side has a symbol to compare (unsymbolized code), we
-// fall back to the old opcode-only acceptance so we never do worse than before.
+// Discriminator: a genuine return address sits right after `JSR <entry>`, i.e. the
+// call targets a KNOWN routine's exact entry (isCallTarget). Garbage 2-byte stack
+// values rarely point 3 bytes past a $20 whose operand is exactly a symbol, so this
+// drops them — while keeping real frames even across JMP trampolines (putchar2 →
+// $238 → JMP Char2Scr): the still-valid caller chain on the stack (putsloop, _main,
+// DoNextLine) all sit after JSRs to known entries and survive; the bogus $3101 /
+// SGN+$1D / $3710 frames don't. Chain-consistency isn't used (trampolines break it).
+// A fully source-less program (no symbols at all) yields only the top frame; the
+// reverse-engineering mode will add manual symbols to recover deeper frames.
 async function buildCallStack() {
     if (!regs || regs.sp === undefined) return [];
 
@@ -3198,49 +3207,32 @@ async function buildCallStack() {
     const readSize = Math.min(stackSize, 64);
     const stk = await readMem(stackAddr, readSize);
 
-    // Candidate return addresses (every 2-byte window) — need the JSR opcode AND
-    // its 2-byte operand at jsrAddr..jsrAddr+2 to verify + read the call target.
-    const candidates = [];
-    for (let pos = 0; pos + 1 < stk.length; pos++) {
-        const retAddr = (((stk[pos + 1] << 8) | stk[pos]) + 1) & 0xFFFF;
-        if (retAddr > 0x01FF && retAddr < 0xFFF0)
-            candidates.push((retAddr - 3) & 0xFFFF);
+    // Read + cache the 3 bytes at a JSR site (opcode + operand). Real return
+    // addresses point across the whole map (RAM C code AND ROM), so a single bulk
+    // range read isn't viable at a trampoline — verify each site on demand instead
+    // (readMem dedups, so repeats are cheap).
+    const jsrCache = new Map();
+    async function jsrAt(a) {
+        a &= 0xFFFF;
+        if (jsrCache.has(a)) return jsrCache.get(a);
+        const m = await readMem(a, 3);
+        const v = (m && m.length >= 3) ? { op: m[0], target: ((m[2] << 8) | m[1]) & 0xFFFF } : null;
+        jsrCache.set(a, v);
+        return v;
     }
-    if (candidates.length === 0) return [];
 
-    const minAddr = Math.min(...candidates);
-    const maxAddr = Math.max(...candidates) + 2;      // +2 to include the JSR operand
-    const rangeSize = maxAddr - minAddr + 1;
-    let verifyMem = null;
-    if (rangeSize > 0 && rangeSize <= 8192)
-        verifyMem = await readMem(minAddr, rangeSize);
-    const memAt = (a) => verifyMem ? verifyMem[(a & 0xFFFF) - minAddr] : undefined;
-
-    // Greedy scan with chain validation. `innerBase` is the routine we expect the
-    // next genuine JSR to have targeted — the current PC's routine to start with.
+    // Greedy scan: accept a slot only when it's the return of a `JSR <known entry>`.
     const frames = [];
-    let innerBase = routineBaseOf(regs.pc & 0xFFFF);
     let pos = 0;
     while (pos + 1 < stk.length && frames.length < 32) {
         const retAddr = (((stk[pos + 1] << 8) | stk[pos]) + 1) & 0xFFFF;
-        const jsrAddr = (retAddr - 3) & 0xFFFF;
         let accept = false;
-
-        if (retAddr > 0x01FF && retAddr < 0xFFF0 && (memAt(jsrAddr) === 0x20 || !verifyMem)) {
-            if (!verifyMem) {
-                accept = true;                        // no memory to verify — old behavior
-            } else {
-                const target = ((memAt(jsrAddr + 2) << 8) | memAt(jsrAddr + 1)) & 0xFFFF;
-                const tBase = routineBaseOf(target);
-                // Chain-consistent if the JSR target's routine == the inner frame's
-                // routine. If either side is unsymbolized, accept (can't disprove it).
-                accept = (innerBase === null || tBase === null) ? true : (tBase === innerBase);
-            }
+        if (retAddr > 0x01FF && retAddr < 0xFFF0) {
+            const j = await jsrAt((retAddr - 3) & 0xFFFF);
+            if (j && j.op === 0x20 && isCallTarget(j.target)) accept = true;
         }
-
         if (accept) {
             frames.push(retAddr);
-            innerBase = routineBaseOf(retAddr);       // next JSR should target THIS return site's routine
             pos += 2;
         } else {
             pos += 1;                                 // skip a byte (PHA/PHP or non-return data)
