@@ -815,7 +815,6 @@ function snapshotDir() {
     return path.join(base, '.oric-snapshots');
 }
 function snapshotFile(name) { return path.join(snapshotDir(), name + '.snapshot'); }
-let autoSnapSeq = 0;   // sequence for [save]-token auto snapshots
 // Tell the extension's snapshot panel to refresh (a DAP custom event).
 function snapshotsChanged() { try { evt('oricSnapshotsChanged', {}); } catch (e) { /* ignore */ } }
 // Save a snapshot to the project folder AND record it in the manifest (so it's
@@ -856,16 +855,26 @@ async function captureBaseline() {
     log('Captured restart baseline snapshot at the entry');
 }
 
+// Delete EVERY snapshot (incl. the restart baseline) and reset the manifest to
+// `newHash`. Snapshots hold the OLD program's RAM, so a binary change makes them
+// all unusable. Returns how many user snapshots were removed.
+function discardAllSnapshots(newHash) {
+    const m = readSnapshotManifest();
+    const names = Object.keys(m.snaps || {});
+    for (const n of names) { try { fs.unlinkSync(snapshotFile(n)); } catch (e) { /* ignore */ } }
+    try { fs.unlinkSync(snapshotFile(BASELINE)); } catch (e) { /* ignore */ }
+    writeSnapshotManifest({ hash: newHash || null, snaps: {} });
+    baselineReady = false;   // the baseline is gone too — no instant restart until re-captured
+    snapshotsChanged();
+    return names.length;
+}
+
 // Drop snapshots taken against a DIFFERENT binary (by checksum). Called at launch.
 function pruneStaleSnapshots() {
     if (!launchArtifactHash) return;
     const m = readSnapshotManifest();
     if (m.hash && m.hash !== launchArtifactHash) {
-        const names = Object.keys(m.snaps || {});
-        for (const n of names) { try { fs.unlinkSync(snapshotFile(n)); } catch (e) { /* ignore */ } }
-        try { fs.unlinkSync(snapshotFile(BASELINE)); } catch (e) { /* ignore */ }   // the restart baseline is stale too
-        log('Snapshots invalidated (binary changed) — cleared ' + names.length);
-        writeSnapshotManifest({ hash: launchArtifactHash, snaps: {} });
+        log('Snapshots invalidated (binary changed) — cleared ' + discardAllSnapshots(launchArtifactHash));
     } else if (m.hash !== launchArtifactHash) {
         writeSnapshotManifest({ hash: launchArtifactHash, snaps: m.snaps || {} });
     }
@@ -1828,12 +1837,15 @@ async function onStopReply(payload) {
                 catch (e) { line = '[logpoint error: ' + (e && e.message ? e.message : e) + ']'; }
                 evt('output', { category: 'console', output: '\x1b[36m' + line + '\x1b[0m\n' });
                 if (doSnap) {
-                    // Self-describing name: <file>-<func>-L<line>-<seq>, so an auto
-                    // snapshot is findable later (line alone isn't enough).
+                    // Self-describing name: <file>-<func>-L<line>, so it's findable
+                    // later (line alone isn't enough). NO sequence — a [save] point
+                    // OVERWRITES its own snapshot each hit (you want the latest state
+                    // at that point, not a pile of per-iteration files). Snapshot a
+                    // specific iteration with a conditional logpoint instead.
                     const fileBase = (bp.source && (bp.source.name || (bp.source.path ? path.basename(bp.source.path) : ''))) || '';
                     const fnRaw = currentFunction(regs.pc);
                     const fn = fnRaw ? fnRaw.replace(/^_+/, '') : '';
-                    const nm = [fileBase, fn, bp.line ? 'L' + bp.line : ''].filter(Boolean).join('-') + '-' + (++autoSnapSeq);
+                    const nm = [fileBase, fn, bp.line ? 'L' + bp.line : ''].filter(Boolean).join('-') || 'auto';
                     const sv = await doSaveSnapshot(nm);
                     evt('output', { category: 'console', output: '\x1b[36m' + (sv.error ? '[save failed: ' + sv.error + ']' : '[snapshot saved: ' + sv.name + ']') + '\x1b[0m\n' });
                 }
@@ -1909,6 +1921,20 @@ async function reconcileMonitorBreakpoints() {
     for (const a of armedAddrs.keys()) if (!stubAddrs.has(a)) removed.push(locFor(a));
 
     if (added.length || removed.length) evt('oricMonitorBreakpoints', { added, removed });
+}
+
+// After loading a snapshot the emulator's exec-breakpoint table is whatever the
+// snapshot captured (snapshot.c saves cpu.breakpoints) — which may not match the
+// debugger's current set. Bring the emulator back in line with armedAddrs so a
+// later reconcileMonitorBreakpoints doesn't see a phantom delta and mutate VS
+// Code's breakpoints, and so no breakpoint is silently missing from the machine.
+async function resyncStubBreakpoints() {
+    const reply = await gdbCmd('qOricBreakpoints');
+    if (typeof reply !== 'string' || !reply.startsWith('bp:')) return;
+    const stub = new Set();
+    for (const tok of reply.slice(3).split(',')) { const a = parseInt(tok, 16); if (!isNaN(a)) stub.add(a & 0xffff); }
+    for (const a of stub) if (!armedAddrs.has(a)) await gdbCmd('z0,' + a.toString(16) + ',1');       // drop stale (snapshot) bp
+    for (const a of armedAddrs.keys()) if (!stub.has(a)) await gdbCmd('Z0,' + a.toString(16) + ',1'); // re-arm a bp the snapshot lacked
 }
 
 // Emit the stopped event — used by onStopReply and by source-level stepping
@@ -3198,6 +3224,73 @@ function handleDap(msg) {
     }
 }
 
+// Full relaunch from within the restart handler: kill the current emulator,
+// re-spawn (same as launch's Step 2a/2b) and reconnect (Step 3). Used when the
+// binary changed — a hard reset can't reload a tape program, and terminated{restart}
+// loops back into restart while spawning a second emulator. Mirrors launch so a
+// rebuild-restart behaves exactly like a fresh Start. Responds to `req` itself.
+async function relaunchEmulator(req) {
+    const host = config.host || 'localhost';
+    const port = config.port || 6502;
+
+    // Tear down. `disconnecting` guards the socket-close handler from firing a stray
+    // 'terminated' (which would end the whole session mid-relaunch).
+    disconnecting = true;
+    if (sock) { try { gdbWrite('D'); } catch (_) { /* ignore */ } try { sock.destroy(); } catch (_) { /* ignore */ } sock = null; }
+    if (scriptLaunched) { killByPort(port); scriptLaunched = false; }
+    else if (launchedProcess) { try { launchedProcess.kill(); } catch (_) { /* ignore */ } launchedProcess = null; }
+    running = false; configDone = false; pendingStop = null; regs = null;
+    awaitingEntry = false; moduleByteTrusted = false; baselineReady = false;
+    await new Promise(r => setTimeout(r, 700));   // let the old emulator release the gdb port
+    disconnecting = false;
+
+    // Re-spawn (mirror launch Step 2a/2b).
+    if (config.launchScript) {
+        const scriptCwd = config.cwd || (config.build && config.build.cwd) || process.cwd();
+        const osdkEnv = await harvestOsdkConfig(scriptCwd);
+        const entry = (config.gdbBreak || osdkEnv.OSDKADDR || '').toString().trim().replace(/^\$/, '').replace(/^0x/i, '');
+        initBreakAddr = /^[0-9a-fA-F]+$/.test(entry) ? parseInt(entry, 16) & 0xffff : -1;
+        entryAddr = initBreakAddr;
+        if (await probePort(host, port)) { respond(req, {}, false, 'gdb port ' + port + ' still in use after relaunch — close the old Oricutron and retry'); return; }
+        const launchEnv = { OSDKGDBPORT: String(port) };
+        if (initBreakAddr >= 0) launchEnv.OSDKGDBBREAK = initBreakAddr.toString(16);
+        log('Relaunching via ' + config.launchScript + ' (gdb port ' + port + (initBreakAddr >= 0 ? ', entry $' + initBreakAddr.toString(16) : '') + ')');
+        const runner = spawnOsdk(config.launchScript, { cwd: scriptCwd, env: launchEnv });
+        if (runner.stdout) runner.stdout.on('data', d => evt('output', { category: 'stdout', output: d.toString() }));
+        if (runner.stderr) runner.stderr.on('data', d => evt('output', { category: 'stderr', output: d.toString() }));
+        runner.on('error', err => log('Relaunch script failed to start: ' + err.message));
+        scriptLaunched = true;
+    } else if (config.emulatorPath) {
+        const emuArgs = [config.diskImage, '--gdb_port', String(port), '-s', 'symbols', ...(config.emulatorArgs || [])];
+        const emuCwd = config.emulatorCwd || path.dirname(config.emulatorPath);
+        log('Relaunching: ' + config.emulatorPath + ' ' + emuArgs.join(' '));
+        launchedProcess = child_process.spawn(config.emulatorPath, emuArgs, { cwd: emuCwd, detached: false, windowsHide: false });
+        launchedProcess.on('close', (code) => { launchedProcess = null; if (!disconnecting) { log('Emulator exited (code ' + code + ')'); evt('terminated'); } });
+        if (launchedProcess.stdout) launchedProcess.stdout.on('data', d => evt('output', { category: 'stdout', output: d.toString() }));
+        if (launchedProcess.stderr) launchedProcess.stderr.on('data', d => evt('output', { category: 'stderr', output: d.toString() }));
+    } else {
+        respond(req, {}, false, 'Cannot relaunch: launch config has no launchScript or emulatorPath'); return;
+    }
+
+    // Reconnect (mirror launch Step 3).
+    const retries = config.connectRetries || 10;
+    const retryDelay = config.connectRetryDelay || 1000;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            await gdbConnect(host, port);
+            log('Connected to Oricutron at ' + host + ':' + port);
+            const reply = await gdbCmd('?');
+            if (reply) regs = parseStopRegs(reply);
+            respond(req);
+            evt('initialized');
+            return;
+        } catch (e) {
+            if (attempt < retries) { if (attempt === 0) log('Waiting for Oricutron on ' + host + ':' + port + '...'); await new Promise(r => setTimeout(r, retryDelay)); }
+        }
+    }
+    respond(req, {}, false, 'Could not reconnect to Oricutron after relaunch');
+}
+
 // ----------------------------------------------------------------
 // DAP request handlers
 // ----------------------------------------------------------------
@@ -3289,6 +3382,7 @@ const handlers = {
 
     async launch(req) {
         config = req.arguments || {};
+        disconnecting = false; // reset — a reused adapter process (e.g. after a terminated{restart} relaunch) must not start a launch in the disconnecting state
         logSessionBanner();
         moduleByteTrusted = false; // fresh boot — don't believe the module byte until the loader stamps it
         if (config.logLevel !== undefined) logLevel = config.logLevel;
@@ -3301,7 +3395,11 @@ const handlers = {
         // Hash the disk image now, so a later `reloadsymbols` can tell a
         // byte-identical rebuild (safe to reload symbols in place) from a real
         // rebuild (emulator holds a stale binary — needs a relaunch).
-        launchArtifactPath = config.diskImage || null;
+        // Artifact whose checksum decides snapshot validity: the disk image if set,
+        // else the build output (e.g. the .tap that actually gets loaded — OSDK tape
+        // projects have no diskImage). Without this the hash is null and snapshot
+        // invalidation is inert.
+        launchArtifactPath = config.diskImage || (config.build && config.build.output) || null;
         launchArtifactHash = launchArtifactPath ? hashFile(launchArtifactPath) : null;
         pruneStaleSnapshots();   // drop snapshots taken against a different binary (checksum, not timestamp)
 
@@ -3569,17 +3667,40 @@ const handlers = {
         pendingStop = null;
         running = false;
 
+        // Binary changed? (rebuilt in Step 1, or an external rebuild — re-hash the
+        // disk image and compare to what the snapshots were taken against.) If so,
+        // every snapshot holds the OLD program's RAM and is unusable — discard them
+        // all and force the hard-reset path (which reloads the new binary).
+        let binaryChanged = rebuilt;
+        if (launchArtifactPath) {
+            const nowHash = hashFile(launchArtifactPath);
+            if (nowHash && nowHash !== launchArtifactHash) { binaryChanged = true; launchArtifactHash = nowHash; }
+        }
+        if (binaryChanged) {
+            const n = discardAllSnapshots(launchArtifactHash);
+            log('Binary changed on restart — discarded all snapshots' + (n ? ' (' + n + ' user)' : '') + '; relaunching to load the new build');
+            // A hard reset can't reload a tape program (and doesn't reliably
+            // re-autoload one), so it would reboot to ROM/BASIC without the new
+            // build. Do an explicit relaunch — kill this emulator and re-spawn +
+            // reconnect exactly like a fresh Start — so the rebuilt media loads.
+            // (terminated{restart} is NOT usable here: VS Code re-invokes restart
+            // rather than launch, and spawns a second emulator without killing this
+            // one.) Works for both tape and disk projects.
+            await relaunchEmulator(req);
+            return;
+        }
+
         // --- Step 3a: Instant restart via the entry baseline snapshot ---
-        // If nothing was rebuilt (same binary in RAM) and we captured a baseline at
-        // launch, reload it: no ROM boot, no tape load. configurationDone then just
-        // stops at the restored entry. Falls back to the hard reset below on any
-        // problem. (A rebuild changes the binary, so the baseline is stale — skip it.)
-        if (scriptLaunched && baselineReady && !rebuilt && fs.existsSync(snapshotFile(BASELINE))) {
+        // Same binary in RAM and a baseline captured at launch: reload it — no ROM
+        // boot, no tape load. configurationDone then just stops at the restored
+        // entry. Falls back to the hard reset below on any problem.
+        if (scriptLaunched && baselineReady && !binaryChanged && fs.existsSync(snapshotFile(BASELINE))) {
             const r = await gdbCmd('qOricLoadSnapshot,' + Buffer.from(snapshotFile(BASELINE), 'utf8').toString('hex'));
             if (!(typeof r === 'string' && r.indexOf('E snapshot') === 0)) {
                 regs = parseStopRegs(r);
                 moduleByteTrusted = false;
                 clearGdbReadCache();
+                await resyncStubBreakpoints();   // realign the emulator's bp table with the debugger's set
                 restartViaSnapshot = true;
                 log('Restart via baseline snapshot (instant), PC=$' + (regs && regs.pc !== undefined ? regs.pc.toString(16).toUpperCase().padStart(4, '0') : '??'));
                 respond(req);
@@ -5016,11 +5137,23 @@ const handlers = {
     // no #MODULE section (or with no module info) are resident ('R').
     getBreakpointModules(req) {
         const files = (req.arguments && req.arguments.files) || [];
+        const locs = (req.arguments && req.arguments.locs) || [];
         const byFile = {};
         for (const f of files) byFile[f] = fileToModules.get(canonPath(f)) || ['R'];
         const modules = [{ id: 'R', name: 'Resident' }];
         for (const [id, name] of moduleNames) modules.push({ id, name });
-        respond(req, { modules, byFile });
+        // Bound (snapped) line for each requested bp line — a line with no code of
+        // its own (e.g. an assignment folded into adjacent statements) binds to the
+        // next line that has code. Returned so the panel shows the same line VS Code
+        // does instead of the requested one.
+        const snaps = {};
+        if (resolverInstance) {
+            for (const loc of locs) {
+                const s = resolverInstance.addrForLine(loc.file, loc.line);
+                if (s && s.line && s.line !== loc.line) snaps[loc.file + ':' + loc.line] = s.line;
+            }
+        }
+        respond(req, { modules, byFile, snaps });
     },
 
     async setActiveModule(req) {
@@ -5109,6 +5242,7 @@ const handlers = {
         regs = parseStopRegs(r);   // r is the post-restore stop reply
         running = false;
         clearGdbReadCache();
+        await resyncStubBreakpoints();   // realign the emulator's bp table with the debugger's set
         log('Snapshot restored: ' + name + ' (PC=$' + (regs && regs.pc !== undefined ? regs.pc.toString(16).toUpperCase().padStart(4, '0') : '??') + ')');
         respond(req, { name });
         evt('stopped', { reason: 'restore', threadId: 1, allThreadsStopped: true });
