@@ -4713,6 +4713,69 @@ function activate(context) {
     );
     rebuildBpTree();
 
+    // ---- Oric Snapshots panel (TreeView) --------------------------------------
+    // Lists the project's snapshots (from the adapter). Restore on click, inline
+    // restore/delete/rename; refreshes on the adapter's oricSnapshotsChanged event
+    // (covers the [save] logpoint token) and on session start/stop.
+    let snapItems = [];
+    const snapEmitter = new vscode.EventEmitter();
+    async function refreshSnapshots() {
+        const s = vscode.debug.activeDebugSession;
+        if (!s || s.type !== 'oric-debug') { snapItems = []; snapEmitter.fire(); return; }
+        try { const r = await s.customRequest('listSnapshots'); snapItems = (r && r.snapshots) || []; }
+        catch (e) { snapItems = []; }
+        snapEmitter.fire();
+    }
+    const snapTreeProvider = {
+        onDidChangeTreeData: snapEmitter.event,
+        getChildren() {
+            if (!vscode.debug.activeDebugSession) return [{ kind: 'hint', label: '(start a debug session to see snapshots)' }];
+            if (!snapItems.length) return [{ kind: 'hint', label: '(no snapshots — use Save Snapshot)' }];
+            return snapItems.map(x => ({ kind: 'snap', snap: x }));
+        },
+        getTreeItem(el) {
+            if (el.kind === 'hint') { const it = new vscode.TreeItem(el.label); it.contextValue = 'oricSnapHint'; return it; }
+            const x = el.snap;
+            const it = new vscode.TreeItem(x.name);
+            const when = x.at ? new Date(x.at).toLocaleTimeString() : '';
+            const pc = x.pc != null ? 'PC $' + (x.pc & 0xFFFF).toString(16).toUpperCase().padStart(4, '0') : '';
+            it.description = [pc, when].filter(Boolean).join('  ·  ');
+            it.contextValue = 'oricSnap';
+            it.iconPath = new vscode.ThemeIcon('history');
+            it.id = 'snap:' + x.name;
+            // Click restores (the panel's whole point is quick revert).
+            it.command = { command: 'oric-debug.snapshotRestoreItem', title: 'Restore', arguments: [el] };
+            return it;
+        }
+    };
+    const snapTree = vscode.window.createTreeView('oricSnapshots', { treeDataProvider: snapTreeProvider });
+    const snapSession = () => { const s = vscode.debug.activeDebugSession; return (s && s.type === 'oric-debug') ? s : null; };
+    context.subscriptions.push(
+        snapTree,
+        vscode.debug.onDidReceiveDebugSessionCustomEvent(e => { if (e.event === 'oricSnapshotsChanged') refreshSnapshots(); }),
+        vscode.debug.onDidStartDebugSession(() => setTimeout(refreshSnapshots, 300)),
+        vscode.debug.onDidTerminateDebugSession(() => refreshSnapshots()),
+        vscode.commands.registerCommand('oric-debug.snapshotRefresh', () => refreshSnapshots()),
+        vscode.commands.registerCommand('oric-debug.snapshotRestoreItem', async node => {
+            const s = snapSession(); if (!s || !node || !node.snap) return;
+            try { await s.customRequest('restoreSnapshot', { name: node.snap.name }); vscode.window.setStatusBarMessage('Oric: restored "' + node.snap.name + '"', 3000); }
+            catch (e) { vscode.window.showErrorMessage('Restore failed: ' + (e && e.message ? e.message : e)); }
+        }),
+        vscode.commands.registerCommand('oric-debug.snapshotDeleteItem', async node => {
+            const s = snapSession(); if (!s || !node || !node.snap) return;
+            try { await s.customRequest('deleteSnapshot', { name: node.snap.name }); }
+            catch (e) { vscode.window.showErrorMessage('Delete failed: ' + (e && e.message ? e.message : e)); }
+        }),
+        vscode.commands.registerCommand('oric-debug.snapshotRenameItem', async node => {
+            const s = snapSession(); if (!s || !node || !node.snap) return;
+            const to = await vscode.window.showInputBox({ prompt: 'Rename snapshot', value: node.snap.name, ignoreFocusOut: true });
+            if (!to || to === node.snap.name) return;
+            try { await s.customRequest('renameSnapshot', { name: node.snap.name, to }); }
+            catch (e) { vscode.window.showErrorMessage('Rename failed: ' + (e && e.message ? e.message : e)); }
+        })
+    );
+    if (snapSession()) refreshSnapshots();
+
     // Re-read source @annotations into the running adapter — no rebuild, no lost
     // debugger state. Panels/watch refresh via the adapter's oricSymbolsChanged
     // event; refreshAll() also updates registers + the inline instruction hint.

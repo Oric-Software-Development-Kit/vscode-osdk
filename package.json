@@ -120,6 +120,10 @@
                 {
                     "id": "oricBreakpoints",
                     "name": "Oric Breakpoints"
+                },
+                {
+                    "id": "oricSnapshots",
+                    "name": "Oric Snapshots"
                 }
             ],
             "oricDebugPanel": [
@@ -195,6 +199,26 @@
             {
                 "command": "oric-debug.snapshotDelete",
                 "title": "Oric: Delete Snapshot"
+            },
+            {
+                "command": "oric-debug.snapshotRefresh",
+                "title": "Oric: Refresh Snapshots",
+                "icon": "$(refresh)"
+            },
+            {
+                "command": "oric-debug.snapshotRestoreItem",
+                "title": "Restore",
+                "icon": "$(history)"
+            },
+            {
+                "command": "oric-debug.snapshotDeleteItem",
+                "title": "Delete",
+                "icon": "$(trash)"
+            },
+            {
+                "command": "oric-debug.snapshotRenameItem",
+                "title": "Rename",
+                "icon": "$(edit)"
             },
             {
                 "command": "oric-debug.openMemoryView",
@@ -351,9 +375,17 @@
         "menus": {
             "view/title": [
                 { "command": "oric-debug.bpEnableAll", "when": "view == oricBreakpoints", "group": "navigation@1" },
-                { "command": "oric-debug.bpDisableAll", "when": "view == oricBreakpoints", "group": "navigation@2" }
+                { "command": "oric-debug.bpDisableAll", "when": "view == oricBreakpoints", "group": "navigation@2" },
+                { "command": "oric-debug.snapshotSave", "when": "view == oricSnapshots", "group": "navigation@1" },
+                { "command": "oric-debug.snapshotRefresh", "when": "view == oricSnapshots", "group": "navigation@2" }
             ],
             "view/item/context": [
+                { "command": "oric-debug.snapshotRestoreItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "inline@1" },
+                { "command": "oric-debug.snapshotRenameItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "inline@2" },
+                { "command": "oric-debug.snapshotDeleteItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "inline@3" },
+                { "command": "oric-debug.snapshotRestoreItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "1_snap@1" },
+                { "command": "oric-debug.snapshotRenameItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "1_snap@2" },
+                { "command": "oric-debug.snapshotDeleteItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "1_snap@3" },
                 { "command": "oric-debug.bpEnableModule", "when": "view == oricBreakpoints && viewItem == oricModule", "group": "inline@1" },
                 { "command": "oric-debug.bpDisableModule", "when": "view == oricBreakpoints && viewItem == oricModule", "group": "inline@2" },
                 { "command": "oric-debug.bpEnableModule", "when": "view == oricBreakpoints && viewItem == oricModule", "group": "1_mod@1" },

@@ -815,6 +815,27 @@ function snapshotDir() {
     return path.join(base, '.oric-snapshots');
 }
 function snapshotFile(name) { return path.join(snapshotDir(), name + '.snapshot'); }
+let autoSnapSeq = 0;   // sequence for [save]-token auto snapshots
+// Tell the extension's snapshot panel to refresh (a DAP custom event).
+function snapshotsChanged() { try { evt('oricSnapshotsChanged', {}); } catch (e) { /* ignore */ } }
+// Save a snapshot to the project folder AND record it in the manifest (so it's
+// listed). Shared by the saveSnapshot request and the [save] logpoint token.
+// Returns { name } or { error }. (captureBaseline stays separate — the baseline is
+// hidden and not manifested.)
+async function doSaveSnapshot(rawName) {
+    const name = String(rawName || 'snap').replace(/[^\w.-]/g, '_').slice(0, 64) || 'snap';
+    try { fs.mkdirSync(snapshotDir(), { recursive: true }); } catch (e) { /* ignore */ }
+    const r = await gdbCmd('qOricSaveSnapshot,' + Buffer.from(snapshotFile(name), 'utf8').toString('hex'));
+    if (typeof r === 'string' && r.indexOf('E snapshot') === 0) return { error: r.slice(2).trim() };
+    const m = readSnapshotManifest();
+    m.hash = launchArtifactHash || m.hash;
+    m.snaps = m.snaps || {};
+    m.snaps[name] = { pc: regs ? regs.pc : null, at: Date.now() };
+    writeSnapshotManifest(m);
+    log('Snapshot saved: ' + name);
+    snapshotsChanged();
+    return { name };
+}
 function readSnapshotManifest() {
     try { return JSON.parse(fs.readFileSync(path.join(snapshotDir(), 'manifest.json'), 'utf8')); }
     catch (e) { return { hash: null, snaps: {} }; }
@@ -1790,9 +1811,9 @@ async function onStopReply(payload) {
     // Print every logpoint at this PC; if nothing else here would stop, resume
     // transparently (step off the bp first, then continue — same as `continue`).
     // A message containing "[stop]" logs AND stops (VS Code allows only a
-    // logpoint OR a plain bp per line — this is how to get both at once).
-    // Logpoint output is cyan (ANSI) so it stands out from the emulator's own
-    // stdout in the Debug Console.
+    // logpoint OR a plain bp per line — this is how to get both at once); "[save]"
+    // also snapshots the machine on hit. Logpoint output is cyan (ANSI) so it
+    // stands out from the emulator's own stdout in the Debug Console.
     if (watchAddr === null && regs && regs.pc !== undefined) {
         const logs = logpointsAt(regs.pc);
         if (logs.length) {
@@ -1800,10 +1821,22 @@ async function onStopReply(payload) {
             for (const bp of logs) {
                 let raw = bp.logMessage;
                 if (/\[stop\]/i.test(raw)) { forceStop = true; raw = raw.replace(/\s*\[stop\]\s*/ig, ' ').trim(); }
+                const doSnap = /\[save\]/i.test(raw);
+                if (doSnap) raw = raw.replace(/\s*\[save\]\s*/ig, ' ').trim();
                 let line;
                 try { line = await interpolateLog(raw); }
                 catch (e) { line = '[logpoint error: ' + (e && e.message ? e.message : e) + ']'; }
                 evt('output', { category: 'console', output: '\x1b[36m' + line + '\x1b[0m\n' });
+                if (doSnap) {
+                    // Self-describing name: <file>-<func>-L<line>-<seq>, so an auto
+                    // snapshot is findable later (line alone isn't enough).
+                    const fileBase = (bp.source && (bp.source.name || (bp.source.path ? path.basename(bp.source.path) : ''))) || '';
+                    const fnRaw = currentFunction(regs.pc);
+                    const fn = fnRaw ? fnRaw.replace(/^_+/, '') : '';
+                    const nm = [fileBase, fn, bp.line ? 'L' + bp.line : ''].filter(Boolean).join('-') + '-' + (++autoSnapSeq);
+                    const sv = await doSaveSnapshot(nm);
+                    evt('output', { category: 'console', output: '\x1b[36m' + (sv.error ? '[save failed: ' + sv.error + ']' : '[snapshot saved: ' + sv.name + ']') + '\x1b[0m\n' });
+                }
             }
             if (!forceStop && !stoppingBpAt(regs.pc)) {
                 resumeMode = 'run';
@@ -5049,18 +5082,23 @@ const handlers = {
 
     // -- Snapshots: save / restore / list (custom requests) -----------
     async saveSnapshot(req) {
-        const raw = (req.arguments && req.arguments.name) || 'snap';
-        const name = String(raw).replace(/[^\w.-]/g, '_').slice(0, 64) || 'snap';
-        try { fs.mkdirSync(snapshotDir(), { recursive: true }); } catch (e) { /* ignore */ }
-        const r = await gdbCmd('qOricSaveSnapshot,' + Buffer.from(snapshotFile(name), 'utf8').toString('hex'));
-        if (typeof r === 'string' && r.indexOf('E snapshot') === 0) { respond(req, {}, false, r.slice(2).trim()); return; }
+        const r = await doSaveSnapshot((req.arguments && req.arguments.name) || 'snap');
+        if (r.error) { respond(req, {}, false, r.error); return; }
+        respond(req, { name: r.name });
+    },
+    async renameSnapshot(req) {
+        const from = req.arguments && req.arguments.name;
+        const toRaw = req.arguments && req.arguments.to;
+        if (!from || !toRaw) { respond(req, {}, false, 'rename needs name + to'); return; }
+        const to = String(toRaw).replace(/[^\w.-]/g, '_').slice(0, 64);
+        if (!to) { respond(req, {}, false, 'invalid new name'); return; }
+        try { fs.renameSync(snapshotFile(from), snapshotFile(to)); }
+        catch (e) { respond(req, {}, false, 'rename failed: ' + e.message); return; }
         const m = readSnapshotManifest();
-        m.hash = launchArtifactHash || m.hash;
-        m.snaps = m.snaps || {};
-        m.snaps[name] = { pc: regs ? regs.pc : null, at: Date.now() };
+        if (m.snaps && m.snaps[from]) { m.snaps[to] = m.snaps[from]; delete m.snaps[from]; }
         writeSnapshotManifest(m);
-        log('Snapshot saved: ' + name);
-        respond(req, { name });
+        snapshotsChanged();
+        respond(req, { name: to });
     },
     async restoreSnapshot(req) {
         const name = req.arguments && req.arguments.name;
@@ -5090,6 +5128,7 @@ const handlers = {
         const m = readSnapshotManifest();
         if (m.snaps) delete m.snaps[name];
         writeSnapshotManifest(m);
+        snapshotsChanged();
         respond(req, { name });
     },
 
