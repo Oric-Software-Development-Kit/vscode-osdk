@@ -108,6 +108,11 @@
         "views": {
             "debug": [
                 {
+                    "id": "oricDebugControls",
+                    "name": "Oric Debug Controls",
+                    "type": "webview"
+                },
+                {
                     "id": "oricCpuRegs",
                     "name": "Oric Registers",
                     "type": "webview"

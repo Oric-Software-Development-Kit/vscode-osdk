@@ -2552,6 +2552,7 @@ let lineActionLens = null;    // created in activate(); refreshed on stop/contin
 let currentStopLoc = null;    // {path, line} of the top stack frame while stopped (null = no source)
 let bpTreeEmitter = null;     // Oric Breakpoints tree refresh signal (created in activate)
 let activeOricModuleId = null; // active overlay module id (for the breakpoint tree's follow/highlight)
+let debugControlsProvider = null; // Oric Debug Controls webview view (button toolbar in the Run & Debug sidebar)
 
 // Central stopped-state switch: gates the source CodeLens AND the disasm
 // panel's line actions (the webview hides its buttons/menu while the program
@@ -2562,6 +2563,7 @@ function setOricDebugStopped(v) {
     if (lineActionLens) lineActionLens.refresh();
     if (bpTreeEmitter) bpTreeEmitter.fire();   // clear/redraw the "stopped here" marker
     pushDebugStateToDisasm();
+    if (debugControlsProvider) debugControlsProvider.pushState();
 }
 
 // Array-valued context key for the line-number gutter menu: the PC line when
@@ -2577,6 +2579,102 @@ function updatePcLineContext() {
 }
 function pushDebugStateToDisasm() {
     for (const p of disasmPanels) p.webview.postMessage({ type: 'debugState', stopped: oricDebugStopped });
+}
+
+// Custom debug-control toolbar as a webview VIEW in the Run & Debug sidebar (always
+// present, next to Registers/Variables/Call Stack). Unlike a toolbar inside the
+// disassembly panel, focusing this doesn't flip VS Code into instruction stepping,
+// so its buttons drive C-statement stepping AND assembler stepping. Buttons carry
+// PRINTED labels (no tooltip reliance) and just fire VS Code's built-in debug
+// commands, which dispatch to our adapter.
+function debugControlsHtml() {
+    return `<!DOCTYPE html>
+<html><head><style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size, 13px); color: var(--vscode-foreground); padding: 6px; }
+.grp { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 6px; }
+.grp:last-child { margin-bottom: 0; }
+.dbg-btn {
+    display: inline-flex; align-items: center; gap: 5px;
+    background: var(--vscode-button-secondaryBackground, #3a3d41);
+    color: var(--vscode-button-secondaryForeground, #ccc);
+    border: 1px solid var(--vscode-widget-border, #555);
+    border-radius: 4px; padding: 5px 9px; cursor: pointer;
+    font-family: inherit; font-size: inherit; white-space: nowrap; flex: 0 0 auto;
+}
+.dbg-btn:hover:not(:disabled) { background: var(--vscode-button-secondaryHoverBackground, #45494e); }
+.dbg-btn:disabled { opacity: 0.35; cursor: default; }
+.dbg-btn .ic { font-size: 1.1em; line-height: 1; }
+.dbg-btn.go .ic   { color: var(--vscode-debugIcon-continueForeground, #89d185); }
+.dbg-btn.stop .ic { color: var(--vscode-debugIcon-stopForeground, #f48771); }
+.dbg-btn.rev .ic  { color: var(--vscode-debugIcon-stepBackForeground, #75beff); }
+</style></head><body>
+<div class="grp">
+    <button class="dbg-btn go" data-act="continue"><span class="ic">&#9654;</span>Continue</button>
+    <button class="dbg-btn" data-act="stepOver"><span class="ic">&#8631;</span>Step Over</button>
+    <button class="dbg-btn" data-act="stepInto"><span class="ic">&#8628;</span>Step Into</button>
+    <button class="dbg-btn" data-act="stepOut"><span class="ic">&#8630;</span>Step Out</button>
+</div>
+<div class="grp">
+    <button class="dbg-btn rev" data-act="stepBack"><span class="ic">&#9664;</span>Step Back</button>
+    <button class="dbg-btn rev" data-act="reverse"><span class="ic">&#9194;</span>Reverse</button>
+</div>
+<div class="grp">
+    <button class="dbg-btn" data-act="pause"><span class="ic">&#9208;</span>Pause</button>
+    <button class="dbg-btn" data-act="restart"><span class="ic">&#8635;</span>Restart</button>
+    <button class="dbg-btn stop" data-act="stop"><span class="ic">&#9632;</span>Stop</button>
+</div>
+<script>
+const vscode = acquireVsCodeApi();
+let stopped = true, active = false;
+document.body.addEventListener('click', e => {
+    const b = e.target.closest('button.dbg-btn');
+    if (b && !b.disabled) vscode.postMessage({ type: 'debugAction', action: b.dataset.act });
+});
+function apply() {
+    const set = (act, on) => { const b = document.querySelector('[data-act="' + act + '"]'); if (b) b.disabled = !on; };
+    // No session -> everything disabled; else forward/reverse when stopped, Pause when running.
+    ['continue','stepOver','stepInto','stepOut','stepBack','reverse'].forEach(a => set(a, active && stopped));
+    set('pause', active && !stopped);
+    set('restart', active);
+    set('stop', active);
+}
+window.addEventListener('message', e => { if (e.data && e.data.type === 'state') { active = !!e.data.active; stopped = !!e.data.stopped; apply(); } });
+apply();
+</script>
+</body></html>`;
+}
+
+class DebugControlsWebviewProvider {
+    constructor() { this._view = null; }
+    resolveWebviewView(view) {
+        this._view = view;
+        view.webview.options = { enableScripts: true };
+        view.webview.html = debugControlsHtml();
+        view.webview.onDidReceiveMessage(msg => {
+            if (!msg || msg.type !== 'debugAction') return;
+            const CMD = {
+                continue: 'workbench.action.debug.continue',
+                stepOver: 'workbench.action.debug.stepOver',
+                stepInto: 'workbench.action.debug.stepInto',
+                stepOut: 'workbench.action.debug.stepOut',
+                stepBack: 'workbench.action.debug.stepBack',
+                reverse: 'workbench.action.debug.reverseContinue',
+                pause: 'workbench.action.debug.pause',
+                restart: 'workbench.action.debug.restart',
+                stop: 'workbench.action.debug.stop'
+            };
+            const cmd = CMD[msg.action];
+            if (cmd) vscode.commands.executeCommand(cmd);
+        });
+        this.pushState();
+    }
+    pushState() {
+        if (!this._view) return;
+        const s = vscode.debug.activeDebugSession;
+        const active = !!(s && s.type === 'oric-debug');
+        this._view.webview.postMessage({ type: 'state', active, stopped: oricDebugStopped });
+    }
 }
 function setInstrStepMode(on) {
     on = !!on;
@@ -5051,7 +5149,11 @@ function activate(context) {
     const regsProvider = new RegistersWebviewProvider();
     const periphProvider = new PeripheralsWebviewProvider();
 
+    debugControlsProvider = new DebugControlsWebviewProvider();
     context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider('oricDebugControls', debugControlsProvider),
+        vscode.debug.onDidStartDebugSession(() => debugControlsProvider.pushState()),
+        vscode.debug.onDidTerminateDebugSession(() => debugControlsProvider.pushState()),
         vscode.window.registerWebviewViewProvider('oricCpuRegs', regsProvider),
         vscode.window.registerWebviewViewProvider('oricPeripherals', periphProvider),
         vscode.commands.registerCommand('oric-debug.openMemoryView', () => createMemoryPanel(context)),
