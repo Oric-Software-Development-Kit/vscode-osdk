@@ -3955,21 +3955,21 @@ const handlers = {
         const top = makeFrame(0, pc);
         const stackFrames = [top];
 
-        // Walk the hardware stack to find JSR return addresses. When the PC is in
-        // ROM / unsymbolized code (top frame has no source), two things go wrong:
-        //  - the stack-scan unwind can't be trusted (JMP trampolines like
-        //    putjar → $238 → JMP Char2Scr push no return address, so the chain
-        //    breaks and deeper frames are often false positives), and
-        //  - more importantly, VS Code auto-reveals the first DEEPER frame that has
-        //    a source (e.g. printint in printf.s), yanking the editor there on every
-        //    step and making ROM tracing impossible.
-        // So while in ROM show ONLY the current frame — nothing for VS Code to jump
-        // to; the Oric Disassembly webview follows the PC as the ROM viewer. The full
-        // best-effort call stack returns the moment execution is back in sourced code.
-        if (top.source) {
-            const returnAddrs = await buildCallStack();
-            for (let i = 0; i < returnAddrs.length; i++)
-                stackFrames.push(makeFrame(i + 1, returnAddrs[i]));
+        // Walk the hardware stack to find JSR return addresses, and always show the
+        // deeper frames — a JMP into ROM/page-2 (putjar → $238 → JMP Char2Scr) doesn't
+        // touch the stack, so the caller chain (putsloop, _main, ...) is still valid
+        // and useful. BUT when the current PC has no source (ROM/unsymbolized), VS Code
+        // would auto-reveal the first DEEPER frame that HAS a source (e.g. printint in
+        // printf.s) and yank the editor there on every step, making ROM tracing
+        // impossible. So in that case mark the deeper frames' source `deemphasize`: they
+        // stay visible in the call stack, but VS Code won't steal focus to them — the
+        // Oric Disassembly webview remains the viewer for the ROM location.
+        const deemphasizeDeeper = !top.source;
+        const returnAddrs = await buildCallStack();
+        for (let i = 0; i < returnAddrs.length; i++) {
+            const f = makeFrame(i + 1, returnAddrs[i]);
+            if (deemphasizeDeeper && f.source) f.source.presentationHint = 'deemphasize';
+            stackFrames.push(f);
         }
 
         respond(req, {
