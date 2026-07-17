@@ -53,6 +53,13 @@ const canonPath = p => {
 const { buildResolver } = require('./resolver.cjs');
 let resolverInstance = null;
 
+// ROM symbols (Oricutron's romsyms, e.g. basic11b.sym) — a SEPARATE tier from the
+// build symbols, fetched from the emulator via qOricRomSyms. ROM is all code with
+// no source and sparse symbols, so it's resolved nearest-at-or-below with no
+// distance cap, deliberately kept out of the delicate build-symbol resolver.
+let romSymbols = [];       // sorted [{addr, name}]
+let romSymAddrs = [];      // parallel sorted addr array (binary search)
+
 // ----------------------------------------------------------------
 // DAP protocol I/O  (Content-Length framing over stdin/stdout)
 // ----------------------------------------------------------------
@@ -256,6 +263,7 @@ function gdbConnect(host, port) {
         s.on('close', () => {
             const wasSock = sock;
             sock = null;
+            stopMonitorBpPoll();
             if (pendingResolve) {
                 const r = pendingResolve;
                 pendingResolve = null;
@@ -501,6 +509,8 @@ let symSource  = new Map();   // name  -> { file, line } (per-symbol source)
 let lineTable  = [];          // [{addr, file, line}] sorted by addr (from #LINES)
 let regs       = null;        // { a, x, y, sp, pc, f }
 let running    = false;
+let bpPollTimer = null;       // interval that reconciles monitor-set breakpoints while stopped
+let bpPollBusy = false;       // guards against overlapping reconciles
 let config     = {};
 let bpId       = 1;
 let bps        = new Map();   // id -> { id, addr, name } (function breakpoints)
@@ -1956,6 +1966,26 @@ async function reconcileMonitorBreakpoints() {
     if (added.length || removed.length) evt('oricMonitorBreakpoints', { added, removed });
 }
 
+// While the session is STOPPED, the adapter is otherwise idle, so a breakpoint set
+// by hand in Oricutron's monitor (bs/bc) wouldn't reach VS Code until the next stop.
+// A light poll reconciles it within a second or two. It runs only while stopped
+// (never adds traffic during free-run), skips overlapping runs, and is a no-op when
+// the breakpoint set hasn't changed (reconcileMonitorBreakpoints emits nothing).
+function startMonitorBpPoll() {
+    if (bpPollTimer) return;
+    bpPollTimer = setInterval(async () => {
+        if (running || bpPollBusy || disconnecting || !sock) return;
+        bpPollBusy = true;
+        try { await reconcileMonitorBreakpoints(); }
+        catch (_) { /* transient (socket blip) — ignore, next tick retries */ }
+        finally { bpPollBusy = false; }
+    }, 1500);
+    if (bpPollTimer.unref) bpPollTimer.unref();   // don't keep the process alive on its own
+}
+function stopMonitorBpPoll() {
+    if (bpPollTimer) { clearInterval(bpPollTimer); bpPollTimer = null; }
+}
+
 // After loading a snapshot the emulator's exec-breakpoint table is whatever the
 // snapshot captured (snapshot.c saves cpu.breakpoints) — which may not match the
 // debugger's current set. Bring the emulator back in line with armedAddrs so a
@@ -2048,8 +2078,9 @@ function opSize(mode) {
 function fmtOp(mode, lo, hi, pc) {
     const h2 = v => v.toString(16).toUpperCase().padStart(2, '0');
     const h4 = v => v.toString(16).toUpperCase().padStart(4, '0');
-    // Resolve an address to a symbol name, or fall back to hex
-    const s = (addr, w) => symbolAt(addr) || ('$' + (w === 2 ? h2(addr) : h4(addr)));
+    // Resolve an address to a symbol name (build symbol, then exact ROM symbol),
+    // or fall back to hex — so e.g. `JMP $F77C` renders as `JMP Char2Scr`.
+    const s = (addr, w) => symbolAt(addr) || romExactName(addr) || ('$' + (w === 2 ? h2(addr) : h4(addr)));
     switch (mode) {
         case 'I': return '';
         case 'A': return 'A';
@@ -3058,6 +3089,70 @@ async function armTurbo(addr, warp = true) {
 // Address -> display label through the single resolver: exact symbol name, else nearest
 // symbol "name+$off", else "$hhhh". One authority (no separate addrSym walk); the resolver's
 // owner rule keeps this consistent with the call stack / disassembly / annotations.
+// Nearest ROM symbol at-or-below `addr` → { name, offset }, or null. No distance
+// cap: ROM is code, so the enclosing routine owns everything up to the next symbol.
+function resolveRomSym(addr) {
+    addr &= 0xFFFF;
+    if (romSymAddrs.length === 0) return null;
+    let lo = 0, hi = romSymAddrs.length - 1, best = -1;
+    while (lo <= hi) { const mid = (lo + hi) >> 1; if (romSymAddrs[mid] <= addr) { best = mid; lo = mid + 1; } else hi = mid - 1; }
+    if (best < 0) return null;
+    const s = romSymbols[best];
+    return { name: s.name, offset: addr - s.addr };
+}
+
+// Render an address as a ROM "name+$off" label if a ROM symbol covers it, else null.
+function romLabelFor(addr) {
+    const rs = resolveRomSym(addr);
+    if (!rs) return null;
+    return rs.offset ? rs.name + '+$' + rs.offset.toString(16).toUpperCase() : rs.name;
+}
+
+// ROM symbol name only when one sits EXACTLY at `addr` (a routine entry), for the
+// disassembly's label column — matches how build labels are shown (exact-match).
+function romExactName(addr) {
+    const rs = resolveRomSym(addr);
+    return (rs && rs.offset === 0) ? rs.name : null;
+}
+
+// Fetch Oricutron's ROM symbol table (romsyms, auto-loaded from <romfile>.sym for
+// the active machine) via the paged qOricRomSyms query and index it. Best-effort and
+// non-fatal: an old stub replies with an empty/unknown packet and we just leave
+// romSymbols empty, so ROM frames stay bare "$addr" exactly as before.
+async function loadRomSymbols() {
+    romSymbols = []; romSymAddrs = [];
+    try {
+        let start = 0, guard = 0;
+        for (;;) {
+            const reply = await gdbCmd('qOricRomSyms,' + start);
+            if (!reply || reply.slice(0, 3) !== 'RS:') { romSymbols = []; break; } // unsupported / error
+            // Format: RS:<total>:<next>:aaaa=name,aaaa=name,...
+            const c1 = reply.indexOf(':', 3);
+            const c2 = reply.indexOf(':', c1 + 1);
+            if (c1 < 0 || c2 < 0) break;
+            const total = parseInt(reply.slice(3, c1), 10);
+            const next = parseInt(reply.slice(c1 + 1, c2), 10);
+            const body = reply.slice(c2 + 1);
+            if (body) {
+                for (const pair of body.split(',')) {
+                    const eq = pair.indexOf('=');
+                    if (eq < 0) continue;
+                    const addr = parseInt(pair.slice(0, eq), 16);
+                    const name = pair.slice(eq + 1);
+                    if (!isNaN(addr) && name) romSymbols.push({ addr: addr & 0xFFFF, name });
+                }
+            }
+            if (!(next > start) || next >= total || ++guard > 10000) break; // done / no progress
+            start = next;
+        }
+        romSymbols.sort((a, b) => a.addr - b.addr);
+        romSymAddrs = romSymbols.map(s => s.addr);
+        if (romSymbols.length) log('Loaded ' + romSymbols.length + ' ROM symbols from Oricutron');
+    } catch (e) {
+        romSymbols = []; romSymAddrs = [];
+    }
+}
+
 function labelFor(addr) {
     addr &= 0xFFFF;
     const r = resolverInstance ? resolverInstance.resolve(addr) : null;
@@ -3066,10 +3161,31 @@ function labelFor(addr) {
     return '$' + addr.toString(16).toUpperCase().padStart(4, '0');
 }
 
+// The routine base (owner entry address) that contains `addr`, from build symbols
+// first (active-module view) then ROM symbols, or null when nothing owns it.
+function routineBaseOf(addr) {
+    addr &= 0xFFFF;
+    const r = resolverInstance ? resolverInstance.resolve(addr) : null;
+    if (r && r.symbol) return r.symbol.base & 0xFFFF;
+    const rs = resolveRomSym(addr);
+    if (rs) return (addr - rs.offset) & 0xFFFF;
+    return null;
+}
+
 // Walk the hardware stack (page 1) and identify JSR return addresses.
-// JSR pushes (PC+2) onto the stack (the last byte of the JSR instruction),
-// so the return address is (stack word) + 1.
-// Uses a single GDB read for the stack, then verifies candidates in bulk.
+//
+// JSR pushes (PC+2) — the last byte of the JSR — so a return address is
+// (stack word) + 1 and the JSR itself is 3 bytes before it. Scanning the raw
+// stack for that pattern gives false positives: deep in a routine the stack is
+// full of PHA/PHP saves and locals that coincidentally point 3 bytes past a $20.
+//
+// To reject those, we require CHAIN CONSISTENCY: the JSR that produced a frame
+// must target the routine that contains the inner (callee) frame. Concretely, the
+// JSR operand's owning routine must equal the owning routine of the address one
+// level in (the current PC for the first frame; the previous return address after
+// that). This is what prunes the bogus $3101/$DF3E/... frames when stopped in a
+// ROM routine. When neither side has a symbol to compare (unsymbolized code), we
+// fall back to the old opcode-only acceptance so we never do worse than before.
 async function buildCallStack() {
     if (!regs || regs.sp === undefined) return [];
 
@@ -3082,48 +3198,53 @@ async function buildCallStack() {
     const readSize = Math.min(stackSize, 64);
     const stk = await readMem(stackAddr, readSize);
 
-    // Collect all candidate JSR addresses for bulk verification
+    // Candidate return addresses (every 2-byte window) — need the JSR opcode AND
+    // its 2-byte operand at jsrAddr..jsrAddr+2 to verify + read the call target.
     const candidates = [];
-    for (let pos = 0; pos + 1 < stk.length && candidates.length < 16; pos++) {
-        const lo = stk[pos];
-        const hi = stk[pos + 1];
-        const retAddr = (((hi << 8) | lo) + 1) & 0xFFFF;
-        if (retAddr > 0x01FF && retAddr < 0xFFF0) {
-            candidates.push({ pos: pos, retAddr: retAddr, jsrAddr: (retAddr - 3) & 0xFFFF });
-        }
+    for (let pos = 0; pos + 1 < stk.length; pos++) {
+        const retAddr = (((stk[pos + 1] << 8) | stk[pos]) + 1) & 0xFFFF;
+        if (retAddr > 0x01FF && retAddr < 0xFFF0)
+            candidates.push((retAddr - 3) & 0xFFFF);
     }
     if (candidates.length === 0) return [];
 
-    // Find contiguous range covering all JSR verification addresses,
-    // then read them in a single GDB command
-    const minAddr = Math.min(...candidates.map(c => c.jsrAddr));
-    const maxAddr = Math.max(...candidates.map(c => c.jsrAddr));
+    const minAddr = Math.min(...candidates);
+    const maxAddr = Math.max(...candidates) + 2;      // +2 to include the JSR operand
     const rangeSize = maxAddr - minAddr + 1;
-
     let verifyMem = null;
-    if (rangeSize <= 4096) {
-        // Reasonable range — read in one shot (uses readMem for dedup cache)
+    if (rangeSize > 0 && rangeSize <= 8192)
         verifyMem = await readMem(minAddr, rangeSize);
-    }
+    const memAt = (a) => verifyMem ? verifyMem[(a & 0xFFFF) - minAddr] : undefined;
 
-    // Greedy scan using bulk-fetched verification data
+    // Greedy scan with chain validation. `innerBase` is the routine we expect the
+    // next genuine JSR to have targeted — the current PC's routine to start with.
     const frames = [];
+    let innerBase = routineBaseOf(regs.pc & 0xFFFF);
     let pos = 0;
-    while (pos + 1 < stk.length && frames.length < 16) {
-        const lo = stk[pos];
-        const hi = stk[pos + 1];
-        const retAddr = (((hi << 8) | lo) + 1) & 0xFFFF;
+    while (pos + 1 < stk.length && frames.length < 32) {
+        const retAddr = (((stk[pos + 1] << 8) | stk[pos]) + 1) & 0xFFFF;
         const jsrAddr = (retAddr - 3) & 0xFFFF;
+        let accept = false;
 
-        if (retAddr > 0x01FF && retAddr < 0xFFF0) {
-            const opcode = verifyMem ? verifyMem[jsrAddr - minAddr] : undefined;
-            if (opcode === 0x20 || !verifyMem) {
-                frames.push(retAddr);
-                pos += 2;
-                continue;
+        if (retAddr > 0x01FF && retAddr < 0xFFF0 && (memAt(jsrAddr) === 0x20 || !verifyMem)) {
+            if (!verifyMem) {
+                accept = true;                        // no memory to verify — old behavior
+            } else {
+                const target = ((memAt(jsrAddr + 2) << 8) | memAt(jsrAddr + 1)) & 0xFFFF;
+                const tBase = routineBaseOf(target);
+                // Chain-consistent if the JSR target's routine == the inner frame's
+                // routine. If either side is unsymbolized, accept (can't disprove it).
+                accept = (innerBase === null || tBase === null) ? true : (tBase === innerBase);
             }
         }
-        pos += 1; // skip single byte (PHA/PHP or non-JSR)
+
+        if (accept) {
+            frames.push(retAddr);
+            innerBase = routineBaseOf(retAddr);       // next JSR should target THIS return site's routine
+            pos += 2;
+        } else {
+            pos += 1;                                 // skip a byte (PHA/PHP or non-return data)
+        }
     }
 
     return frames;
@@ -3277,6 +3398,8 @@ async function connectAndHandshake(req) {
                 regs = parseStopRegs(reply);
                 log('Parsed regs: PC=$' + (regs.pc !== undefined ? regs.pc.toString(16).toUpperCase().padStart(4, '0') : '??'));
             }
+            await loadRomSymbols();   // name ROM addresses the build symbols don't cover (best-effort)
+            startMonitorBpPoll();     // pick up hand-set monitor breakpoints while stopped
             respond(req);
             evt('initialized');
             return true;
@@ -3747,6 +3870,7 @@ const handlers = {
 
     async disconnect(req) {
         disconnecting = true;
+        stopMonitorBpPoll();
         if (sock) {
             gdbWrite('D'); // detach — don't wait for reply
             sock.destroy();
@@ -3802,11 +3926,11 @@ const handlers = {
             // Single-source-of-truth resolver: name AND source come from ONE owner,
             // so the call stack can't disagree with the disassembly view (DOGFOODING #1).
             const R = resolverInstance ? resolverInstance.resolve(addr) : null;
-            const name = R
-                ? (R.symbol
-                    ? (R.symbol.offset ? R.symbol.name + '+$' + R.symbol.offset.toString(16).toUpperCase() : R.symbol.name)
-                    : '$' + addr.toString(16).toUpperCase().padStart(4, '0'))
-                : labelFor(addr);
+            const name = (R && R.symbol)
+                ? (R.symbol.offset ? R.symbol.name + '+$' + R.symbol.offset.toString(16).toUpperCase() : R.symbol.name)
+                // No build symbol here — fall back to a ROM symbol (e.g. $F785 in a
+                // ROM routine) before showing a bare address.
+                : (romLabelFor(addr) || '$' + addr.toString(16).toUpperCase().padStart(4, '0'));
             const frame = {
                 id: id,
                 name: name,
@@ -3817,39 +3941,35 @@ const handlers = {
             if (R && R.source) {
                 frame.source = { name: path.basename(R.source.file), path: R.source.file };
                 frame.line = R.source.line;
-            } else if (disasmCache && disasmCache.lineForAddr.has(addr)) {
-                // Address is within the cached disassembly window — reuse
-                // the same sourceReference so VS Code just scrolls, no tab refresh.
-                frame.source = { name: 'Disassembly', sourceReference: disasmCache.ref };
-                frame.line = disasmCache.lineForAddr.get(addr);
-            } else {
-                // Fallback for call stack frames outside the cache window
-                const ref = ++disasmRefCounter;
-                disasmRefMap.set(ref, addr);
-                frame.source = {
-                    name: 'Disassembly @ $' + addr.toString(16).toUpperCase().padStart(4, '0'),
-                    sourceReference: ref
-                };
-                frame.line = DISASM_CONTEXT + 1;
             }
+            // No real source (ROM / unsymbolized code): leave `source` unset so VS Code
+            // does NOT auto-open a virtual "Disassembly @ $XXXX" text tab when it reveals
+            // this frame (that was the intrusive window, and worse when the frame was a
+            // false-positive unwind). The Oric Disassembly webview is the viewer for these;
+            // the frame still carries a name + instructionPointerReference, so VS Code's own
+            // Disassembly View still works if the user opens it explicitly.
             return frame;
         }
 
         // Frame 0: current PC
-        const topFrame = makeFrame(0, pc);
-        // If the top frame only has a virtual disassembly source (no real file),
-        // strip it so VS Code doesn't auto-open a "Disassembly" text tab.
-        // The custom Oric Disassembly webview panel handles this instead.
-        if (topFrame.source && topFrame.source.sourceReference && !topFrame.source.path) {
-            delete topFrame.source;
-            topFrame.line = 0;
-        }
-        const stackFrames = [topFrame];
+        const top = makeFrame(0, pc);
+        const stackFrames = [top];
 
-        // Walk the hardware stack to find JSR return addresses
-        const returnAddrs = await buildCallStack();
-        for (let i = 0; i < returnAddrs.length; i++) {
-            stackFrames.push(makeFrame(i + 1, returnAddrs[i]));
+        // Walk the hardware stack to find JSR return addresses. When the PC is in
+        // ROM / unsymbolized code (top frame has no source), two things go wrong:
+        //  - the stack-scan unwind can't be trusted (JMP trampolines like
+        //    putjar → $238 → JMP Char2Scr push no return address, so the chain
+        //    breaks and deeper frames are often false positives), and
+        //  - more importantly, VS Code auto-reveals the first DEEPER frame that has
+        //    a source (e.g. printint in printf.s), yanking the editor there on every
+        //    step and making ROM tracing impossible.
+        // So while in ROM show ONLY the current frame — nothing for VS Code to jump
+        // to; the Oric Disassembly webview follows the PC as the ROM viewer. The full
+        // best-effort call stack returns the moment execution is back in sourced code.
+        if (top.source) {
+            const returnAddrs = await buildCallStack();
+            for (let i = 0; i < returnAddrs.length; i++)
+                stackFrames.push(makeFrame(i + 1, returnAddrs[i]));
         }
 
         respond(req, {
@@ -5888,16 +6008,33 @@ const handlers = {
         for (let i = 0; i < reply.length && i / 2 < totalBytes; i += 2)
             mem[i / 2] = parseInt(reply.substring(i, i + 2), 16);
 
-        // Disassemble all bytes from startAddr
+        // Anchor the decode to the PC. `center` (the PC) IS a real instruction
+        // boundary, but decoding blindly from center-preBytes can drift — ROM keeps
+        // data between routines and uses the BIT ($2C) skip trick for multi-entry
+        // points, so a naive forward decode may never land a boundary exactly on
+        // center, leaving the view with no current-line row. Pick the FURTHEST-BACK
+        // start whose forward decode lands exactly on center (center itself always
+        // qualifies → zero before-context as the safe floor).
+        const opAt = (a) => mem[a - startAddr];
+        const sizeAt = (a) => { const e = OPS[opAt(a)]; return e ? opSize(e[3]) : 1; };
+        const alignsOnCenter = (S) => { let a = S; while (a < center) a += sizeAt(a); return a === center; };
+        let decodeStart = center;
+        for (let S = startAddr; S < center; S++) {
+            if (alignsOnCenter(S)) { decodeStart = S; break; }
+        }
+
+        // Disassemble all bytes from the aligned start (guarantees a row at center=PC)
         const allInsns = [];
-        let addr = startAddr;
+        let addr = decodeStart;
         while (addr < startAddr + totalBytes) {
             const off = addr - startAddr;
             const opcode = mem[off];
             const entry = OPS[opcode];
+            // ROM label: exact build symbol, else exact ROM symbol (e.g. Char2Scr @ $F77C)
+            const label = symbolAt(addr) || romExactName(addr);
             if (!entry) {
                 // Illegal opcode — emit as data byte
-                allInsns.push({ address: addr, bytes: [opcode], mnemonic: '???', operand: '$' + opcode.toString(16).toUpperCase().padStart(2, '0'), label: symbolAt(addr) });
+                allInsns.push({ address: addr, bytes: [opcode], mnemonic: '???', operand: '$' + opcode.toString(16).toUpperCase().padStart(2, '0'), label });
                 addr++;
                 continue;
             }
@@ -5910,7 +6047,7 @@ const handlers = {
             const bytesArr = [];
             for (let b = 0; b < size; b++) bytesArr.push(mem[off + b]);
             const operand = fmtOp(mode, lo, hi, addr);
-            allInsns.push({ address: addr, bytes: bytesArr, mnemonic: mnem, operand, label: symbolAt(addr) });
+            allInsns.push({ address: addr, bytes: bytesArr, mnemonic: mnem, operand, label });
             addr += size;
         }
 
