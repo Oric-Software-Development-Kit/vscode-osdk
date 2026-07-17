@@ -4665,7 +4665,41 @@ function activate(context) {
         // that property directly; plus remove.
         vscode.commands.registerCommand('oric-debug.bpEdit', editBpLine),
         vscode.commands.registerCommand('oric-debug.bpEditDetail', node => { if (node && node.ln && node.prop) editBpProp(node.ln, node.prop); }),
-        vscode.commands.registerCommand('oric-debug.bpRemove', node => { if (node && node.ln) removeBpLine(node.ln); })
+        vscode.commands.registerCommand('oric-debug.bpRemove', node => { if (node && node.ln) removeBpLine(node.ln); }),
+        // Snapshots (SPEC-snapshots.md): save/restore the full machine state to a
+        // per-project folder so you can poke around then rewind.
+        vscode.commands.registerCommand('oric-debug.snapshotSave', async () => {
+            const s = vscode.debug.activeDebugSession;
+            if (!s || s.type !== 'oric-debug') { vscode.window.showInformationMessage('Oric: start a debug session first.'); return; }
+            const name = await vscode.window.showInputBox({ prompt: 'Snapshot name', value: 'snap', ignoreFocusOut: true });
+            if (!name) return;
+            try { const r = await s.customRequest('saveSnapshot', { name }); vscode.window.setStatusBarMessage('Oric: saved snapshot "' + r.name + '"', 3000); }
+            catch (e) { vscode.window.showErrorMessage('Snapshot save failed: ' + (e && e.message ? e.message : e)); }
+        }),
+        vscode.commands.registerCommand('oric-debug.snapshotRestore', async () => {
+            const s = vscode.debug.activeDebugSession;
+            if (!s || s.type !== 'oric-debug') { vscode.window.showInformationMessage('Oric: start a debug session first.'); return; }
+            let list; try { list = await s.customRequest('listSnapshots'); } catch (e) { vscode.window.showErrorMessage('List failed: ' + (e && e.message ? e.message : e)); return; }
+            const snaps = (list && list.snapshots) || [];
+            if (!snaps.length) { vscode.window.showInformationMessage('Oric: no snapshots saved yet.'); return; }
+            const pick = await vscode.window.showQuickPick(
+                snaps.map(x => ({ label: x.name, description: x.pc != null ? 'PC $' + (x.pc & 0xFFFF).toString(16).toUpperCase().padStart(4, '0') : '' })),
+                { placeHolder: 'Restore which snapshot?' });
+            if (!pick) return;
+            try { await s.customRequest('restoreSnapshot', { name: pick.label }); vscode.window.setStatusBarMessage('Oric: restored "' + pick.label + '"', 3000); }
+            catch (e) { vscode.window.showErrorMessage('Restore failed: ' + (e && e.message ? e.message : e)); }
+        }),
+        vscode.commands.registerCommand('oric-debug.snapshotDelete', async () => {
+            const s = vscode.debug.activeDebugSession;
+            if (!s || s.type !== 'oric-debug') { vscode.window.showInformationMessage('Oric: start a debug session first.'); return; }
+            let list; try { list = await s.customRequest('listSnapshots'); } catch (e) { return; }
+            const snaps = (list && list.snapshots) || [];
+            if (!snaps.length) { vscode.window.showInformationMessage('Oric: no snapshots to delete.'); return; }
+            const pick = await vscode.window.showQuickPick(snaps.map(x => x.name), { placeHolder: 'Delete which snapshot?' });
+            if (!pick) return;
+            try { await s.customRequest('deleteSnapshot', { name: pick }); vscode.window.setStatusBarMessage('Oric: deleted "' + pick + '"', 3000); }
+            catch (e) { vscode.window.showErrorMessage('Delete failed: ' + (e && e.message ? e.message : e)); }
+        })
     );
     rebuildBpTree();
 

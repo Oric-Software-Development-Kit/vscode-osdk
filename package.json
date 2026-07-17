@@ -178,6 +178,20 @@
                 "icon": "$(trash)"
             },
             {
+                "command": "oric-debug.snapshotSave",
+                "title": "Oric: Save Snapshot",
+                "icon": "$(save)"
+            },
+            {
+                "command": "oric-debug.snapshotRestore",
+                "title": "Oric: Restore Snapshot",
+                "icon": "$(history)"
+            },
+            {
+                "command": "oric-debug.snapshotDelete",
+                "title": "Oric: Delete Snapshot"
+            },
+            {
                 "command": "oric-debug.openMemoryView",
                 "title": "Oric: Memory View"
             },

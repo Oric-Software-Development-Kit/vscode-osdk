@@ -218,9 +218,12 @@ let pendingCmd = null;       // full pending GDB command (some commands reply wi
 
 // Commands whose legitimate RESPONSE is a stop packet (T../S..), so a T/S while
 // they're pending must resolve the await — NOT be treated as an unsolicited stop.
-// (`?` is the initial stop query; `qOricHardReset` replies T05 after resetting.)
+// (`?` is the initial stop query; `qOricHardReset` and `qOricLoadSnapshot` reply
+// T05 after resetting/restoring. qOricLoadSnapshot carries a hex-path arg, so
+// match by prefix.)
 function stopReplyIsResponse() {
-    return pendingCmdType === '?' || pendingCmd === 'qOricHardReset';
+    return pendingCmdType === '?' || pendingCmd === 'qOricHardReset' ||
+           (pendingCmd !== null && pendingCmd.indexOf('qOricLoadSnapshot,') === 0);
 }
 let gdbQueue = [];           // queued commands: [{cmd, resolve}]
 let disconnecting = false;
@@ -798,6 +801,38 @@ let launchArtifactHash = null;
 function hashFile(p) {
     try { return crypto.createHash('md5').update(fs.readFileSync(p)).digest('hex'); }
     catch (e) { return null; }
+}
+
+// --- Snapshots (SPEC-snapshots.md) --------------------------------------------
+// Snapshots live in a PROJECT subfolder (never the Oricutron folder), tracked by a
+// manifest that records the debugged binary's checksum. They're invalidated when
+// the binary hash changes — NOT the timestamp — so editing annotations to aid
+// debugging never throws them away.
+function snapshotDir() {
+    const base = config.cwd || (config.build && config.build.cwd) || process.cwd();
+    return path.join(base, '.oric-snapshots');
+}
+function snapshotFile(name) { return path.join(snapshotDir(), name + '.snapshot'); }
+function readSnapshotManifest() {
+    try { return JSON.parse(fs.readFileSync(path.join(snapshotDir(), 'manifest.json'), 'utf8')); }
+    catch (e) { return { hash: null, snaps: {} }; }
+}
+function writeSnapshotManifest(m) {
+    try { fs.mkdirSync(snapshotDir(), { recursive: true }); fs.writeFileSync(path.join(snapshotDir(), 'manifest.json'), JSON.stringify(m, null, 2)); }
+    catch (e) { log('snapshot manifest write failed: ' + e.message); }
+}
+// Drop snapshots taken against a DIFFERENT binary (by checksum). Called at launch.
+function pruneStaleSnapshots() {
+    if (!launchArtifactHash) return;
+    const m = readSnapshotManifest();
+    if (m.hash && m.hash !== launchArtifactHash) {
+        const names = Object.keys(m.snaps || {});
+        for (const n of names) { try { fs.unlinkSync(snapshotFile(n)); } catch (e) { /* ignore */ } }
+        log('Snapshots invalidated (binary changed) — cleared ' + names.length);
+        writeSnapshotManifest({ hash: launchArtifactHash, snaps: {} });
+    } else if (m.hash !== launchArtifactHash) {
+        writeSnapshotManifest({ hash: launchArtifactHash, snaps: m.snaps || {} });
+    }
 }
 
 // Re-parse the symbol FILE in place (new enum members / types / symbols from a
@@ -3217,6 +3252,7 @@ const handlers = {
         // rebuild (emulator holds a stale binary — needs a relaunch).
         launchArtifactPath = config.diskImage || null;
         launchArtifactHash = launchArtifactPath ? hashFile(launchArtifactPath) : null;
+        pruneStaleSnapshots();   // drop snapshots taken against a different binary (checksum, not timestamp)
 
         // --- Step 1: Build if stale ---
         if (config.build) {
@@ -4948,6 +4984,50 @@ const handlers = {
     async resetCycles(req) {
         const reply = await gdbCmd('qOricResetCycles');
         respond(req, { result: reply === 'OK' ? 'Cycles reset' : 'Failed' });
+    },
+
+    // -- Snapshots: save / restore / list (custom requests) -----------
+    async saveSnapshot(req) {
+        const raw = (req.arguments && req.arguments.name) || 'snap';
+        const name = String(raw).replace(/[^\w.-]/g, '_').slice(0, 64) || 'snap';
+        try { fs.mkdirSync(snapshotDir(), { recursive: true }); } catch (e) { /* ignore */ }
+        const r = await gdbCmd('qOricSaveSnapshot,' + Buffer.from(snapshotFile(name), 'utf8').toString('hex'));
+        if (typeof r === 'string' && r.indexOf('E snapshot') === 0) { respond(req, {}, false, r.slice(2).trim()); return; }
+        const m = readSnapshotManifest();
+        m.hash = launchArtifactHash || m.hash;
+        m.snaps = m.snaps || {};
+        m.snaps[name] = { pc: regs ? regs.pc : null, at: Date.now() };
+        writeSnapshotManifest(m);
+        log('Snapshot saved: ' + name);
+        respond(req, { name });
+    },
+    async restoreSnapshot(req) {
+        const name = req.arguments && req.arguments.name;
+        if (!name) { respond(req, {}, false, 'No snapshot name'); return; }
+        if (!fs.existsSync(snapshotFile(name))) { respond(req, {}, false, 'Snapshot not found: ' + name); return; }
+        const r = await gdbCmd('qOricLoadSnapshot,' + Buffer.from(snapshotFile(name), 'utf8').toString('hex'));
+        if (typeof r === 'string' && r.indexOf('E snapshot') === 0) { respond(req, {}, false, r.slice(2).trim()); return; }
+        regs = parseStopRegs(r);   // r is the post-restore stop reply
+        running = false;
+        clearGdbReadCache();
+        log('Snapshot restored: ' + name + ' (PC=$' + (regs && regs.pc !== undefined ? regs.pc.toString(16).toUpperCase().padStart(4, '0') : '??') + ')');
+        respond(req, { name });
+        evt('stopped', { reason: 'restore', threadId: 1, allThreadsStopped: true });
+    },
+    listSnapshots(req) {
+        const m = readSnapshotManifest();
+        const snaps = Object.keys(m.snaps || {}).map(n => ({ name: n, pc: m.snaps[n].pc, at: m.snaps[n].at }))
+            .sort((a, b) => (b.at || 0) - (a.at || 0));
+        respond(req, { hash: m.hash, snapshots: snaps });
+    },
+    async deleteSnapshot(req) {
+        const name = req.arguments && req.arguments.name;
+        if (!name) { respond(req, {}, false, 'No snapshot name'); return; }
+        try { fs.unlinkSync(snapshotFile(name)); } catch (e) { /* already gone */ }
+        const m = readSnapshotManifest();
+        if (m.snaps) delete m.snaps[name];
+        writeSnapshotManifest(m);
+        respond(req, { name });
     },
 
     // -- Read all symbols with current values (custom request) ---------
