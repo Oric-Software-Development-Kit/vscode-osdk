@@ -227,6 +227,7 @@ function stopReplyIsResponse() {
 }
 let gdbQueue = [];           // queued commands: [{cmd, resolve}]
 let disconnecting = false;
+let emuPid = null;           // pid of the emulator we're attached to (for logging + alive checks)
 
 // GDB commands sent constantly to service the variables/memory views —
 // pure noise in the verbose log. Suppress both the '→' send and the '←'
@@ -265,6 +266,9 @@ function gdbConnect(host, port) {
             for (const entry of gdbQueue) entry.resolve(null);
             gdbQueue = [];
             if (wasSock && !disconnecting) {
+                // Distinguish a dropped socket (emulator alive) from a dead emulator.
+                const alive = pidAlive(emuPid);
+                log('GDB socket closed — emulator (pid ' + (emuPid || '?') + ') is ' + (alive ? 'STILL RUNNING (socket dropped, not a crash)' : 'gone (exited)'));
                 evt('terminated');
             }
         });
@@ -333,9 +337,10 @@ function harvestOsdkConfig(cwd) {
     });
 }
 
-// Kill the process(es) listening on `port` (used when the emulator was started
-// detached by a launch script, so we have no child handle). Best-effort.
-function killByPort(port) {
+// PID(s) listening on `port` — the emulator is detached (script launch), so we
+// find it by port. Also used to log which process we attached to and to tell a
+// dropped socket from a dead emulator.
+function pidsOnPort(port) {
     try {
         if (process.platform === 'win32') {
             const out = child_process.execSync('netstat -ano -p tcp', { windowsHide: true }).toString();
@@ -344,14 +349,35 @@ function killByPort(port) {
                 const m = line.match(/^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)/i);
                 if (m && parseInt(m[1], 10) === port) pids.add(m[2]);
             }
-            for (const pid of pids)
-                try { child_process.execSync('taskkill /pid ' + pid + ' /T /F', { windowsHide: true, stdio: 'ignore' }); } catch (_) { /* gone */ }
-        } else {
-            const pids = child_process.execSync('lsof -ti tcp:' + port + ' -s tcp:LISTEN', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim().split(/\s+/).filter(Boolean);
-            for (const pid of pids)
-                try { process.kill(parseInt(pid, 10), 'SIGTERM'); } catch (_) { /* gone */ }
+            return [...pids];
         }
-    } catch (_) { /* nothing listening / tool missing */ }
+        return child_process.execSync('lsof -ti tcp:' + port + ' -s tcp:LISTEN', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim().split(/\s+/).filter(Boolean);
+    } catch (_) { return []; }
+}
+
+// Is a pid still running? Distinguishes "socket dropped, emulator alive" from
+// "emulator exited" on a disconnect.
+function pidAlive(pid) {
+    if (!pid) return false;
+    try {
+        if (process.platform === 'win32') {
+            const out = child_process.execSync('tasklist /FI "PID eq ' + pid + '" /NH', { windowsHide: true }).toString();
+            return new RegExp('\\b' + pid + '\\b').test(out);
+        }
+        process.kill(parseInt(pid, 10), 0);
+        return true;
+    } catch (_) { return false; }
+}
+
+// Kill the process(es) listening on `port` (used when the emulator was started
+// detached by a launch script, so we have no child handle). Best-effort.
+function killByPort(port) {
+    for (const pid of pidsOnPort(port)) {
+        try {
+            if (process.platform === 'win32') child_process.execSync('taskkill /pid ' + pid + ' /T /F', { windowsHide: true, stdio: 'ignore' });
+            else process.kill(parseInt(pid, 10), 'SIGTERM');
+        } catch (_) { /* gone */ }
+    }
 }
 
 function onGdbData(data) {
@@ -600,6 +626,12 @@ let entryAddr = -1;            // preserved entry address (initBreakAddr is clea
 let awaitingEntry = false;     // true after configurationDone continue, until the entry breakpoint is hit
 let baselineReady = false;     // a "__baseline" snapshot was captured at the entry (enables instant restart)
 let restartViaSnapshot = false;// set by restart() when it loaded the baseline; configurationDone then just stops at entry
+// Time-travel history (reverse debugging). The ring of machine states lives IN
+// Oricutron's RAM (see the qOricHist* stub commands) — the adapter just pushes a
+// state at each stop and asks the emulator to step back. Enabled when the launch
+// config's "historyBudgetMB" > 0 (that budget bounds the emulator's ring).
+let histEnabled = false;
+let histBudgetKB = 0;          // ring budget in KB, sent to the emulator
 
 // ----------------------------------------------------------------
 // Build staleness check (pure Node.js, cross-platform)
@@ -1329,6 +1361,7 @@ function parseRegsG(hex) {
 //   T0500:aa;01:xx;02:yy;03:ss;04:pppp;05:ff;
 function parseStopRegs(payload) {
     const r = {};
+    if (typeof payload !== 'string' || payload.length < 3) return r;  // dropped connection → null reply; caller sees empty regs, not a crash
     const parts = payload.substring(3).split(';');
     for (const p of parts) {
         const c = p.indexOf(':');
@@ -3224,6 +3257,39 @@ function handleDap(msg) {
     }
 }
 
+// Connect to the emulator's GDB stub (with retries), do the initial `?` handshake,
+// then respond to `req` and fire 'initialized'. Shared by launch/attach/relaunch.
+// Returns true on success; on failure returns false WITHOUT responding, so each
+// caller can add its own cleanup + failure message.
+async function connectAndHandshake(req) {
+    const host = config.host || 'localhost';
+    const port = config.port || 6502;
+    const retries = config.connectRetries || 10;
+    const retryDelay = config.connectRetryDelay || 1000;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            await gdbConnect(host, port);
+            emuPid = (launchedProcess && launchedProcess.pid) || pidsOnPort(port)[0] || null;
+            log('Connected to Oricutron at ' + host + ':' + port + ' (pid ' + (emuPid || '?') + ')');
+            const reply = await gdbCmd('?');
+            log('GDB ? reply: ' + (reply || '(null)'));
+            if (reply) {
+                regs = parseStopRegs(reply);
+                log('Parsed regs: PC=$' + (regs.pc !== undefined ? regs.pc.toString(16).toUpperCase().padStart(4, '0') : '??'));
+            }
+            respond(req);
+            evt('initialized');
+            return true;
+        } catch (e) {
+            if (attempt < retries) {
+                if (attempt === 0) log('Waiting for Oricutron on ' + host + ':' + port + '...');
+                await new Promise(r => setTimeout(r, retryDelay));
+            }
+        }
+    }
+    return false;
+}
+
 // Full relaunch from within the restart handler: kill the current emulator,
 // re-spawn (same as launch's Step 2a/2b) and reconnect (Step 3). Used when the
 // binary changed — a hard reset can't reload a tape program, and terminated{restart}
@@ -3272,23 +3338,9 @@ async function relaunchEmulator(req) {
         respond(req, {}, false, 'Cannot relaunch: launch config has no launchScript or emulatorPath'); return;
     }
 
-    // Reconnect (mirror launch Step 3).
-    const retries = config.connectRetries || 10;
-    const retryDelay = config.connectRetryDelay || 1000;
-    for (let attempt = 0; attempt <= retries; attempt++) {
-        try {
-            await gdbConnect(host, port);
-            log('Connected to Oricutron at ' + host + ':' + port);
-            const reply = await gdbCmd('?');
-            if (reply) regs = parseStopRegs(reply);
-            respond(req);
-            evt('initialized');
-            return;
-        } catch (e) {
-            if (attempt < retries) { if (attempt === 0) log('Waiting for Oricutron on ' + host + ':' + port + '...'); await new Promise(r => setTimeout(r, retryDelay)); }
-        }
-    }
-    respond(req, {}, false, 'Could not reconnect to Oricutron after relaunch');
+    // Reconnect + handshake (shared with launch/attach).
+    if (!await connectAndHandshake(req))
+        respond(req, {}, false, 'Could not reconnect to Oricutron after relaunch');
 }
 
 // ----------------------------------------------------------------
@@ -3344,40 +3396,11 @@ const handlers = {
         applyLogLevel(logLevel, true); // reflect the initial level in the status bar (don't re-persist)
         const host = config.host || 'localhost';
         const port = config.port || 6502;
-        const retries = config.connectRetries || 10;
-        const retryDelay = config.connectRetryDelay || 1000;
 
         if (config.symbolFile) loadSymbols(config.symbolFile);
 
-        // Retry loop — gives Oricutron time to start when using preLaunchTask
-        let lastErr;
-        for (let attempt = 0; attempt <= retries; attempt++) {
-            try {
-                await gdbConnect(host, port);
-                log('Connected to Oricutron at ' + host + ':' + port);
-
-                const reply = await gdbCmd('?');
-                log('GDB ? reply: ' + (reply || '(null)'));
-                if (reply) {
-                    regs = parseStopRegs(reply);
-                    log('Parsed regs: PC=$' + (regs.pc !== undefined ? regs.pc.toString(16).toUpperCase().padStart(4, '0') : '??') +
-                        ' A=$' + (regs.a !== undefined ? regs.a.toString(16).toUpperCase().padStart(2, '0') : '??'));
-                }
-
-                respond(req);
-                evt('initialized');
-                return;
-            } catch (e) {
-                lastErr = e;
-                if (attempt < retries) {
-                    if (attempt === 0)
-                        log('Waiting for Oricutron on ' + host + ':' + port + '...');
-                    await new Promise(r => setTimeout(r, retryDelay));
-                }
-            }
-        }
-        respond(req, {}, false, 'Could not connect to ' + host + ':' + port +
-            ' after ' + retries + ' retries — is Oricutron running with --gdb_port?');
+        if (!await connectAndHandshake(req))
+            respond(req, {}, false, 'Could not connect to ' + host + ':' + port + ' — is Oricutron running with --gdb_port?');
     },
 
     async launch(req) {
@@ -3516,40 +3539,19 @@ const handlers = {
             return;
         }
 
-        // --- Step 3: Connect GDB (same retry logic as attach) ---
+        // --- Step 3: Connect GDB + handshake (shared with attach/relaunch) ---
         const host = config.host || 'localhost';
-        const retries = config.connectRetries || 10;
-        const retryDelay = config.connectRetryDelay || 1000;
-
-        let lastErr;
-        for (let attempt = 0; attempt <= retries; attempt++) {
-            try {
-                await gdbConnect(host, port);
-                log('Connected to Oricutron at ' + host + ':' + port);
-                const reply = await gdbCmd('?');
-                if (reply) {
-                    regs = parseStopRegs(reply);
-                }
-                respond(req);
-                evt('initialized');
-                return;
-            } catch (e) {
-                lastErr = e;
-                if (attempt < retries) {
-                    if (attempt === 0)
-                        log('Waiting for Oricutron on ' + host + ':' + port + '...');
-                    await new Promise(r => setTimeout(r, retryDelay));
-                }
-            }
-        }
+        if (await connectAndHandshake(req)) return;
         // Total connect failure: kill the emulator we spawned so it doesn't linger and
         // own the port for the next launch (which would then attach to this stale one).
         if (launchedProcess) {
             try { launchedProcess.kill(); } catch (_) { /* ignore */ }
             launchedProcess = null;
+        } else if (scriptLaunched) {
+            killByPort(config.port || 6502);
         }
-        respond(req, {}, false, 'Could not connect to ' + host + ':' + port +
-            ' after ' + retries + ' retries — is Oricutron running?');
+        respond(req, {}, false, 'Could not connect to ' + host + ':' + (config.port || 6502) +
+            ' — is Oricutron running with --gdb_port?');
     },
 
     configurationDone(req) {
