@@ -515,6 +515,11 @@ let config     = {};
 let bpId       = 1;
 let bps        = new Map();   // id -> { id, addr, name } (function breakpoints)
 let ibps       = new Map();   // id -> { id, addr }       (instruction breakpoints)
+let addrBps    = new Map();   // addr -> { addr }  ADAPTER-OWNED address breakpoints for
+                              // no-source / ROM code (e.g. $238, Char2Scr). Armed directly
+                              // via Z0, NOT through VS Code's InstructionBreakpoint model
+                              // (which it won't even arm for programmatic bps). Shown as dots
+                              // in the Oric Disassembly and in the Oric Breakpoints panel.
 let zpSymbols  = [];          // [{addr, name, size}] sorted by address (derived from symInfo)
 let symInfo    = new Map();   // name -> { name, addr, size, ann, type, group } — single source of truth for per-symbol info
 let typeDefs   = new Map();   // structName -> { size, fields: [{name, type, offset, size}] }
@@ -1697,6 +1702,7 @@ function logpointsAt(pc) {
 function stoppingBpAt(pc) {
     for (const [, b] of bps)  if (b.addr === pc) return true;
     for (const [, b] of ibps) if (b.addr === pc) return true;
+    if (addrBps.has(pc)) return true;
     for (const [, arr] of srcBps)
         for (const bp of arr)
             if (!bp.logMessage && bp.bindings.some(b => b.addr === pc && b.armed)) return true;
@@ -1957,13 +1963,27 @@ async function reconcileMonitorBreakpoints() {
         }
     }
 
-    const locFor = a => { const s = sourceFor(a); return s ? { address: a, file: s.file, line: s.line } : { address: a }; };
-    const added = [];
-    for (const a of stubAddrs) if (!armedAddrs.has(a)) added.push(locFor(a));
+    // A stub bp we didn't arm was set by hand in the monitor. If it maps to a source
+    // line, promote it to a VS Code SourceBreakpoint; otherwise (ROM / no source) adopt
+    // it as an adapter-owned ADDRESS breakpoint (VS Code can't show it as anything else).
+    const added = [];       // source-backed → VS Code SourceBreakpoints
+    let addrChanged = false;
+    for (const a of stubAddrs) {
+        if (armedAddrs.has(a)) continue;          // already ours (source, function, or address bp)
+        const s = sourceFor(a);
+        if (s) added.push({ address: a, file: s.file, line: s.line });
+        else { await armAddr(a); addrBps.set(a, { addr: a }); addrChanged = true; }
+    }
+    // An address we armed that the stub no longer has was cleared in the monitor.
     const removed = [];
-    for (const a of armedAddrs.keys()) if (!stubAddrs.has(a)) removed.push(locFor(a));
+    for (const a of [...armedAddrs.keys()]) {
+        if (stubAddrs.has(a)) continue;
+        if (addrBps.has(a)) { await disarmAddr(a); addrBps.delete(a); addrChanged = true; }
+        else { const s = sourceFor(a); removed.push(s ? { address: a, file: s.file, line: s.line } : { address: a }); }
+    }
 
     if (added.length || removed.length) evt('oricMonitorBreakpoints', { added, removed });
+    if (addrChanged) evt('oricAddressBreakpoints', {});   // refresh the Address panel + disasm dots
 }
 
 // While the session is STOPPED, the adapter is otherwise idle, so a breakpoint set
@@ -6062,6 +6082,7 @@ const handlers = {
         const pendingAddrs = [];
         for (const [, bp] of bps) bpAddrs.push(bp.addr);
         for (const [, bp] of ibps) bpAddrs.push(bp.addr);
+        for (const [, bp] of addrBps) bpAddrs.push(bp.addr);
         for (const [, fileBps] of srcBps) {
             for (const bp of fileBps) for (const b of bp.bindings) (b.armed ? bpAddrs : pendingAddrs).push(b.addr);
         }
@@ -6083,5 +6104,45 @@ const handlers = {
         if (typeof addr !== 'number') { respond(req, { location: null }); return; }
         const src = sourceFor(addr & 0xffff);
         respond(req, { location: src ? { file: src.file, line: src.line } : null });
+    },
+
+    // -- Adapter-owned ADDRESS breakpoints (custom requests) ----------
+    // For no-source / ROM addresses, armed directly (Z0) instead of via VS Code's
+    // InstructionBreakpoint model (which it won't arm for programmatic bps). The Oric
+    // Disassembly gutter and the Oric Breakpoints panel drive these.
+
+    // Toggle: arm+track if absent, disarm+untrack if present. Reply { address, set }.
+    async toggleAddressBreakpoint(req) {
+        const addr = req.arguments && req.arguments.address;
+        if (typeof addr !== 'number') { respond(req, { set: false }); return; }
+        const a = addr & 0xFFFF;
+        return withBpLock(async () => {
+            let set;
+            if (addrBps.has(a)) { await disarmAddr(a); addrBps.delete(a); set = false; }
+            else                { await armAddr(a);    addrBps.set(a, { addr: a }); set = true; }
+            respond(req, { address: a, set });
+            evt('oricAddressBreakpoints', {});   // extension refreshes the panel + disasm dots
+        });
+    },
+
+    // Remove (disarm) an address breakpoint. Reply {}.
+    async clearAddressBreakpoint(req) {
+        const addr = req.arguments && req.arguments.address;
+        if (typeof addr === 'number' && addrBps.has(addr & 0xFFFF)) {
+            const a = addr & 0xFFFF;
+            return withBpLock(async () => { await disarmAddr(a); addrBps.delete(a); respond(req, {}); evt('oricAddressBreakpoints', {}); });
+        }
+        respond(req, {});
+    },
+
+    // List the current address breakpoints (for the Oric Breakpoints panel).
+    listAddressBreakpoints(req) {
+        const list = [...addrBps.values()].map(b => ({
+            address: b.addr,
+            label: labelFor(b.addr),                 // build/ROM symbol name if any
+            source: !!sourceFor(b.addr)
+        }));
+        list.sort((x, y) => x.address - y.address);
+        respond(req, { breakpoints: list });
     }
 };

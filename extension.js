@@ -3039,13 +3039,13 @@ async function toggleBreakpointViaModel(session, address) {
         else vscode.debug.addBreakpoints([new vscode.SourceBreakpoint(
             new vscode.Location(uri, new vscode.Position(line0, 0)))]);
     } else {
-        const addr16 = address & 0xFFFF;
-        const ref = '0x' + addr16.toString(16).padStart(4, '0');
-        const existing = vscode.debug.breakpoints.find(bp =>
-            bp instanceof vscode.InstructionBreakpoint &&
-            parseInt(bp.instructionReference, 16) === addr16);
-        if (existing) vscode.debug.removeBreakpoints([existing]);
-        else vscode.debug.addBreakpoints([new vscode.InstructionBreakpoint(ref)]);
+        // No source (ROM / page-2, e.g. $238): an adapter-owned ADDRESS breakpoint.
+        // VS Code's InstructionBreakpoint model won't even arm a programmatically
+        // created one, so the adapter arms/tracks it directly and fires
+        // 'oricAddressBreakpoints' — the message listener then refreshes the gutter
+        // dot and the Oric Breakpoints panel (which is in rebuildBpTree's scope).
+        try { await session.customRequest('toggleAddressBreakpoint', { address: address & 0xFFFF }); }
+        catch (e) { /* ignore */ }
     }
 }
 
@@ -4401,7 +4401,7 @@ function activate(context) {
     // toggle flips VS Code's own `enabled` flag (remove + re-add), so the native
     // Breakpoints panel stays in sync. Module grouping needs a live oric session
     // (that's where the module map lives); without one it's a flat list.
-    let bpTreeModel = { modules: [], grouped: false };
+    let bpTreeModel = { modules: [], grouped: false, addrBps: [] };
     let bpTreeGen = 0;             // rebuild generation — drops superseded async rebuilds
     bpTreeEmitter = new vscode.EventEmitter();
 
@@ -4495,6 +4495,15 @@ function activate(context) {
                 if (r && r.snaps) snaps = r.snaps;
             } catch (e) { /* adapter unavailable: fall back to a flat list */ }
         }
+        // Adapter-owned ADDRESS breakpoints (ROM / no-source, e.g. $238) — their own
+        // category, fetched regardless of whether any source breakpoints exist.
+        let addrBpList = [];
+        if (session && session.type === 'oric-debug') {
+            try {
+                const r = await session.customRequest('listAddressBreakpoints', {});
+                if (r && Array.isArray(r.breakpoints)) addrBpList = r.breakpoints;
+            } catch (e) { /* old adapter without the request: no address category */ }
+        }
         if (gen !== bpTreeGen) return;   // a newer rebuild started during the await — let it win
         const nameOf = new Map(modulesMeta.map(m => [String(m.id), m.name]));
         // module -> { files: fsPath -> { uri, name, lines: locKey -> { line, col, uri, bps:[] } } }
@@ -4531,7 +4540,7 @@ function activate(context) {
         }
         // Show breakpoints NOW — the async source-text enrichment below must never
         // hide or delay them (that async work is exactly what let rebuilds race).
-        bpTreeModel = { modules: modArr, grouped: modArr.length > 1 };
+        bpTreeModel = { modules: modArr, grouped: modArr.length > 1, addrBps: addrBpList };
         bpTreeEmitter.fire();
 
         // Enrich each line with its trimmed source ("236:  if (SetupColors(..."),
@@ -4579,16 +4588,44 @@ function activate(context) {
         onDidChangeTreeData: bpTreeEmitter.event,
         getChildren(el) {
             if (!el) {
-                if (bpTreeModel.grouped) return bpTreeModel.modules.map(m => ({ kind: 'module', mod: m }));
-                const m = bpTreeModel.modules[0];   // single group: skip the module level
-                return m ? m.fileArr.map(f => ({ kind: 'file', file: f, mod: m })) : [];
+                const roots = [];
+                if (bpTreeModel.grouped) roots.push(...bpTreeModel.modules.map(m => ({ kind: 'module', mod: m })));
+                else {
+                    const m = bpTreeModel.modules[0];   // single group: skip the module level
+                    if (m) roots.push(...m.fileArr.map(f => ({ kind: 'file', file: f, mod: m })));
+                }
+                // Address breakpoints (ROM / no-source) get their own category at the end.
+                if (bpTreeModel.addrBps && bpTreeModel.addrBps.length) roots.push({ kind: 'addrGroup' });
+                return roots;
             }
+            if (el.kind === 'addrGroup') return bpTreeModel.addrBps.map(a => ({ kind: 'addrBp', a }));
             if (el.kind === 'module') return el.mod.fileArr.map(f => ({ kind: 'file', file: f, mod: el.mod }));
             if (el.kind === 'file') return el.file.lineArr.map(l => ({ kind: 'line', ln: l, file: el.file, mod: el.mod }));
             if (el.kind === 'line') return lineDetails(el.ln).map((d, i) => ({ kind: 'detail', ln: el.ln, el, idx: i, ...d }));
             return [];
         },
         getTreeItem(el) {
+            if (el.kind === 'addrGroup') {
+                const it = new vscode.TreeItem('Address breakpoints',
+                    vscode.TreeItemCollapsibleState.Expanded);
+                it.description = String(bpTreeModel.addrBps.length);
+                it.contextValue = 'oricAddrGroup';
+                it.iconPath = new vscode.ThemeIcon('symbol-number');
+                it.id = 'addrgroup';
+                return it;
+            }
+            if (el.kind === 'addrBp') {
+                const a = el.a;
+                const hx = '$' + (a.address & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
+                const it = new vscode.TreeItem(
+                    (a.label && a.label !== hx) ? (hx + '  ' + a.label) : hx,
+                    vscode.TreeItemCollapsibleState.None);
+                it.contextValue = 'oricAddrBp';
+                it.iconPath = new vscode.ThemeIcon('debug-breakpoint',
+                    new vscode.ThemeColor('debugIcon.breakpointForeground'));
+                it.id = 'addrbp:' + a.address;
+                return it;
+            }
             if (el.kind === 'detail') {
                 const it = new vscode.TreeItem(el.text);
                 it.iconPath = new vscode.ThemeIcon(el.icon);
@@ -5524,6 +5561,12 @@ function activate(context) {
                         // sync them into VS Code's model (Oricutron is just another view).
                         if (msg.type === 'event' && msg.event === 'oricMonitorBreakpoints' && msg.body) {
                             syncMonitorBreakpoints(msg.body);
+                        }
+                        // Adapter-owned address breakpoints (ROM / no-source) changed —
+                        // refresh the Oric Breakpoints panel (Address category) + gutter dots.
+                        if (msg.type === 'event' && msg.event === 'oricAddressBreakpoints') {
+                            rebuildBpTree();
+                            refreshDisasmPanel(vscode.debug.activeDebugSession);
                         }
                         // Active symbol module changed (auto-switch or manual) — reflect in status bar
                         if (msg.type === 'event' && msg.event === 'oricActiveModule' && msg.body) {
