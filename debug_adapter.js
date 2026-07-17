@@ -593,6 +593,7 @@ let turboWarpActive = false;   // true while a "Turbo Run" is warping toward a s
 let turboPrevWarp = false;     // warp state to restore when the turbo run stops
 let scriptLaunched = false;    // true when Oricutron was started via a launch script (detached; kill by port)
 let initBreakAddr = -1;        // address of the --gdb_break entry breakpoint to drop on connect (-1 = none)
+let entryAddr = -1;            // preserved entry address (initBreakAddr is cleared once hit; restart re-arms from this)
 let awaitingEntry = false;     // true after configurationDone continue, until the entry breakpoint is hit
 
 // ----------------------------------------------------------------
@@ -1509,12 +1510,30 @@ async function evalLogExpr(expr) {
         if (rn === 'sp' || rn === 'pc') return '$' + ((regs[rn] || 0) & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
         return regTagStr(rn) || formatScalar('uchar', [regs[rn] || 0], 0, 1);
     }
-    let addr = symbols.get(expr);
-    if (addr === undefined && !expr.startsWith('_')) addr = symbols.get('_' + expr);
-    if (addr !== undefined) {
-        const spec = renderSpec(expr);
-        const v = await buildTypedVar(expr, addr & 0xFFFF, spec.type, spec.size, spec.ann, { omitAddr: true });
-        return v.value;
+    // Bare global symbol: keep the annotation-aware render (@bcd/@ptr16/@bool…).
+    if (/^[A-Za-z_]\w*$/.test(expr)) {
+        let addr = symbols.get(expr);
+        if (addr === undefined && !expr.startsWith('_')) addr = symbols.get('_' + expr);
+        if (addr !== undefined) {
+            const spec = renderSpec(expr);
+            const v = await buildTypedVar(expr, addr & 0xFFFF, spec.type, spec.size, spec.ann, { omitAddr: true });
+            return v.value;
+        }
+    }
+    // C variable access — locals, members, subscripts, enum-decoded — through the
+    // SAME evaluator as Watch, so {g_entities[i].hp} in a log message reads exactly
+    // like the watched expression instead of "?".
+    if (regs && /^[A-Za-z_]/.test(expr)) {
+        try {
+            const func = currentFunction(regs.pc);
+            const locals = func ? localDefs.get(func) : null;
+            const fpA = symbols.get('fp'), apA = symbols.get('ap');
+            let fpVal = 0, apVal = 0;
+            if (typeof fpA === 'number') { const mm = await readMem(fpA, 2); fpVal = (mm[0] || 0) | ((mm[1] || 0) << 8); }
+            if (typeof apA === 'number') { const mm = await readMem(apA, 2); apVal = (mm[0] || 0) | ((mm[1] || 0) << 8); }
+            const lv = await evalAccess(expr, locals, fpVal, apVal);
+            if (lv) { const v = await buildTypedVar(expr, lv.addr, lv.type, lv.size, undefined, { omitAddr: true }); return v.value; }
+        } catch (e) { return '[' + (e && e.message ? e.message : 'err') + ']'; }
     }
     const hm = expr.match(/^\$([0-9a-fA-F]{1,4})$/);
     if (hm) { const b = await readMem(parseInt(hm[1], 16), 1); return '$' + (b[0] || 0).toString(16).toUpperCase().padStart(2, '0'); }
@@ -3238,6 +3257,7 @@ const handlers = {
             const osdkEnv = await harvestOsdkConfig(scriptCwd);
             let entry = (config.gdbBreak || osdkEnv.OSDKADDR || '').toString().trim().replace(/^\$/, '').replace(/^0x/i, '');
             initBreakAddr = /^[0-9a-fA-F]+$/.test(entry) ? parseInt(entry, 16) & 0xffff : -1;
+            entryAddr = initBreakAddr;   // preserve it — restart re-arms from here (initBreakAddr is cleared once hit)
             if (initBreakAddr < 0)
                 log('No entry address (OSDKADDR/gdbBreak) — launching without an initial breakpoint; may miss the entry.');
 
@@ -3451,6 +3471,19 @@ const handlers = {
         if (reply) {
             regs = parseStopRegs(reply);
             log('Hard reset complete, PC=$' + (regs.pc !== undefined ? regs.pc.toString(16).toUpperCase().padStart(4, '0') : '??'));
+        }
+
+        // Re-establish the entry breakpoint. On launch the emulator halts at the
+        // program entry via --gdb_break; the reset above cleared that (and it was
+        // already dropped once hit, so initBreakAddr is -1). Re-arm it and restore
+        // initBreakAddr so configurationDone runs THROUGH boot/auto-CLOAD to the
+        // entry (dropping it on hit) instead of leaving the machine paused at the
+        // ROM reset vector with a stale screen.
+        if (scriptLaunched && entryAddr >= 0) {
+            initBreakAddr = entryAddr;
+            awaitingEntry = false;   // set true by configurationDone's continue-to-entry branch
+            await gdbCmd('Z0,' + entryAddr.toString(16) + ',1');
+            log('Re-armed entry breakpoint ($' + entryAddr.toString(16) + ') for restart');
         }
 
         respond(req);
