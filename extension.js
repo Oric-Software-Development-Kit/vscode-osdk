@@ -4689,6 +4689,16 @@ function activate(context) {
             try { await s.customRequest('restoreSnapshot', { name: pick.label }); vscode.window.setStatusBarMessage('Oric: restored "' + pick.label + '"', 3000); }
             catch (e) { vscode.window.showErrorMessage('Restore failed: ' + (e && e.message ? e.message : e)); }
         }),
+        vscode.commands.registerCommand('oric-debug.snapshotRestartRecent', async () => {
+            const s = vscode.debug.activeDebugSession;
+            if (!s || s.type !== 'oric-debug') { vscode.window.showInformationMessage('Oric: start a debug session first.'); return; }
+            let list; try { list = await s.customRequest('listSnapshots'); } catch (e) { vscode.window.showErrorMessage('List failed: ' + (e && e.message ? e.message : e)); return; }
+            const snaps = (list && list.snapshots) || [];   // already newest-first, baseline excluded
+            if (!snaps.length) { vscode.window.showInformationMessage('Oric: no snapshots yet — use "Save Snapshot" first.'); return; }
+            const latest = snaps[0].name;
+            try { await s.customRequest('restoreSnapshot', { name: latest }); vscode.window.setStatusBarMessage('Oric: restarted to "' + latest + '"', 3000); }
+            catch (e) { vscode.window.showErrorMessage('Restart-to-snapshot failed: ' + (e && e.message ? e.message : e)); }
+        }),
         vscode.commands.registerCommand('oric-debug.snapshotDelete', async () => {
             const s = vscode.debug.activeDebugSession;
             if (!s || s.type !== 'oric-debug') { vscode.window.showInformationMessage('Oric: start a debug session first.'); return; }

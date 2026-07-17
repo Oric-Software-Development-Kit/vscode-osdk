@@ -188,6 +188,11 @@
                 "icon": "$(history)"
             },
             {
+                "command": "oric-debug.snapshotRestartRecent",
+                "title": "Oric: Restart to Most Recent Snapshot",
+                "icon": "$(debug-restart)"
+            },
+            {
                 "command": "oric-debug.snapshotDelete",
                 "title": "Oric: Delete Snapshot"
             },

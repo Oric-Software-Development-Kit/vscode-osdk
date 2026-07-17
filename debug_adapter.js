@@ -598,6 +598,8 @@ let scriptLaunched = false;    // true when Oricutron was started via a launch s
 let initBreakAddr = -1;        // address of the --gdb_break entry breakpoint to drop on connect (-1 = none)
 let entryAddr = -1;            // preserved entry address (initBreakAddr is cleared once hit; restart re-arms from this)
 let awaitingEntry = false;     // true after configurationDone continue, until the entry breakpoint is hit
+let baselineReady = false;     // a "__baseline" snapshot was captured at the entry (enables instant restart)
+let restartViaSnapshot = false;// set by restart() when it loaded the baseline; configurationDone then just stops at entry
 
 // ----------------------------------------------------------------
 // Build staleness check (pure Node.js, cross-platform)
@@ -821,6 +823,18 @@ function writeSnapshotManifest(m) {
     try { fs.mkdirSync(snapshotDir(), { recursive: true }); fs.writeFileSync(path.join(snapshotDir(), 'manifest.json'), JSON.stringify(m, null, 2)); }
     catch (e) { log('snapshot manifest write failed: ' + e.message); }
 }
+// The reserved baseline snapshot: captured once at the program entry (loaded, before
+// the first continue) so Restart can reload it instantly instead of rebooting +
+// re-loading the tape. Hidden from the user's snapshot list.
+const BASELINE = '__baseline';
+async function captureBaseline() {
+    try { fs.mkdirSync(snapshotDir(), { recursive: true }); } catch (e) { /* ignore */ }
+    const r = await gdbCmd('qOricSaveSnapshot,' + Buffer.from(snapshotFile(BASELINE), 'utf8').toString('hex'));
+    if (typeof r === 'string' && r.indexOf('E snapshot') === 0) { baselineReady = false; log('Baseline snapshot failed: ' + r.slice(2).trim()); return; }
+    baselineReady = true;
+    log('Captured restart baseline snapshot at the entry');
+}
+
 // Drop snapshots taken against a DIFFERENT binary (by checksum). Called at launch.
 function pruneStaleSnapshots() {
     if (!launchArtifactHash) return;
@@ -828,6 +842,7 @@ function pruneStaleSnapshots() {
     if (m.hash && m.hash !== launchArtifactHash) {
         const names = Object.keys(m.snaps || {});
         for (const n of names) { try { fs.unlinkSync(snapshotFile(n)); } catch (e) { /* ignore */ } }
+        try { fs.unlinkSync(snapshotFile(BASELINE)); } catch (e) { /* ignore */ }   // the restart baseline is stale too
         log('Snapshots invalidated (binary changed) — cleared ' + names.length);
         writeSnapshotManifest({ hash: launchArtifactHash, snaps: {} });
     } else if (m.hash !== launchArtifactHash) {
@@ -1643,6 +1658,9 @@ async function onStopReply(payload) {
         const bp = initBreakAddr;
         initBreakAddr = -1;
         await gdbCmd('z0,' + bp.toString(16) + ',1');
+        // Program is loaded and sitting at the entry (bootstrap bp just dropped, user
+        // breakpoints armed): the ideal baseline for an instant Restart.
+        await captureBaseline();
         if (!config.stopOnEntry) {
             log('Reached entry; running to first breakpoint');
             running = true;
@@ -3412,6 +3430,23 @@ const handlers = {
         // (whenGdbIdle waits for the Z2 to complete first).
         armModuleWatch();
 
+        // Instant restart via baseline snapshot: the machine is restored AT the entry
+        // (osdk_start), exactly where launch's entry-hit leaves it. Mirror what launch
+        // does next — stop at entry only if stopOnEntry, otherwise continue and run to
+        // the first breakpoint (e.g. main), so Restart lands where a fresh start does.
+        // Breakpoints were re-sent above and reconciled against the restored set.
+        if (restartViaSnapshot) {
+            restartViaSnapshot = false;
+            if (config.stopOnEntry) {
+                log('configurationDone: restored baseline — stop at entry');
+                evt('stopped', { reason: 'entry', threadId: 1, allThreadsStopped: true });
+            } else {
+                log('configurationDone: restored baseline — running to first breakpoint');
+                whenGdbIdle(() => { running = true; gdbWrite('c'); });
+            }
+            return;
+        }
+
         // Script-launch: on connect we're paused at boot (pause-on-connect), NOT yet at
         // the entry. Continue so the emulator runs through the auto-CLOAD and hits the
         // --gdb_break at the program entry; onStopReply then drops that breakpoint and
@@ -3467,6 +3502,7 @@ const handlers = {
         log('Restarting debug session...');
 
         // --- Step 1: Build if stale ---
+        let rebuilt = false;
         if (config.build) {
             const buildOutput = config.build.output;
             const sourceDirs  = config.build.sources;
@@ -3480,6 +3516,7 @@ const handlers = {
                     try {
                         await runBuild(buildCmd, buildCwd);
                         log('Build succeeded.');
+                        rebuilt = true;
                     } catch (e) {
                         respond(req, {}, false, 'Rebuild failed: ' + e.message);
                         return;
@@ -3495,10 +3532,34 @@ const handlers = {
             loadSymbols(config.symbolFile);
         }
 
-        // --- Step 3: Hard reset Oricutron (reloads disk + resets CPU, pauses) ---
         configDone = false;
         pendingStop = null;
         running = false;
+
+        // --- Step 3a: Instant restart via the entry baseline snapshot ---
+        // If nothing was rebuilt (same binary in RAM) and we captured a baseline at
+        // launch, reload it: no ROM boot, no tape load. configurationDone then just
+        // stops at the restored entry. Falls back to the hard reset below on any
+        // problem. (A rebuild changes the binary, so the baseline is stale — skip it.)
+        if (scriptLaunched && baselineReady && !rebuilt && fs.existsSync(snapshotFile(BASELINE))) {
+            const r = await gdbCmd('qOricLoadSnapshot,' + Buffer.from(snapshotFile(BASELINE), 'utf8').toString('hex'));
+            if (!(typeof r === 'string' && r.indexOf('E snapshot') === 0)) {
+                regs = parseStopRegs(r);
+                moduleByteTrusted = false;
+                clearGdbReadCache();
+                restartViaSnapshot = true;
+                log('Restart via baseline snapshot (instant), PC=$' + (regs && regs.pc !== undefined ? regs.pc.toString(16).toUpperCase().padStart(4, '0') : '??'));
+                respond(req);
+                evt('initialized');   // VS Code re-sends breakpoints; configurationDone stops at entry
+                return;
+            }
+            log('Baseline load failed (' + r + '); falling back to hard reset');
+        }
+
+        // --- Step 3b: Hard reset Oricutron (reloads disk + resets CPU, pauses) ---
+        // Fresh boot: don't trust the resident module byte until the loader re-stamps
+        // it (loadSymbols already reset activeModuleId/moduleReported). Matches launch().
+        moduleByteTrusted = false;
         // Fresh boot: don't trust the resident module byte until the loader re-stamps
         // it (loadSymbols already reset activeModuleId/moduleReported). Matches launch().
         moduleByteTrusted = false;
@@ -5016,7 +5077,9 @@ const handlers = {
     },
     listSnapshots(req) {
         const m = readSnapshotManifest();
-        const snaps = Object.keys(m.snaps || {}).map(n => ({ name: n, pc: m.snaps[n].pc, at: m.snaps[n].at }))
+        const snaps = Object.keys(m.snaps || {})
+            .filter(n => n.indexOf('__') !== 0)   // hide reserved snapshots (the restart baseline)
+            .map(n => ({ name: n, pc: m.snaps[n].pc, at: m.snaps[n].at }))
             .sort((a, b) => (b.at || 0) - (a.at || 0));
         respond(req, { hash: m.hash, snapshots: snaps });
     },
