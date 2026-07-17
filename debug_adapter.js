@@ -230,7 +230,8 @@ let pendingCmd = null;       // full pending GDB command (some commands reply wi
 // match by prefix.)
 function stopReplyIsResponse() {
     return pendingCmdType === '?' || pendingCmd === 'qOricHardReset' ||
-           (pendingCmd !== null && pendingCmd.indexOf('qOricLoadSnapshot,') === 0);
+           (pendingCmd !== null && pendingCmd.indexOf('qOricLoadSnapshot,') === 0) ||
+           (pendingCmd !== null && pendingCmd.indexOf('qOricHistBack,') === 0);
 }
 let gdbQueue = [];           // queued commands: [{cmd, resolve}]
 let disconnecting = false;
@@ -1702,7 +1703,7 @@ function logpointsAt(pc) {
 function stoppingBpAt(pc) {
     for (const [, b] of bps)  if (b.addr === pc) return true;
     for (const [, b] of ibps) if (b.addr === pc) return true;
-    if (addrBps.has(pc)) return true;
+    if (addrBps.has(pc) && addrBps.get(pc).enabled) return true;
     for (const [, arr] of srcBps)
         for (const bp of arr)
             if (!bp.logMessage && bp.bindings.some(b => b.addr === pc && b.armed)) return true;
@@ -1983,7 +1984,7 @@ async function reconcileMonitorBreakpoints() {
     }
 
     if (added.length || removed.length) evt('oricMonitorBreakpoints', { added, removed });
-    if (addrChanged) evt('oricAddressBreakpoints', {});   // refresh the Address panel + disasm dots
+    if (addrChanged) fireAddrBps();   // refresh the Address panel + disasm dots
 }
 
 // While the session is STOPPED, the adapter is otherwise idle, so a breakpoint set
@@ -3412,8 +3413,17 @@ async function connectAndHandshake(req) {
             }
             await loadRomSymbols();   // name ROM addresses the build symbols don't cover (best-effort)
             startMonitorBpPoll();     // pick up hand-set monitor breakpoints while stopped
+            // Time-travel history: size the ring so reverse-stepping works from VS Code.
+            // Budget from launch cfg historyBudgetMB (default 64MB; set 0 to disable).
+            histBudgetKB = ((config.historyBudgetMB != null ? config.historyBudgetMB : 64) * 1024) | 0;
+            histEnabled = histBudgetKB > 0;
+            try { await gdbCmd('qOricHistConfig,' + histBudgetKB); } catch (e) { /* old stub: no history */ }
             respond(req);
             evt('initialized');
+            // supportsStepBack depends on the (config-driven) history budget, unknown at
+            // initialize time — announce it now via a CapabilitiesEvent so VS Code shows
+            // the Step Back / Reverse buttons.
+            if (histEnabled) evt('capabilities', { capabilities: { supportsStepBack: true } });
             return true;
         } catch (e) {
             if (attempt < retries) {
@@ -3423,6 +3433,21 @@ async function connectAndHandshake(req) {
         }
     }
     return false;
+}
+
+// Notify the extension that the address-breakpoint set changed, carrying the full
+// current list so it can refresh the panel/dots AND persist it without a round-trip.
+function fireAddrBps() {
+    evt('oricAddressBreakpoints', { breakpoints: [...addrBps.values()].map(b => ({ address: b.addr, enabled: b.enabled })) });
+}
+
+// Push the current machine state onto the emulator's history ring before a
+// user-visible FORWARD step, so Step Back / Reverse Continue can return to it.
+// No-op when history is disabled. Called only at the user step-request entry —
+// NOT on the adapter's internal transparent steps (module-watch, step-over temp
+// bp), which would over-capture.
+async function histPush() {
+    if (histEnabled) { try { await gdbCmd('qOricHistPush'); } catch (e) { /* ignore */ } }
 }
 
 // Full relaunch from within the restart handler: kill the current emulator,
@@ -4317,6 +4342,7 @@ const handlers = {
 
     async continue(req) {
         resumeMode = 'run';
+        await histPush();   // record the state we're leaving, for Step Back / Reverse
         // If PC is sitting on a breakpoint, single-step past it first,
         // then continue via the continueAfterStep flag in onStopReply
         if (regs && regs.pc !== undefined) {
@@ -4340,6 +4366,7 @@ const handlers = {
 
     async next(req) {
         resumeMode = 'step';
+        await histPush();
         const granularity = (req.arguments && req.arguments.granularity) || 'statement';
         logVerbose('next: granularity=' + granularity);
         const src = regs ? sourceFor(regs.pc) : null;
@@ -4373,6 +4400,7 @@ const handlers = {
 
     async stepIn(req) {
         resumeMode = 'step';
+        await histPush();
         const granularity = (req.arguments && req.arguments.granularity) || 'statement';
         const src = regs ? sourceFor(regs.pc) : null;
         // Source-level Step Into: single-step at the instruction level until we reach a
@@ -4399,12 +4427,54 @@ const handlers = {
         gdbWrite('s');
     },
 
-    stepOut(req) {
+    async stepOut(req) {
         resumeMode = 'step';
+        await histPush();
         regs = null;
         respond(req);
         running = true;
         gdbWrite('O');
+    },
+
+    // -- Reverse execution (time-travel history ring) -------------
+    // The forward handlers push the pre-step state; these pop + restore it. The
+    // stub's qOricHistBack restores and replies with a T05 stop reply (treated as
+    // this command's response, see stopReplyIsResponse). A restored history entry
+    // carries its own saved breakpoint table, so resync the stub to the current
+    // set afterwards (like a snapshot load).
+    async stepBack(req) {
+        respond(req);
+        if (!histEnabled) { evt('stopped', { reason: 'step', threadId: 1, allThreadsStopped: true }); return; }
+        const reply = await gdbCmd('qOricHistBack,1');
+        if (typeof reply !== 'string' || reply[0] === 'E' || reply[0] !== 'T') {
+            evt('stopped', { reason: 'step', threadId: 1, allThreadsStopped: true }); // nothing to step back to
+            return;
+        }
+        regs = parseStopRegs(reply);
+        running = false;
+        await resyncStubBreakpoints();
+        evt('stopped', { reason: 'step', threadId: 1, allThreadsStopped: true });
+    },
+
+    async reverseContinue(req) {
+        respond(req);
+        if (!histEnabled) { evt('stopped', { reason: 'pause', threadId: 1, allThreadsStopped: true }); return; }
+        // Step back through history until a breakpoint PC or the oldest entry.
+        // Bounded by the ring depth so it always terminates.
+        let count = 0;
+        const st = await gdbCmd('qOricHistStatus');
+        const m = /^hist:(\d+)/.exec(st || '');
+        if (m) count = parseInt(m[1], 10);
+        let lastReply = null;
+        for (let i = 0; i < count; i++) {
+            const reply = await gdbCmd('qOricHistBack,1');
+            if (typeof reply !== 'string' || reply[0] !== 'T') break;
+            lastReply = reply;
+            const r = parseStopRegs(reply);
+            if (r && r.pc !== undefined && stoppingBpAt(r.pc)) break; // reached a breakpoint
+        }
+        if (lastReply) { regs = parseStopRegs(lastReply); running = false; await resyncStubBreakpoints(); }
+        evt('stopped', { reason: 'breakpoint', threadId: 1, allThreadsStopped: true });
     },
 
     pause(req) {
@@ -6082,7 +6152,7 @@ const handlers = {
         const pendingAddrs = [];
         for (const [, bp] of bps) bpAddrs.push(bp.addr);
         for (const [, bp] of ibps) bpAddrs.push(bp.addr);
-        for (const [, bp] of addrBps) bpAddrs.push(bp.addr);
+        for (const [, bp] of addrBps) (bp.enabled ? bpAddrs : pendingAddrs).push(bp.addr);
         for (const [, fileBps] of srcBps) {
             for (const bp of fileBps) for (const b of bp.bindings) (b.armed ? bpAddrs : pendingAddrs).push(b.addr);
         }
@@ -6111,17 +6181,34 @@ const handlers = {
     // InstructionBreakpoint model (which it won't arm for programmatic bps). The Oric
     // Disassembly gutter and the Oric Breakpoints panel drive these.
 
-    // Toggle: arm+track if absent, disarm+untrack if present. Reply { address, set }.
+    // Toggle: add (armed) if absent, remove if present. Reply { address, set }.
     async toggleAddressBreakpoint(req) {
         const addr = req.arguments && req.arguments.address;
         if (typeof addr !== 'number') { respond(req, { set: false }); return; }
         const a = addr & 0xFFFF;
         return withBpLock(async () => {
             let set;
-            if (addrBps.has(a)) { await disarmAddr(a); addrBps.delete(a); set = false; }
-            else                { await armAddr(a);    addrBps.set(a, { addr: a }); set = true; }
+            if (addrBps.has(a)) { if (addrBps.get(a).enabled) await disarmAddr(a); addrBps.delete(a); set = false; }
+            else                { await armAddr(a); addrBps.set(a, { addr: a, enabled: true }); set = true; }
             respond(req, { address: a, set });
-            evt('oricAddressBreakpoints', {});   // extension refreshes the panel + disasm dots
+            fireAddrBps();   // extension refreshes the panel + disasm dots
+        });
+    },
+
+    // Enable/disable without removing: a disabled address breakpoint stays in the
+    // list but is disarmed (no Z0), so it won't stop. Reply {}.
+    async setAddressBreakpointEnabled(req) {
+        const addr = req.arguments && req.arguments.address;
+        const enabled = !!(req.arguments && req.arguments.enabled);
+        if (typeof addr !== 'number' || !addrBps.has(addr & 0xFFFF)) { respond(req, {}); return; }
+        const a = addr & 0xFFFF;
+        return withBpLock(async () => {
+            const b = addrBps.get(a);
+            if (enabled && !b.enabled) await armAddr(a);
+            else if (!enabled && b.enabled) await disarmAddr(a);
+            b.enabled = enabled;
+            respond(req, {});
+            fireAddrBps();
         });
     },
 
@@ -6130,9 +6217,31 @@ const handlers = {
         const addr = req.arguments && req.arguments.address;
         if (typeof addr === 'number' && addrBps.has(addr & 0xFFFF)) {
             const a = addr & 0xFFFF;
-            return withBpLock(async () => { await disarmAddr(a); addrBps.delete(a); respond(req, {}); evt('oricAddressBreakpoints', {}); });
+            return withBpLock(async () => { if (addrBps.get(a).enabled) await disarmAddr(a); addrBps.delete(a); respond(req, {}); fireAddrBps(); });
         }
         respond(req, {});
+    },
+
+    // Replace the whole address-breakpoint set (restore persisted ones at session
+    // start — they're adapter-owned, so the extension re-sends them, preserving each
+    // one's enabled state). Accepts [{address, enabled}] (or bare numbers). Reply {}.
+    async setAddressBreakpoints(req) {
+        const items = (req.arguments && Array.isArray(req.arguments.breakpoints)) ? req.arguments.breakpoints
+                    : (req.arguments && Array.isArray(req.arguments.addresses)) ? req.arguments.addresses.map(a => ({ address: a, enabled: true }))
+                    : [];
+        return withBpLock(async () => {
+            for (const [a, b] of addrBps) if (b.enabled) await disarmAddr(a);
+            addrBps.clear();
+            for (const it of items) {
+                const a = (typeof it === 'number' ? it : it.address) & 0xFFFF;
+                const enabled = (typeof it === 'number') ? true : (it.enabled !== false);
+                if (addrBps.has(a)) continue;
+                if (enabled) await armAddr(a);
+                addrBps.set(a, { addr: a, enabled });
+            }
+            respond(req, {});
+            fireAddrBps();
+        });
     },
 
     // List the current address breakpoints (for the Oric Breakpoints panel).
@@ -6140,7 +6249,8 @@ const handlers = {
         const list = [...addrBps.values()].map(b => ({
             address: b.addr,
             label: labelFor(b.addr),                 // build/ROM symbol name if any
-            source: !!sourceFor(b.addr)
+            source: !!sourceFor(b.addr),
+            enabled: b.enabled
         }));
         list.sort((x, y) => x.address - y.address);
         respond(req, { breakpoints: list });

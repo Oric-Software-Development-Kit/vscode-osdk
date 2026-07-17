@@ -7,6 +7,11 @@ const vscode = require('vscode');
 // so each Oric project keeps its own preference.
 const LOG_LEVEL_KEY = 'oric-debug.logLevel';
 
+// workspaceState key: adapter-owned ADDRESS breakpoints (ROM / no-source). Unlike
+// source breakpoints, VS Code doesn't persist these, so we mirror them here and
+// re-arm them on session start. Stored as an array of numeric addresses.
+const ADDR_BP_KEY = 'oric-debug.addressBreakpoints';
+
 // workspaceState key: remembers gitlens.currentLine.enabled's prior value while
 // we suppress it during a debug session, so a mid-session crash can still be
 // recovered on next activation rather than leaving GitLens blame off forever.
@@ -4616,13 +4621,15 @@ function activate(context) {
             }
             if (el.kind === 'addrBp') {
                 const a = el.a;
+                const enabled = a.enabled !== false;
                 const hx = '$' + (a.address & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
                 const it = new vscode.TreeItem(
                     (a.label && a.label !== hx) ? (hx + '  ' + a.label) : hx,
                     vscode.TreeItemCollapsibleState.None);
                 it.contextValue = 'oricAddrBp';
-                it.iconPath = new vscode.ThemeIcon('debug-breakpoint',
-                    new vscode.ThemeColor('debugIcon.breakpointForeground'));
+                it.checkboxState = enabled ? vscode.TreeItemCheckboxState.Checked : vscode.TreeItemCheckboxState.Unchecked;
+                it.iconPath = new vscode.ThemeIcon(enabled ? 'debug-breakpoint' : 'debug-breakpoint-disabled',
+                    new vscode.ThemeColor(enabled ? 'debugIcon.breakpointForeground' : 'debugIcon.breakpointDisabledForeground'));
                 it.id = 'addrbp:' + a.address;
                 return it;
             }
@@ -4696,8 +4703,15 @@ function activate(context) {
     const bpTree = vscode.window.createTreeView('oricBreakpoints',
         { treeDataProvider: bpTreeProvider, showCollapseAll: true });
     bpTree.onDidChangeCheckboxState(ev => {
-        for (const [node, state] of ev.items)
+        for (const [node, state] of ev.items) {
             if (node.kind === 'line') setBpsEnabled(node.ln.bps, state === vscode.TreeItemCheckboxState.Checked);
+            else if (node.kind === 'addrBp') {
+                const s = vscode.debug.activeDebugSession;
+                if (s && s.type === 'oric-debug')
+                    s.customRequest('setAddressBreakpointEnabled',
+                        { address: node.a.address, enabled: state === vscode.TreeItemCheckboxState.Checked }).catch(() => {});
+            }
+        }
     });
     const modBps = m => m.fileArr.flatMap(f => f.lineArr.flatMap(l => l.bps));
     const fileBps = f => f.lineArr.flatMap(l => l.bps);
@@ -4711,6 +4725,14 @@ function activate(context) {
         // settled locations — matching the native panel — without needing a manual
         // breakpoint edit.
         vscode.debug.onDidStartDebugSession(() => { rebuildBpTree(); setTimeout(rebuildBpTree, 1500); }),
+        // Re-arm persisted address breakpoints (ROM / no-source) — adapter-owned, so
+        // VS Code didn't restore them. A short delay lets the adapter finish connecting.
+        vscode.debug.onDidStartDebugSession(s => {
+            if (!s || s.type !== 'oric-debug') return;
+            const saved = context.workspaceState.get(ADDR_BP_KEY, []);
+            if (Array.isArray(saved) && saved.length)
+                setTimeout(() => s.customRequest('setAddressBreakpoints', { breakpoints: saved }).catch(() => {}), 400);
+        }),
         vscode.debug.onDidTerminateDebugSession(() => { activeOricModuleId = null; rebuildBpTree(); }),
         vscode.commands.registerCommand('oric-debug.bpEnableModule', node => { if (node && node.mod) setBpsEnabled(modBps(node.mod), true); }),
         vscode.commands.registerCommand('oric-debug.bpDisableModule', node => { if (node && node.mod) setBpsEnabled(modBps(node.mod), false); }),
@@ -5482,6 +5504,7 @@ function activate(context) {
     context.subscriptions.push(
         vscode.debug.registerDebugAdapterTrackerFactory('oric-debug', {
             createDebugAdapterTracker(session) {
+                let addrBpsRestored = false;   // re-arm persisted address bps once per session
                 return {
                     onDidSendMessage(msg) {
                         // Running/stopped state for the line actions (CodeLens + disasm panel).
@@ -5489,6 +5512,15 @@ function activate(context) {
                             setOricDebugStopped(msg.event === 'stopped');
                         }
                         if (msg.type === 'event' && msg.event === 'stopped') {
+                            // Re-arm persisted ADDRESS breakpoints (ROM / no-source) on the
+                            // first stop — the adapter is now connected and responsive, which
+                            // onDidStartDebugSession can't guarantee (too early / restart).
+                            if (!addrBpsRestored) {
+                                addrBpsRestored = true;
+                                const saved = context.workspaceState.get(ADDR_BP_KEY, []);
+                                if (Array.isArray(saved) && saved.length)
+                                    session.customRequest('setAddressBreakpoints', { breakpoints: saved }).catch(() => {});
+                            }
                             // Record the stop time so the imminent reveal-on-stop focus
                             // change (source editor) isn't mistaken for a user click that
                             // would flip step mode.
@@ -5567,6 +5599,11 @@ function activate(context) {
                         if (msg.type === 'event' && msg.event === 'oricAddressBreakpoints') {
                             rebuildBpTree();
                             refreshDisasmPanel(vscode.debug.activeDebugSession);
+                            // Mirror to workspaceState (the event carries the full list, incl.
+                            // enabled state) — VS Code doesn't persist these, so we re-arm them
+                            // on the next session's first stop.
+                            if (msg.body && Array.isArray(msg.body.breakpoints))
+                                context.workspaceState.update(ADDR_BP_KEY, msg.body.breakpoints);
                         }
                         // Active symbol module changed (auto-switch or manual) — reflect in status bar
                         if (msg.type === 'event' && msg.event === 'oricActiveModule' && msg.body) {
