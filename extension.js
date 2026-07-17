@@ -4470,12 +4470,15 @@ function activate(context) {
         const session = vscode.debug.activeDebugSession;
         let modulesMeta = [{ id: 'R', name: 'Resident' }];
         let byFile = {};
+        let snaps = {};   // "<fsPath>:<reqLine>" -> bound line (when a requested line has no code of its own)
         if (session && session.type === 'oric-debug' && all.length) {
             const files = [...new Set(all.map(b => b.location.uri.fsPath))];
+            const locs = all.map(b => ({ file: b.location.uri.fsPath, line: b.location.range.start.line + 1 }));
             try {
-                const r = await session.customRequest('getBreakpointModules', { files });
+                const r = await session.customRequest('getBreakpointModules', { files, locs });
                 if (r && r.modules) modulesMeta = r.modules;
                 if (r && r.byFile) byFile = r.byFile;
+                if (r && r.snaps) snaps = r.snaps;
             } catch (e) { /* adapter unavailable: fall back to a flat list */ }
         }
         if (gen !== bpTreeGen) return;   // a newer rebuild started during the await — let it win
@@ -4490,7 +4493,10 @@ function activate(context) {
         for (const b of all) {
             const fsPath = b.location.uri.fsPath;
             const owners = (byFile[fsPath] && byFile[fsPath].length) ? byFile[fsPath] : ['R'];
-            const line = b.location.range.start.line + 1;
+            const reqLine = b.location.range.start.line + 1;
+            // Show the BOUND line (where the bp actually binds) so the panel matches
+            // VS Code's gutter/native view when the requested line has no code.
+            const line = snaps[fsPath + ':' + reqLine] || reqLine;
             const col = b.location.range.start.character;
             const locKey = line + ':' + col;
             const name = b.location.uri.path.split('/').pop();
