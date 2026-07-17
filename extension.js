@@ -4408,6 +4408,62 @@ function activate(context) {
         if (rem.length) { vscode.debug.removeBreakpoints(rem); vscode.debug.addBreakpoints(add); }
     }
 
+    // Editing breakpoints straight from the Oric panel (no need to hunt for the
+    // gutter's native "Edit Breakpoint"). Each edit re-creates VS Code's own
+    // SourceBreakpoint with the one property changed, keeping the rest — so the
+    // native panel and the adapter (which re-sends condition/hitCount on change)
+    // stay in sync. Works with or without a live session.
+    const PROP_META = {
+        condition:    { label: 'Condition',   prompt: 'Break only when this holds — leave blank to clear', ph: 'e.g.  g_score > 100   ·   e->hp == 0   ·   g_entities[i].kind == KIND_DRAGON' },
+        hitCondition: { label: 'Hit Count',    prompt: 'Break on/after the Nth hit — leave blank to clear',  ph: 'e.g.  5' },
+        logMessage:   { label: 'Log Message',  prompt: 'Print on hit and keep running; {expr} interpolates; add [stop] to also break — leave blank to clear', ph: 'e.g.  reached start, i={i}, hp={e->hp}  [stop]' }
+    };
+    const propVal = (bp, prop) => prop === 'condition' ? bp.condition : prop === 'hitCondition' ? bp.hitCondition : bp.logMessage;
+    function updateBpProps(bps, changes) {
+        const keys = new Set(bps.map(bpKey));
+        const rem = [], add = [];
+        for (const bp of vscode.debug.breakpoints) {
+            if (!(bp instanceof vscode.SourceBreakpoint) || !keys.has(bpKey(bp))) continue;
+            rem.push(bp);
+            const cond = 'condition' in changes ? changes.condition : bp.condition;
+            const hit  = 'hitCondition' in changes ? changes.hitCondition : bp.hitCondition;
+            const log  = 'logMessage' in changes ? changes.logMessage : bp.logMessage;
+            add.push(new vscode.SourceBreakpoint(bp.location, bp.enabled, cond || undefined, hit || undefined, log || undefined));
+        }
+        if (rem.length) { vscode.debug.removeBreakpoints(rem); vscode.debug.addBreakpoints(add); }
+    }
+    async function editBpProp(L, prop) {
+        if (!L || !L.bps || !L.bps.length) return;
+        const meta = PROP_META[prop];
+        const val = await vscode.window.showInputBox({
+            prompt: meta.prompt, value: propVal(L.bps[0], prop) || '',
+            placeHolder: meta.ph, ignoreFocusOut: true
+        });
+        if (val === undefined) return;   // cancelled — leave unchanged
+        updateBpProps(L.bps, { [prop]: val.trim() || undefined });
+    }
+    function removeBpLine(L) {
+        if (!L || !L.bps || !L.bps.length) return;
+        const keys = new Set(L.bps.map(bpKey));
+        const rem = vscode.debug.breakpoints.filter(b => b instanceof vscode.SourceBreakpoint && keys.has(bpKey(b)));
+        if (rem.length) vscode.debug.removeBreakpoints(rem);
+    }
+    async function editBpLine(node) {
+        const L = node && node.ln;
+        if (!L || !L.bps || !L.bps.length) return;
+        const rep = L.bps[0];
+        const items = Object.keys(PROP_META).map(prop => ({
+            label: PROP_META[prop].label, description: propVal(rep, prop) || '(none)', prop
+        }));
+        items.push({ label: '$(trash) Remove Breakpoint', prop: '__remove' });
+        const pick = await vscode.window.showQuickPick(items, {
+            placeHolder: 'Edit breakpoint — line ' + L.line + (L.col ? ':' + L.col : '')
+        });
+        if (!pick) return;
+        if (pick.prop === '__remove') return removeBpLine(L);
+        await editBpProp(L, pick.prop);
+    }
+
     async function rebuildBpTree() {
         const gen = ++bpTreeGen;
         const all = vscode.debug.breakpoints.filter(b => b instanceof vscode.SourceBreakpoint);
@@ -4484,8 +4540,18 @@ function activate(context) {
     // the right of the code. Icon carries an at-a-glance cue; text is the label.
     const lineDetails = L => {
         const rep = L.bps[0], out = [];
-        if (rep.condition) out.push({ text: 'if ' + rep.condition, icon: 'debug-breakpoint-conditional' });
-        if (rep.hitCondition) out.push({ text: 'hit count ' + rep.hitCondition, icon: 'symbol-number' });
+        if (rep.condition) out.push({ text: 'if ' + rep.condition, icon: 'debug-breakpoint-conditional', prop: 'condition' });
+        if (rep.hitCondition) out.push({ text: 'hit count ' + rep.hitCondition, icon: 'symbol-number', prop: 'hitCondition' });
+        // The logpoint message on its own row (like the condition) instead of a
+        // tiny "log" tag — a conditional logpoint then reads clearly: "if <cond>"
+        // above "log: <message>". Both fire together (log only when cond holds).
+        if (rep.logMessage) {
+            // "[stop]" in the message means log AND break — reflect that in the row
+            // label (token stripped for readability) so the behavior is visible.
+            const stops = /\[stop\]/i.test(rep.logMessage);
+            const msg = rep.logMessage.replace(/\s*\[stop\]\s*/ig, ' ').trim();
+            out.push({ text: (stops ? 'log & stop: ' : 'log: ') + msg, icon: 'debug-breakpoint-log', prop: 'logMessage' });
+        }
         return out;
     };
 
@@ -4546,10 +4612,9 @@ function activate(context) {
             const lineTag = L.line + (L.col ? ':' + L.col : '');
             const marks = [];
             if (here) marks.push('▶ stopped here');
-            if (rep.logMessage) marks.push('log');
             if (L.bps.length > 1) marks.push(L.bps.length + ' bps');
-            // Condition/hit-count are NOT put here — they get their own child rows
-            // (see lineDetails) so a long expression is fully visible on its own line.
+            // Condition/hit-count/log-message are NOT put here — they get their own
+            // child rows (see lineDetails) so long text is fully visible on its own line.
             const details = lineDetails(L);
             // Line number FIRST in the label so it stays visible — long code would
             // otherwise push a trailing line number off-screen. Code follows it and
@@ -4595,7 +4660,12 @@ function activate(context) {
         vscode.commands.registerCommand('oric-debug.bpEnableFile', node => { if (node && node.file) setBpsEnabled(fileBps(node.file), true); }),
         vscode.commands.registerCommand('oric-debug.bpDisableFile', node => { if (node && node.file) setBpsEnabled(fileBps(node.file), false); }),
         vscode.commands.registerCommand('oric-debug.bpEnableAll', () => setBpsEnabled(allBps(), true)),
-        vscode.commands.registerCommand('oric-debug.bpDisableAll', () => setBpsEnabled(allBps(), false))
+        vscode.commands.registerCommand('oric-debug.bpDisableAll', () => setBpsEnabled(allBps(), false)),
+        // Edit from the panel: line row -> pick which property; detail row -> edit
+        // that property directly; plus remove.
+        vscode.commands.registerCommand('oric-debug.bpEdit', editBpLine),
+        vscode.commands.registerCommand('oric-debug.bpEditDetail', node => { if (node && node.ln && node.prop) editBpProp(node.ln, node.prop); }),
+        vscode.commands.registerCommand('oric-debug.bpRemove', node => { if (node && node.ln) removeBpLine(node.ln); })
     );
     rebuildBpTree();
 

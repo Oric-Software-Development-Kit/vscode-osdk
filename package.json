@@ -163,6 +163,21 @@
                 "icon": "$(circle-slash)"
             },
             {
+                "command": "oric-debug.bpEdit",
+                "title": "Oric: Edit Breakpoint…",
+                "icon": "$(edit)"
+            },
+            {
+                "command": "oric-debug.bpEditDetail",
+                "title": "Oric: Edit",
+                "icon": "$(edit)"
+            },
+            {
+                "command": "oric-debug.bpRemove",
+                "title": "Oric: Remove Breakpoint",
+                "icon": "$(trash)"
+            },
+            {
                 "command": "oric-debug.openMemoryView",
                 "title": "Oric: Memory View"
             },
@@ -327,7 +342,12 @@
                 { "command": "oric-debug.bpEnableFile", "when": "view == oricBreakpoints && viewItem == oricFile", "group": "inline@1" },
                 { "command": "oric-debug.bpDisableFile", "when": "view == oricBreakpoints && viewItem == oricFile", "group": "inline@2" },
                 { "command": "oric-debug.bpEnableFile", "when": "view == oricBreakpoints && viewItem == oricFile", "group": "1_mod@1" },
-                { "command": "oric-debug.bpDisableFile", "when": "view == oricBreakpoints && viewItem == oricFile", "group": "1_mod@2" }
+                { "command": "oric-debug.bpDisableFile", "when": "view == oricBreakpoints && viewItem == oricFile", "group": "1_mod@2" },
+                { "command": "oric-debug.bpEdit", "when": "view == oricBreakpoints && viewItem == oricBp", "group": "inline@1" },
+                { "command": "oric-debug.bpRemove", "when": "view == oricBreakpoints && viewItem == oricBp", "group": "inline@2" },
+                { "command": "oric-debug.bpEdit", "when": "view == oricBreakpoints && viewItem == oricBp", "group": "1_bp@1" },
+                { "command": "oric-debug.bpRemove", "when": "view == oricBreakpoints && viewItem == oricBp", "group": "1_bp@2" },
+                { "command": "oric-debug.bpEditDetail", "when": "view == oricBreakpoints && viewItem == oricBpDetail", "group": "inline@1" }
             ],
             "debug/toolBar": [
                 {
