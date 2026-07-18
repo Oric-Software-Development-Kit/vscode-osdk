@@ -675,14 +675,14 @@ function resolveEnum(name, value) {
     if (name && name.indexOf('|') >= 0) {
         let first = null;
         for (const part of name.split('|')) {
-            const ed = enumDefs.get(part) || allEnumDefs.get(part);
+            const ed = enumDefs.get(part) || allEnumDefs.get(part) || headerEnumDefs.get(part);
             if (!ed) continue;
             if (value !== undefined && ed.byValue.has(value)) return ed;
             if (!first) first = ed;
         }
         return first;
     }
-    return enumDefs.get(name) || allEnumDefs.get(name);
+    return enumDefs.get(name) || allEnumDefs.get(name) || headerEnumDefs.get(name);
 }
 // Annotation lookup for a symbol (C global or asm label), tolerant of the leading
 // underscore the C compiler / assembler add. One place so every view resolves the
@@ -2478,6 +2478,7 @@ function parseAnnotations(files) {
   annByField.clear();
   annBySymbol.clear();
   paramsByEnumMember.clear();
+  headerEnumDefs.clear();
   try {
     // stream before str: alternation is first-match (str\b would not match "stream"
     // anyway due to \b, but keep the longer tokens earlier to be safe).
@@ -2504,6 +2505,7 @@ function parseAnnotations(files) {
         const isAsm = /\.(s|asm)$/i.test(f);
         let inStruct = false, structName = null, pending = [];
         let inEnum = false, enumName = null, pendingParams = [];
+        let enumMembers = [], enumNextVal = 0, enumValid = true;
         for (const line of lines) {
             // Enter a C struct/union body (name may be trailing on the '}' line).
             if (!isAsm && !inStruct && /\b(typedef\s+)?(struct|union)\b/.test(line)
@@ -2516,6 +2518,7 @@ function parseAnnotations(files) {
             if (!isAsm && !inEnum && /\benum\b/.test(line)
                 && !/;/.test(line.replace(/\/\/.*$/, ''))) {
                 inEnum = true; pendingParams = []; enumName = null;
+                enumMembers = []; enumNextVal = 0; enumValid = true;
             }
             // Split code from comment. C comment = "//"; asm also allows ";".
             let ci = line.indexOf('//');
@@ -2533,6 +2536,23 @@ function parseAnnotations(files) {
                     const ids = c.match(/[A-Za-z_]\w*/g);
                     const member = ids ? ids[ids.length - 1] : null;
                     if (member) pendingParams.push({ member, types: pm[1].trim() ? pm[1].trim().split(/\s+/) : [] });
+                }
+                // Member VALUES, for the headerEnumDefs fallback. Skip the decl
+                // line itself; only literal decimal/hex or implicit sequential
+                // values are trusted — any other member line poisons the whole
+                // enum (enumValid=false) so we never render wrong names.
+                if (!/\b(typedef|enum)\b/.test(code)) {
+                    const em = code.match(/^\s*([A-Za-z_]\w*)\s*(?:=\s*([^,\s]+))?\s*,?\s*$/);
+                    if (em) {
+                        let v;
+                        if (em[2] === undefined) v = enumNextVal;
+                        else if (/^\d+$/.test(em[2])) v = parseInt(em[2], 10);
+                        else if (/^0[xX][0-9a-fA-F]+$/.test(em[2])) v = parseInt(em[2], 16);
+                        else enumValid = false;
+                        if (v !== undefined) { enumMembers.push({ name: em[1], value: v }); enumNextVal = v + 1; }
+                    } else if (code.trim() && !/[{}]/.test(code)) {
+                        enumValid = false;   // unparseable member line — don't guess
+                    }
                 }
             }
             const m = comment.match(ANN);
@@ -2575,12 +2595,32 @@ function parseAnnotations(files) {
                 if (structName) for (const p of pending) annByField.set(structName + '.' + p.field, p.directive);
                 inStruct = false; structName = null; pending = [];
             }
-            // Close a C enum: flush buffered @params grammar under the enum's name.
+            // Close a C enum: flush buffered @params grammar under the enum's name,
+            // plus the header-parsed member values (fallback defs for pure-asm
+            // projects — resolveEnum consults these only when no compiler-emitted
+            // enum record exists). isFlags heuristic matches the #TYPES parser.
             if (!isAsm && inEnum && /\}/.test(line)) {
                 const nm = line.match(/\}\s*([A-Za-z_]\w*)\s*;/);
                 if (nm) enumName = nm[1];
                 if (enumName) for (const p of pendingParams) paramsByEnumMember.set(enumName + '.' + p.member, p.types);
+                if (enumName && enumValid && enumMembers.length && !headerEnumDefs.has(enumName)) {
+                    const byValue = new Map();
+                    let allSingleBit = true, nonZero = 0, seenBits = 0, maxVal = 0;
+                    for (const mb of enumMembers) {
+                        if (!byValue.has(mb.value)) byValue.set(mb.value, mb.name);  // first name wins on aliases
+                        const ev = mb.value;
+                        if (ev !== 0) {
+                            nonZero++;
+                            if (ev > maxVal) maxVal = ev;
+                            if ((ev & (ev - 1)) !== 0 || (seenBits & ev)) allSingleBit = false;
+                            seenBits |= ev;
+                        }
+                    }
+                    const isFlags = nonZero >= 2 && allSingleBit && maxVal >= 4;
+                    headerEnumDefs.set(enumName, { size: 1, byValue, isFlags });
+                }
                 inEnum = false; enumName = null; pendingParams = [];
+                enumMembers = []; enumNextVal = 0; enumValid = true;
             }
         }
     }
