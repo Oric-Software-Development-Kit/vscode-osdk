@@ -135,8 +135,7 @@
                 {
                     "id": "oricCurrentInstr",
                     "name": "Current Instruction",
-                    "type": "webview",
-                    "when": "inDebugMode && debugType == 'oric-debug'"
+                    "type": "webview"
                 }
             ]
         },

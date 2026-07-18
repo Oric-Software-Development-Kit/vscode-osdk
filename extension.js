@@ -12,6 +12,11 @@ const LOG_LEVEL_KEY = 'oric-debug.logLevel';
 // re-arm them on session start. Stored as an array of numeric addresses.
 const ADDR_BP_KEY = 'oric-debug.addressBreakpoints';
 
+// Shared dimming for live-data webviews when the debugger isn't stopped (no session,
+// or running): keep the last values but grey them out, so it's visually clear the data
+// is stale rather than live. Providers add `class="stale"` on <body>.
+const STALE_CSS = 'body.stale{opacity:.5;filter:grayscale(.35)}';
+
 // workspaceState key: remembers gitlens.currentLine.enabled's prior value while
 // we suppress it during a debug session, so a mid-session crash can still be
 // recovered on next activation rather than leaving GitLens blame off forever.
@@ -149,18 +154,19 @@ class RegistersWebviewProvider {
     constructor() {
         this._view = null;
         this._prev = {};  // previous values for change detection
+        this._last = null; // last live {regs, flags, extra}, kept to show dimmed when stale
     }
 
     resolveWebviewView(webviewView) {
         this._view = webviewView;
         webviewView.webview.options = { enableScripts: false };
-        this._updateHtml(null);
+        this.markStale();
     }
 
     refresh(session) {
         if (!this._view) return;
         if (!session || session.type !== 'oric-debug') {
-            this._updateHtml(null);
+            this.markStale();
             return;
         }
         Promise.all([
@@ -175,17 +181,21 @@ class RegistersWebviewProvider {
             if (flagResp && flagResp.variables)
                 for (const v of flagResp.variables) flags[v.name] = v.value;
             const extra = extraResp && extraResp.extra;
-            this._updateHtml(regs, flags, extra);
-        }).catch(() => this._updateHtml(null));
+            this._last = { regs, flags, extra };
+            this._updateHtml(regs, flags, extra, false);
+        }).catch(() => this.markStale());
     }
 
-    _updateHtml(regs, flags, extra) {
+    // No live data (no session or running): keep the last values but dimmed, so it's
+    // obviously stale. Nothing ever shown yet → the plain "no session" placeholder.
+    markStale() {
         if (!this._view) return;
-        if (!regs) {
-            this._view.webview.html = '<body style="color:var(--vscode-foreground);font-family:var(--vscode-editor-font-family);font-size:var(--vscode-editor-font-size);padding:8px"><i>No debug session</i></body>';
-            this._prev = {};  // reset so next session starts fresh
-            return;
-        }
+        if (this._last) this._updateHtml(this._last.regs, this._last.flags, this._last.extra, true);
+        else this._view.webview.html = '<body style="color:var(--vscode-foreground);font-family:var(--vscode-editor-font-family);font-size:var(--vscode-editor-font-size);padding:8px"><i>No debug session</i></body>';
+    }
+
+    _updateHtml(regs, flags, extra, stale) {
+        if (!this._view || !regs) return;
 
         // Compare with previous values: returns CSS class 'v' or 'mod'
         const p = this._prev;
@@ -244,7 +254,8 @@ body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(
 .foff { opacity: 0.35; }
 .foff.mod { opacity: 1.0; color: #e04040; }
 .sep { border-top: 1px solid var(--vscode-widget-border, #444); margin: 4px 0; }
-</style></head><body>
+${STALE_CSS}
+</style></head><body class="${stale ? 'stale' : ''}">
 <div class="r">
  ${rv('A')} ${rv('X')} ${rv('Y')} ${rv('SP')} ${rv('PC')}
 </div>
@@ -262,32 +273,37 @@ class PeripheralsWebviewProvider {
     constructor() {
         this._view = null;
         this._prev = {};  // previous values for change detection
+        this._last = null; // last live peripherals, kept to show dimmed when stale
     }
 
     resolveWebviewView(webviewView) {
         this._view = webviewView;
         webviewView.webview.options = { enableScripts: false };
-        this._updateHtml(null);
+        this.markStale();
     }
 
     refresh(session) {
         if (!this._view) return;
         if (!session || session.type !== 'oric-debug') {
-            this._updateHtml(null);
+            this.markStale();
             return;
         }
         session.customRequest('readPeripherals').then(resp => {
-            this._updateHtml(resp && resp.peripherals);
-        }).catch(() => this._updateHtml(null));
+            const d = resp && resp.peripherals;
+            if (d) { this._last = d; this._updateHtml(d, false); }
+            else this.markStale();
+        }).catch(() => this.markStale());
     }
 
-    _updateHtml(d) {
+    // No live data (no session or running): last values dimmed, else a placeholder.
+    markStale() {
         if (!this._view) return;
-        if (!d) {
-            this._view.webview.html = '<body style="color:var(--vscode-foreground);font-family:var(--vscode-editor-font-family);font-size:var(--vscode-editor-font-size);padding:8px"><i>No debug session</i></body>';
-            this._prev = {};
-            return;
-        }
+        if (this._last) this._updateHtml(this._last, true);
+        else this._view.webview.html = '<body style="color:var(--vscode-foreground);font-family:var(--vscode-editor-font-family);font-size:var(--vscode-editor-font-size);padding:8px"><i>No debug session</i></body>';
+    }
+
+    _updateHtml(d, stale) {
+        if (!this._view || !d) return;
 
         // Compare with previous values: returns CSS class 'v' or 'mod'
         const p = this._prev;
@@ -371,7 +387,8 @@ body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(
 .hdr { color: var(--vscode-sideBarSectionHeader-foreground, #ccc); font-weight: bold; font-size: 0.95em; margin-top: 2px; }
 .addr { color: var(--vscode-descriptionForeground, #888); font-weight: normal; font-size: 0.9em; }
 .hr { border-top: 1px solid var(--vscode-widget-border, #444); margin: 4px 0; }
-</style></head><body>${body}</body></html>`;
+${STALE_CSS}
+</style></head><body class="${stale ? 'stale' : ''}">${body}</body></html>`;
     }
 }
 
@@ -2553,6 +2570,8 @@ let currentStopLoc = null;    // {path, line} of the top stack frame while stopp
 let bpTreeEmitter = null;     // Oric Breakpoints tree refresh signal (created in activate)
 let activeOricModuleId = null; // active overlay module id (for the breakpoint tree's follow/highlight)
 let debugControlsProvider = null; // Oric Debug Controls webview view (button toolbar in the Run & Debug sidebar)
+let oricSessionActive = false; // true between an oric-debug session's start and terminate (activeDebugSession races on terminate)
+let dimLiveViews = null;      // set in activate: greys the live-data views (regs/peripherals/…) when not stopped
 
 // Central stopped-state switch: gates the source CodeLens AND the disasm
 // panel's line actions (the webview hides its buttons/menu while the program
@@ -2564,6 +2583,9 @@ function setOricDebugStopped(v) {
     if (bpTreeEmitter) bpTreeEmitter.fire();   // clear/redraw the "stopped here" marker
     pushDebugStateToDisasm();
     if (debugControlsProvider) debugControlsProvider.pushState();
+    // Not stopped (running or session ended) → grey the live-data views to show the
+    // values are stale. When stopped, refreshAll() re-renders them live.
+    if (!oricDebugStopped && dimLiveViews) dimLiveViews();
 }
 
 // Array-valued context key for the line-number gutter menu: the PC line when
@@ -2671,9 +2693,9 @@ class DebugControlsWebviewProvider {
     }
     pushState() {
         if (!this._view) return;
-        const s = vscode.debug.activeDebugSession;
-        const active = !!(s && s.type === 'oric-debug');
-        this._view.webview.postMessage({ type: 'state', active, stopped: oricDebugStopped });
+        // Use the tracked flag, not activeDebugSession — the latter can still be set
+        // during onDidTerminateDebugSession, leaving Stop looking enabled after the end.
+        this._view.webview.postMessage({ type: 'state', active: oricSessionActive, stopped: oricDebugStopped });
     }
 }
 function setInstrStepMode(on) {
@@ -4376,10 +4398,12 @@ function activate(context) {
     let instrDecoDisasm = '';      // the 6502 instruction text at PC (shown below the C decode)
     let currentInstrView = null;   // WebviewView, set once the panel is resolved
 
-    function renderCurrentInstr() {
+    let lastGoodInstr = null;   // last LIVE render that had content, replayed dimmed when not stopped
+    function renderCurrentInstr(stale) {
         if (!currentInstrView) return;
-        currentInstrView.webview.postMessage({
+        const msg = {
             type: 'instr',
+            stale: !!stale,   // keep the content but grey it out when not stopped
             pc: (typeof lastPcAddr === 'number') ? lastPcAddr : null,
             file: instrDecoFile,
             line: instrDecoLine,
@@ -4389,7 +4413,11 @@ function activate(context) {
             lineVars: instrDecoVars || null,
             isC: instrDecoIsC,
             disasm: instrDecoDisasm || ''
-        });
+        };
+        // Remember the last LIVE render with real content, so markInstrStale can replay
+        // it dimmed even if instrDeco* got cleared meanwhile (keeps the line info).
+        if (!stale && (msg.annotation || (msg.lineVars && msg.lineVars.length))) lastGoodInstr = msg;
+        currentInstrView.webview.postMessage(msg);
     }
 
     function clearInstrDecoration() {
@@ -4404,8 +4432,17 @@ function activate(context) {
         renderCurrentInstr();
     }
 
+    // Keep the last instruction visible but dimmed when not stopped (no clearing), so
+    // you can still read what it was after ending the session to fix the issue. Replays
+    // the last GOOD render dimmed, so an intermediate empty clear can't wipe the info.
+    function markInstrStale() {
+        if (!currentInstrView) return;
+        if (lastGoodInstr) currentInstrView.webview.postMessage(Object.assign({}, lastGoodInstr, { stale: true }));
+        else renderCurrentInstr(true);
+    }
+
     function refreshInstructionAnnotation(session) {
-        if (!session || session.type !== 'oric-debug') { clearInstrDecoration(); return; }
+        if (!session || session.type !== 'oric-debug') { markInstrStale(); return; }
         session.customRequest('resolveInstruction').then(resp => {
             const hasVars = resp && resp.lineVars && resp.lineVars.length > 0;
             if (resp && (resp.annotation || hasVars) && resp.file && resp.line > 0) {
@@ -4427,7 +4464,7 @@ function activate(context) {
                 }
                 clearInstrDecoration();
             }
-        }).catch(() => { clearInstrDecoration(); });
+        }).catch(() => { markInstrStale(); });   // session dying (query threw) → keep last-good dimmed, don't clear
     }
 
     function currentInstrHtml() {
@@ -4452,6 +4489,7 @@ function activate(context) {
                    white-space: pre-wrap; word-break: break-word; }
             body.vscode-light #cmt { color: #008000; }
             .empty { color: #808080; font-style: italic; }
+            body.stale { opacity: 0.5; filter: grayscale(0.35); }
             .val { color: #B5CEA8; } .kw { color: #C586C0; } .sym { color: #9CDCFE; } .op { color: #808080; }
             .mne { color: #569CD6; }
             body.vscode-light .val { color: #098658; } body.vscode-light .kw { color: #AF00DB; }
@@ -4516,6 +4554,7 @@ function activate(context) {
                 window.addEventListener('message', function(e){
                     const d = e.data;
                     if (!d || d.type !== 'instr') return;
+                    document.body.classList.toggle('stale', !!d.stale);
                     const hasVars = d.lineVars && d.lineVars.length;
                     if (!d.annotation && !hasVars){ hdr.style.display='none'; cmt.style.display='none'; src.style.display='none'; ann.innerHTML='<span class="empty">— no instruction —</span>'; return; }
                     let h = '';
@@ -4953,19 +4992,32 @@ function activate(context) {
     // (covers the [save] logpoint token) and on session start/stop.
     let snapItems = [];
     const snapEmitter = new vscode.EventEmitter();
+    // Gray the snapshot rows when there's no session (a TreeView can't be CSS-dimmed like a
+    // webview, but a FileDecorationProvider can tint the labels with a themed disabled color).
+    const snapDecoEmitter = new vscode.EventEmitter();
+    const snapDecoProvider = {
+        onDidChangeFileDecorations: snapDecoEmitter.event,
+        provideFileDecoration(uri) {
+            if (uri.scheme !== 'oric-snapshot' || oricSessionActive) return undefined;
+            return { color: new vscode.ThemeColor('disabledForeground') };
+        }
+    };
     async function refreshSnapshots() {
         const s = vscode.debug.activeDebugSession;
-        if (!s || s.type !== 'oric-debug') { snapItems = []; snapEmitter.fire(); return; }
+        // No session: KEEP the last listed snapshots visible (they're files on disk) rather
+        // than clearing to a placeholder — you can still see what you had; restore just needs
+        // a session (its command is gated). Only a live session re-lists them.
+        if (!s || s.type !== 'oric-debug') { snapEmitter.fire(); return; }
         try { const r = await s.customRequest('listSnapshots'); snapItems = (r && r.snapshots) || []; }
-        catch (e) { snapItems = []; }
+        catch (e) { /* session dying (query threw) → keep the last list, don't clear */ }
         snapEmitter.fire();
     }
     const snapTreeProvider = {
         onDidChangeTreeData: snapEmitter.event,
         getChildren() {
+            if (snapItems.length) return snapItems.map(x => ({ kind: 'snap', snap: x }));
             if (!vscode.debug.activeDebugSession) return [{ kind: 'hint', label: '(start a debug session to see snapshots)' }];
-            if (!snapItems.length) return [{ kind: 'hint', label: '(no snapshots — use Save Snapshot)' }];
-            return snapItems.map(x => ({ kind: 'snap', snap: x }));
+            return [{ kind: 'hint', label: '(no snapshots — use Save Snapshot)' }];
         },
         getTreeItem(el) {
             if (el.kind === 'hint') { const it = new vscode.TreeItem(el.label); it.contextValue = 'oricSnapHint'; return it; }
@@ -4975,6 +5027,7 @@ function activate(context) {
             const pc = x.pc != null ? 'PC $' + (x.pc & 0xFFFF).toString(16).toUpperCase().padStart(4, '0') : '';
             it.description = [pc, when].filter(Boolean).join('  ·  ');
             it.contextValue = 'oricSnap';
+            it.resourceUri = vscode.Uri.from({ scheme: 'oric-snapshot', path: '/' + x.name });  // enables the dim decoration
             it.iconPath = new vscode.ThemeIcon('history');
             it.id = 'snap:' + x.name;
             // Click restores (the panel's whole point is quick revert).
@@ -4986,6 +5039,7 @@ function activate(context) {
     const snapSession = () => { const s = vscode.debug.activeDebugSession; return (s && s.type === 'oric-debug') ? s : null; };
     context.subscriptions.push(
         snapTree,
+        vscode.window.registerFileDecorationProvider(snapDecoProvider),
         vscode.debug.onDidReceiveDebugSessionCustomEvent(e => { if (e.event === 'oricSnapshotsChanged') refreshSnapshots(); }),
         vscode.debug.onDidStartDebugSession(() => setTimeout(refreshSnapshots, 300)),
         vscode.debug.onDidTerminateDebugSession(() => refreshSnapshots()),
@@ -5205,12 +5259,14 @@ function activate(context) {
 
     const regsProvider = new RegistersWebviewProvider();
     const periphProvider = new PeripheralsWebviewProvider();
+    // Grey the live-data views when the debugger isn't stopped (see setOricDebugStopped).
+    dimLiveViews = () => { regsProvider.markStale(); periphProvider.markStale(); markInstrStale(); refreshWatchValues(null); };
 
     debugControlsProvider = new DebugControlsWebviewProvider();
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider('oricDebugControls', debugControlsProvider),
-        vscode.debug.onDidStartDebugSession(() => debugControlsProvider.pushState()),
-        vscode.debug.onDidTerminateDebugSession(() => debugControlsProvider.pushState()),
+        vscode.debug.onDidStartDebugSession(s => { if (s && s.type === 'oric-debug') oricSessionActive = true; debugControlsProvider.pushState(); snapDecoEmitter.fire(); }),
+        vscode.debug.onDidTerminateDebugSession(() => { oricSessionActive = false; debugControlsProvider.pushState(); snapDecoEmitter.fire(); }),
         vscode.window.registerWebviewViewProvider('oricCpuRegs', regsProvider),
         vscode.window.registerWebviewViewProvider('oricPeripherals', periphProvider),
         vscode.commands.registerCommand('oric-debug.openMemoryView', () => createMemoryPanel(context)),
