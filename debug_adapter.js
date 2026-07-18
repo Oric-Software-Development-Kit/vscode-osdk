@@ -13,6 +13,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const child_process = require('child_process');
+const os = require('os');
 
 // Staleness self-check: capture this adapter file's mtime at process start (the
 // version node actually compiled). If the file on disk later becomes newer, the
@@ -72,7 +73,20 @@ process.stdin.on('data', chunk => {
     dapBuf = Buffer.concat([dapBuf, chunk]);
     parseDap();
 });
-process.stdin.on('end', () => process.exit(0));
+// VS Code closes our stdin on a window reload / extension-host shutdown — which skips
+// the graceful DAP `disconnect`, so we must kill the emulator here or it orphans. Same
+// for termination signals and any other exit. `killLaunchedEmulator` is idempotent, and
+// the `exit` handler is the last-resort net (sync taskkill still runs during exit).
+let exitCleanupDone = false;
+function cleanupAndExit(code) {
+    if (!exitCleanupDone) { exitCleanupDone = true; try { killLaunchedEmulator(); } catch (_) { /* ignore */ } }
+    process.exit(code || 0);
+}
+process.stdin.on('end', () => cleanupAndExit(0));
+process.on('SIGTERM', () => cleanupAndExit(0));
+process.on('SIGINT',  () => cleanupAndExit(0));
+process.on('SIGHUP',  () => cleanupAndExit(0));
+process.on('exit', () => { if (!exitCleanupDone) { exitCleanupDone = true; try { killLaunchedEmulator(); } catch (_) { /* ignore */ } } });
 
 function parseDap() {
     while (true) {
@@ -389,6 +403,110 @@ function killByPort(port) {
     }
 }
 
+// Synchronously kill the Oricutron we launched — the direct child handle if we have
+// one, or (for a script/detached launch) whatever now owns the gdb port. Shared by the
+// disconnect handler AND the process-exit safety nets below, so a window reload or any
+// other abrupt shutdown that skips `disconnect` can't leave an orphaned emulator.
+function killLaunchedEmulator() {
+    if (launchedProcess) {
+        try {
+            if (process.platform === 'win32')
+                child_process.execSync('taskkill /pid ' + launchedProcess.pid + ' /T /F', { windowsHide: true, stdio: 'ignore' });
+            else
+                launchedProcess.kill('SIGTERM');
+        } catch (_) { /* already exited */ }
+        launchedProcess = null;
+    }
+    if (scriptLaunched) {
+        killByPort((config && config.port) || 6502);
+        scriptLaunched = false;
+    }
+    clearEmuPidFile();   // we killed it cleanly — no orphan for the next session to reclaim
+}
+
+// Is `pid` an Oricutron process? Used so we only auto-reclaim OUR own stale emulator on
+// the gdb port — never some unrelated service that happens to be listening there.
+function isOricutronPid(pid) {
+    try {
+        if (process.platform === 'win32') {
+            const out = child_process.execSync('tasklist /FI "PID eq ' + pid + '" /NH /FO CSV', { windowsHide: true }).toString();
+            return /oricutron/i.test(out);
+        }
+        const out = child_process.execSync('ps -p ' + pid + ' -o comm=', { stdio: ['ignore', 'pipe', 'ignore'] }).toString();
+        return /oricutron/i.test(out);
+    } catch (_) { return false; }
+}
+
+// Force-kill a pid (whole tree on Windows). Best-effort.
+function killPid(pid) {
+    try {
+        if (process.platform === 'win32') child_process.execSync('taskkill /pid ' + pid + ' /T /F', { windowsHide: true, stdio: 'ignore' });
+        else process.kill(parseInt(pid, 10), 'SIGTERM');
+    } catch (_) { /* already gone */ }
+}
+
+// --- Orphan reclaim across sessions (the robust fix) --------------------------
+// On Windows a VS Code window reload hard-terminates the adapter (TerminateProcess),
+// so NONE of our cleanup runs — and the orphaned Oricutron stops listening on its gdb
+// port once its debugger drops, so it can't be found by port either. So we persist the
+// emulator's exact pid to a small file keyed by PROJECT, and the next launch kills that
+// pid directly (verifying it's still an Oricutron, in case the OS reused the pid).
+function emuPidFile() {
+    const key = (config.cwd || config.diskImage || config.emulatorPath || 'oric').toLowerCase();
+    const h = crypto.createHash('md5').update(key).digest('hex').slice(0, 12);
+    return path.join(os.tmpdir(), 'oricutron-dbg-' + h + '.pid');
+}
+function writeEmuPidFile(pid) {
+    if (!pid) return;
+    try { fs.writeFileSync(emuPidFile(), String(pid)); } catch (_) { /* non-fatal */ }
+}
+function clearEmuPidFile() {
+    try { fs.unlinkSync(emuPidFile()); } catch (_) { /* already gone */ }
+}
+// Kill the emulator left behind by a previous session of THIS project (if any).
+function reclaimOrphanEmulator() {
+    let pid = null;
+    try { pid = parseInt(fs.readFileSync(emuPidFile(), 'utf8').trim(), 10); } catch (_) { return; }
+    // isOricutronPid is true only if `pid` is a LIVE Oricutron right now — so it both
+    // confirms the orphan is still alive and guards against the pid having been reused by
+    // an unrelated process (we must never kill something that isn't our emulator).
+    if (pid && pid !== (emuPid || 0) && isOricutronPid(pid)) {
+        log('Killing orphaned Oricutron (pid ' + pid + ') left by a previous debug session.');
+        killPid(pid);
+    }
+    clearEmuPidFile();
+}
+
+// If a stale Oricutron is still listening on our gdb port (e.g. a previous session that
+// didn't shut down cleanly), kill it so we can bind a fresh one — rather than refusing or
+// silently attaching to stale code. Returns { foreign, free }: `foreign` true if a
+// NON-Oricutron owns the port (caller should refuse rather than kill something unrelated);
+// `free` true once the port is confirmed released (we poll — the OS frees the listen
+// socket a beat after the process dies).
+async function reclaimStaleEmulator(port, host) {
+    const pids = pidsOnPort(port);
+    if (!pids.length) return { foreign: false, free: true };
+    let foreign = false;
+    for (const pid of pids) {
+        if (isOricutronPid(pid)) {
+            log('Reclaiming stale Oricutron (pid ' + pid + ') on gdb port ' + port + ' from a previous session.');
+            try {
+                if (process.platform === 'win32') child_process.execSync('taskkill /pid ' + pid + ' /T /F', { windowsHide: true, stdio: 'ignore' });
+                else process.kill(parseInt(pid, 10), 'SIGTERM');
+            } catch (_) { /* gone */ }
+        } else {
+            foreign = true;
+        }
+    }
+    if (foreign) return { foreign: true, free: false };
+    // Wait for the listen socket to be released (up to ~1s).
+    for (let i = 0; i < 10; i++) {
+        if (!(await probePort(host || 'localhost', port))) return { foreign: false, free: true };
+        await new Promise(r => setTimeout(r, 100));
+    }
+    return { foreign: false, free: false };
+}
+
 function onGdbData(data) {
     rxBuf += data;
     while (rxBuf.length > 0) {
@@ -535,6 +653,14 @@ let annByField  = new Map();  // "structName.fieldName" -> { kind:'bool'|'enum'|
 // Each token is a param type (an enum name, byte, word, str255) or the special
 // "end" token = stop the linear preview after this command (terminators, jumps).
 let paramsByEnumMember = new Map();
+// Enum defs recovered from the header scan (typedef enum bodies). Fallback for
+// pure-asm projects (e.g. Nova) whose build has no C compilation unit — xa only
+// registers enumerators as defines and emits no #TYPES enum records. Same shape
+// as enumDefs entries; consulted LAST by resolveEnum so compiler-emitted records
+// always win. Values must be literal (decimal/hex) or implicit sequential — an
+// enum with a computed member is dropped rather than guessed at.
+// name -> { size, byValue, isFlags }.
+let headerEnumDefs = new Map();
 let annBySymbol = new Map();  // symbolName (no leading _) -> { kind, enumName? }
 // Union of every module's enum defs. Annotation resolution (@enum/@bitset) must
 // work regardless of which module is active (the enum defs are identical across
@@ -3405,6 +3531,7 @@ async function connectAndHandshake(req) {
             await gdbConnect(host, port);
             emuPid = (launchedProcess && launchedProcess.pid) || pidsOnPort(port)[0] || null;
             log('Connected to Oricutron at ' + host + ':' + port + ' (pid ' + (emuPid || '?') + ')');
+            writeEmuPidFile(emuPid);   // persist so the next session can kill it if we're hard-terminated (window reload)
             const reply = await gdbCmd('?');
             log('GDB ? reply: ' + (reply || '(null)'));
             if (reply) {
@@ -3573,6 +3700,11 @@ const handlers = {
         applyLogLevel(logLevel, true); // reflect the initial level in the status bar (don't re-persist)
         const port = config.port || 6502;
 
+        // Kill any emulator orphaned by a previous session of this project (e.g. a window
+        // reload hard-killed the old adapter before it could clean up). Must run before we
+        // spawn a new one, so reloads can't accumulate stray Oricutron windows.
+        reclaimOrphanEmulator();
+
         if (config.symbolFile) loadSymbols(config.symbolFile);
 
         // Hash the disk image now, so a later `reloadsymbols` can tell a
@@ -3630,9 +3762,12 @@ const handlers = {
                 log('No entry address (OSDKADDR/gdbBreak) — launching without an initial breakpoint; may miss the entry.');
 
             if (await probePort(config.host || 'localhost', port)) {
-                respond(req, {}, false, 'gdb port ' + port + ' is already in use — another debug ' +
-                    'session/emulator is likely running. Close it and retry.');
-                return;
+                const { foreign, free } = await reclaimStaleEmulator(port, config.host);
+                if (foreign || !free) {
+                    respond(req, {}, false, 'gdb port ' + port + ' is already in use by another process — ' +
+                        'close it (or change "port" in launch.json) and retry.');
+                    return;
+                }
             }
 
             const launchEnv = { OSDKGDBPORT: String(port) };
@@ -3653,13 +3788,17 @@ const handlers = {
         else if (config.emulatorPath) {
             // VS Code sends noDebug inside arguments for Ctrl+F5
             const isNoDebug = config.noDebug || false;
-            // Guard: if something already listens on the gdb port, a stale emulator
-            // owns it. Spawning another would fail to bind and we'd silently attach to
-            // the OLD emulator (fresh symbols vs stale code). Refuse with guidance.
+            // Guard: if something already listens on the gdb port, a stale emulator owns
+            // it. Spawning another would fail to bind and we'd silently attach to the OLD
+            // emulator (fresh symbols vs stale code). Reclaim our own stale Oricutron; only
+            // refuse if a NON-Oricutron process holds the port.
             if (!isNoDebug && await probePort(config.host || 'localhost', port)) {
-                respond(req, {}, false, 'gdb port ' + port + ' is already in use — another Oricutron/debug ' +
-                    'session is likely running on it. Close it (or change "port" in launch.json) and retry.');
-                return;
+                const { foreign, free } = await reclaimStaleEmulator(port, config.host);
+                if (foreign || !free) {
+                    respond(req, {}, false, 'gdb port ' + port + ' is already in use by another process — ' +
+                        'close it (or change "port" in launch.json) and retry.');
+                    return;
+                }
             }
             const emuArgs = isNoDebug
                 ? [config.diskImage, '-s', 'symbols', ...(config.emulatorArgs || [])]
@@ -3913,25 +4052,9 @@ const handlers = {
             sock.destroy();
             sock = null;
         }
-        // Kill emulator if we launched it
-        if (launchedProcess) {
-            try {
-                if (process.platform === 'win32') {
-                    // Tree-kill on Windows to catch child processes
-                    child_process.execSync('taskkill /pid ' + launchedProcess.pid + ' /T /F',
-                        { windowsHide: true, stdio: 'ignore' });
-                } else {
-                    launchedProcess.kill('SIGTERM');
-                }
-            } catch (e) { /* already exited */ }
-            launchedProcess = null;
-        }
-        // Script-launched Oricutron is detached (START), so there's no child handle —
-        // kill whatever now owns the gdb port instead.
-        if (scriptLaunched) {
-            killByPort(config.port || 6502);
-            scriptLaunched = false;
-        }
+        // Kill the emulator we launched (direct child, or by-port for a detached script
+        // launch). Shared with the process-exit safety nets so behaviour can't diverge.
+        killLaunchedEmulator();
         respond(req);
         evt('terminated');
         setTimeout(() => process.exit(0), 200);
