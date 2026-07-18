@@ -1142,6 +1142,14 @@ function postScreenConn(connected) {
     if (screenPanel) screenPanel.webview.postMessage({ type: 'conn', connected: !!connected });
 }
 
+// Tell the Screen View the emulator run-state so it can show a turbo (▶▶) / paused (‖)
+// OSD badge. `active` = an oric-debug session is live; the badge is hidden otherwise.
+function postScreenRunState() {
+    if (screenPanel) screenPanel.webview.postMessage({
+        type: 'runstate', active: oricSessionActive, stopped: oricDebugStopped, warp: oricWarpOn
+    });
+}
+
 // ----------------------------------------------------------------
 // Shared viz_stream connection (single TCP, multiple consumers)
 // ----------------------------------------------------------------
@@ -1920,7 +1928,7 @@ function createScreenPanel() {
     const path = require('path');
 
     panel.webview.onDidReceiveMessage(msg => {
-        if (msg.type === 'screenReady') { postScreenConn(vizConnected); return; }
+        if (msg.type === 'screenReady') { postScreenConn(vizConnected); postScreenRunState(); return; }
         if (msg.type === 'saveImage' && msg.dataUrl) {
             // Find workspace folder for screenshot subfolder
             let baseDir = null;
@@ -2086,6 +2094,33 @@ body {
     height: 100%;
     pointer-events: none;
 }
+/* Run-state OSD badge (top-right of the screen). Purely informational — pointer-events
+   none so it never steals a hover or a click-to-control. Hidden unless warp or halted. */
+.osd {
+    position: absolute;
+    top: 6px;
+    right: 8px;
+    display: none;
+    pointer-events: none;
+    font: bold 40px/1 monospace;
+    padding: 5px 12px;
+    border-radius: 5px;
+    background: rgba(0, 0, 0, 0.55);
+    letter-spacing: 1px;
+    z-index: 5;
+}
+.osd.turbo  { color: #7ee787; }   /* ▶▶ warp/turbo */
+.osd.paused { color: #e2a03f; }   /* ‖ halted at a breakpoint */
+/* Pause = two thick bars, like a tape recorder's pause button (rather than the thin ‖). */
+.osd .pausebar {
+    display: inline-block;
+    width: 13px;
+    height: 40px;
+    background: currentColor;
+    border-radius: 1px;
+    margin: 0 4px;
+    vertical-align: middle;
+}
 .inspector {
     display: flex;
     gap: 12px;
@@ -2140,6 +2175,7 @@ body {
         <option value="128,128,128" selected>Gray</option>
         <option value="255,128,0">Orange</option>
     </select>
+    <label><input type="checkbox" id="osdToggle" checked> State</label>
     <span style="flex:1"></span>
     <button id="btnSave" title="Save screenshot to project">Save PNG</button>
     <button id="btnCopy" title="Copy to clipboard">Copy</button>
@@ -2147,6 +2183,7 @@ body {
 <div class="screen-wrap" id="screenWrap">
     <canvas id="screenCanvas" width="240" height="224"></canvas>
     <canvas id="overlayCanvas" width="240" height="224"></canvas>
+    <div class="osd" id="osd"></div>
 </div>
 </div>
 <div class="inspect-panel">
@@ -2188,6 +2225,8 @@ const gridColorSel = document.getElementById('gridColor');
 const screenWrap = document.getElementById('screenWrap');
 const zoomFactorSel = document.getElementById('zoomFactor');
 const zoomRegionSel = document.getElementById('zoomRegion');
+const osdToggle = document.getElementById('osdToggle');
+const osd = document.getElementById('osd');
 
 // --- Settings persistence ---
 function saveSettings() {
@@ -2196,7 +2235,8 @@ function saveSettings() {
         rowGrid: rowGridCb.checked,
         gridColor: gridColorSel.value,
         zoomFactor: zoomFactorSel.value,
-        zoomRegion: zoomRegionSel.value
+        zoomRegion: zoomRegionSel.value,
+        osd: osdToggle.checked
     });
 }
 {
@@ -2207,6 +2247,7 @@ function saveSettings() {
         if (s.gridColor) gridColorSel.value = s.gridColor;
         if (s.zoomFactor) zoomFactorSel.value = s.zoomFactor;
         if (s.zoomRegion) zoomRegionSel.value = s.zoomRegion;
+        if (s.osd !== undefined) osdToggle.checked = !!s.osd;
     }
 }
 
@@ -2494,9 +2535,11 @@ screenWrap.addEventListener('mousemove', (e) => {
     const px = Math.floor((e.clientX - rect.left) / rect.width * 240);
     const py = Math.floor((e.clientY - rect.top) / rect.height * 224);
     if (px >= 0 && px < 240 && py >= 0 && py < 224) {
+        const wasHovering = hoverPx >= 0;
         hoverPx = px; hoverPy = py;
         updateInspector(px, py);
         drawOverlay();
+        if (!wasHovering) updateOsd();   // entered the screen → hide the OSD (crosshair up)
     }
 });
 
@@ -2505,6 +2548,7 @@ screenWrap.addEventListener('mouseleave', () => {
     infoPanel.innerHTML = '';
     zoomCtx.clearRect(0, 0, zoomCanvas.width, zoomCanvas.height);
     drawOverlay();
+    updateOsd();   // left the screen → restore the OSD
 });
 
 // Fit the screen to the available HEIGHT too: cap its width so its (aspect-locked)
@@ -2581,11 +2625,32 @@ document.getElementById('btnCopy').addEventListener('click', () => {
     vscode.postMessage({ type: 'copyImage', dataUrl: screenCanvas.toDataURL('image/png') });
 });
 
+// Run-state OSD: ▶▶ when warp/turbo is on, ‖ when halted at a breakpoint, nothing while
+// running normally or with no session. Purely a status indicator (see the "State" toggle).
+let runState = { active: false, stopped: false, warp: false };
+function updateOsd() {
+    let html = '', cls = 'osd';
+    // Hidden while the mouse is over the screen (hoverPx >= 0) so it never sits under the
+    // inspection crosshair; shown again on mouse-leave.
+    if (osdToggle.checked && runState.active && hoverPx < 0) {
+        if (runState.stopped) { cls = 'osd paused'; html = '<span class="pausebar"></span><span class="pausebar"></span>'; }
+        else if (runState.warp) { cls = 'osd turbo'; html = '▶▶'; }
+    }
+    osd.className = cls;
+    osd.innerHTML = html;
+    osd.style.display = html ? 'block' : 'none';
+}
+
 window.addEventListener('message', e => {
     if (e.data.type === 'screenFrame') renderScreen(e.data);
     if (e.data.type === 'status') { status.textContent = e.data.text; errorDiv.style.display = 'none'; }
     if (e.data.type === 'error') { errorDiv.textContent = e.data.text; errorDiv.style.display = 'block'; }
+    if (e.data.type === 'runstate') {
+        runState = { active: !!e.data.active, stopped: !!e.data.stopped, warp: !!e.data.warp };
+        updateOsd();
+    }
 });
+osdToggle.addEventListener('change', () => { saveSettings(); updateOsd(); });
 
 // --- Keyboard input -> Oric (Phase 1) ---
 // While the Screen View is focused, capture keys and forward them to the
@@ -2679,6 +2744,7 @@ let bpTreeEmitter = null;     // Oric Breakpoints tree refresh signal (created i
 let activeOricModuleId = null; // active overlay module id (for the breakpoint tree's follow/highlight)
 let debugControlsProvider = null; // Oric Debug Controls webview view (button toolbar in the Run & Debug sidebar)
 let oricSessionActive = false; // true between an oric-debug session's start and terminate (activeDebugSession races on terminate)
+let oricWarpOn = false;       // current warp/turbo speed state (mirrors the toggleWarp toggle) — for the Screen View OSD
 let dimLiveViews = null;      // set in activate: greys the live-data views (regs/peripherals/…) when not stopped
 
 // Central stopped-state switch: gates the source CodeLens AND the disasm
@@ -2694,6 +2760,7 @@ function setOricDebugStopped(v) {
     // Not stopped (running or session ended) → grey the live-data views to show the
     // values are stale. When stopped, refreshAll() re-renders them live.
     if (!oricDebugStopped && dimLiveViews) dimLiveViews();
+    postScreenRunState();   // update the Screen View turbo/paused OSD
 }
 
 // Array-valued context key for the line-number gutter menu: the PC line when
@@ -3331,8 +3398,10 @@ function doToggleWarp() {
     if (!session || session.type !== 'oric-debug') return;
     session.customRequest('toggleWarp').then(resp => {
         if (resp) {
-            vscode.commands.executeCommand('setContext', 'oric-debug.warp', !!resp.warp);
-            vscode.window.setStatusBarMessage(resp.warp ? 'Warp: ON' : 'Warp: OFF', 3000);
+            oricWarpOn = !!resp.warp;
+            vscode.commands.executeCommand('setContext', 'oric-debug.warp', oricWarpOn);
+            vscode.window.setStatusBarMessage(oricWarpOn ? 'Warp: ON' : 'Warp: OFF', 3000);
+            postScreenRunState();   // reflect warp in the Screen View OSD
         }
     }).catch(e => {
         vscode.window.showErrorMessage('Warp toggle failed: ' + e.message);
@@ -5373,8 +5442,8 @@ function activate(context) {
     debugControlsProvider = new DebugControlsWebviewProvider();
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider('oricDebugControls', debugControlsProvider),
-        vscode.debug.onDidStartDebugSession(s => { if (s && s.type === 'oric-debug') oricSessionActive = true; debugControlsProvider.pushState(); snapDecoEmitter.fire(); }),
-        vscode.debug.onDidTerminateDebugSession(() => { oricSessionActive = false; debugControlsProvider.pushState(); snapDecoEmitter.fire(); }),
+        vscode.debug.onDidStartDebugSession(s => { if (s && s.type === 'oric-debug') { oricSessionActive = true; oricWarpOn = false; } debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); }),
+        vscode.debug.onDidTerminateDebugSession(() => { oricSessionActive = false; oricWarpOn = false; debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); }),
         vscode.window.registerWebviewViewProvider('oricCpuRegs', regsProvider),
         vscode.window.registerWebviewViewProvider('oricPeripherals', periphProvider),
         vscode.commands.registerCommand('oric-debug.openMemoryView', () => createMemoryPanel(context)),
