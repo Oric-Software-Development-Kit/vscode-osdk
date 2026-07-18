@@ -731,7 +731,12 @@ let displayHex = true;        // true = hex primary, false = decimal primary
 let configDone = false;
 let pendingStop = null;       // deferred stopped event body
 let srcBps     = new Map();   // file -> [{id, line, source, bindings:[{addr,module,armed}]}] — one binding per owning overlay (shared files span several)
-let dataBps    = new Map();   // id -> { addr, accessType, gdbType } (data breakpoints)
+let dataBps    = new Map();   // id -> { addr, accessType, gdbType } (plain DAP data breakpoints)
+// Extension-owned WATCHPOINT EVENTS (access-triggered breakpoints with exec-bp parity:
+// module scope, condition, and log/[save]/[stop] actions). The extension owns the list
+// (persists it, re-sends via oricSetWatchpoints on session start / edits); the adapter
+// arms the ones whose module is active and runs their actions when they fire.
+let watchEvents = [];         // { id, addr, size, access, module, condition, logMessage, enabled, armed }
 let armedAddrs = new Map();   // addr -> refcount of execution breakpoints armed in the stub
 let bpLock     = Promise.resolve();  // serialization gate for breakpoint / arm-state mutations
 // Run an arm-state mutation serialized behind bpLock. VS Code bursts many
@@ -1165,6 +1170,13 @@ async function rearmModuleBreakpoints() {
                         message: where + ' — inactive module, binds when its overlay loads' } });
             }
         }
+    }
+    // Watchpoint events follow the same module gating: arm when their module becomes
+    // active, disarm when it's swapped out. (Resident / ANY-scope watches stay armed.)
+    for (const ev of watchEvents) {
+        const want = watchDesired(ev);
+        if (want && !ev.armed) await armWatch(ev);
+        else if (!want && ev.armed) await disarmWatch(ev);
     }
   });
 }
@@ -1991,6 +2003,43 @@ async function onStopReply(payload) {
 
     // Sync any by-hand monitor breakpoint edits into VS Code's model.
     await reconcileMonitorBreakpoints();
+
+    // Watchpoint events: an access-triggered breakpoint with the same actions as an
+    // exec logpoint. Identify the fired event by address+type; run its log / [save] /
+    // [stop] actions; a watch with no message (or with [stop]) stops, otherwise it logs
+    // and resumes transparently (step off — commits the store for a write watch — then
+    // continue), exactly like a logpoint.
+    if (watchAddr !== null) {
+        const evs = watchEventsAt(watchAddr, watchType);
+        if (evs.length) {
+            let forceStop = false;
+            for (const ev of evs) {
+                if (!ev.logMessage) { forceStop = true; continue; }   // plain stop watch
+                let raw = ev.logMessage;
+                if (/\[stop\]/i.test(raw)) { forceStop = true; raw = raw.replace(/\s*\[stop\]\s*/ig, ' ').trim(); }
+                const doSnap = /\[save\]/i.test(raw);
+                if (doSnap) raw = raw.replace(/\s*\[save\]\s*/ig, ' ').trim();
+                let line;
+                try { line = await interpolateLog(raw); }
+                catch (e) { line = '[watch log error: ' + (e && e.message ? e.message : e) + ']'; }
+                const tag = watchType === 'read' ? 'R' : watchType === 'access' ? 'RW' : 'W';
+                evt('output', { category: 'console', output: '\x1b[36m[' + tag + ' $' + (ev.addr & 0xFFFF).toString(16).toUpperCase().padStart(4, '0') + '] ' + line + '\x1b[0m\n' });
+                if (doSnap) {
+                    const nm = 'watch-' + (ev.addr & 0xFFFF).toString(16).padStart(4, '0');
+                    const sv = await doSaveSnapshot(nm);
+                    evt('output', { category: 'console', output: '\x1b[36m' + (sv.error ? '[save failed: ' + sv.error + ']' : '[snapshot saved: ' + sv.name + ']') + '\x1b[0m\n' });
+                }
+            }
+            if (!forceStop) {
+                resumeMode = 'run';
+                continueAfterStep = true;   // step off (commits a write watch), onStopReply then issues 'c'
+                running = true;
+                regs = null;
+                gdbWrite('s');
+                return;                     // logged and resumed — no 'stopped' event
+            }
+        }
+    }
 
     // Logpoints: a source breakpoint with a logMessage prints instead of stopping.
     // Print every logpoint at this PC; if nothing else here would stop, resume
@@ -3229,6 +3278,58 @@ async function sendCond(addr, condExpr, hitTarget) {
         return msg;
     }
     return null;
+}
+
+// Attach a condition to a JUST-ARMED watchpoint at addr (data-breakpoint analogue
+// of sendCond). A watchpoint isn't tied to a function frame, so there's no local
+// context — only globals / registers / memory resolve. The stub compiles the
+// expression (qOricWatchCond) with the SAME cond_compile the exec path uses.
+// For a WRITE watch the condition runs before the store commits, so "A == $10"
+// tests the value being written. Returns an error string or null.
+async function sendWatchCond(addr, condExpr) {
+    if (!condExpr) return null;
+    const r = resolveCondSymbols(condExpr, null, symbols.get('fp'), symbols.get('ap'));
+    if (r.error) { log('watch condition "' + condExpr + '" rejected: ' + r.error); return r.error; }
+    const hex = Buffer.from(r.expr, 'utf8').toString('hex');
+    const rr = await gdbCmd('qOricWatchCond,' + (addr & 0xFFFF).toString(16) + ',' + hex);
+    if (typeof rr === 'string' && rr.indexOf('E cond:') === 0) {
+        const msg = rr.slice(7).trim();
+        log('watch condition "' + condExpr + '" rejected: ' + msg);
+        return msg;
+    }
+    return null;
+}
+
+// --- Watchpoint events (arm / disarm / scope / lookup) ------------------------
+function accessZType(access) { return access === 'read' ? '3' : access === 'readWrite' ? '4' : '2'; }
+// A watchpoint is live when enabled AND its module is active (resident 'R' / null = ANY,
+// or the currently active overlay) — same gating rule as exec breakpoints.
+function watchDesired(ev) {
+    if (ev.enabled === false) return false;
+    return ev.module == null || ev.module === 'R' || ev.module === activeModuleId;
+}
+async function armWatch(ev) {
+    const z = accessZType(ev.access);
+    let ok = true;
+    for (let k = 0; k < (ev.size || 1); k++) {          // a size>1 var arms one watch per byte
+        const a = (ev.addr + k) & 0xFFFF;
+        const r = await gdbCmd('Z' + z + ',' + a.toString(16) + ',1');
+        if (r !== 'OK') ok = false;
+    }
+    ev.armed = ok;
+    if (ok && ev.condition) await sendWatchCond(ev.addr, ev.condition);  // condition on the base byte
+    return ok;
+}
+async function disarmWatch(ev) {
+    const z = accessZType(ev.access);
+    for (let k = 0; k < (ev.size || 1); k++)
+        await gdbCmd('z' + z + ',' + ((ev.addr + k) & 0xFFFF).toString(16) + ',1');
+    ev.armed = false;
+}
+// Watchpoint events covering `addr` for an access of `type` (write|read|access).
+function watchEventsAt(addr, type) {
+    return watchEvents.filter(ev => ev.armed && addr >= ev.addr && addr < ev.addr + (ev.size || 1) &&
+        (type === 'write' ? ev.access !== 'read' : type === 'read' ? ev.access !== 'write' : true));
 }
 
 // Check if any user-set breakpoint is armed (live in the stub) at this address.
@@ -5829,15 +5930,47 @@ const handlers = {
             }
             const r = await gdbCmd('Z' + gdbType + ',' + addr.toString(16) + ',1');
             const id = bpId++;
-            const ok = r === 'OK';
-            if (ok) dataBps.set(id, { id, addr, accessType: access, gdbType });
-            result.push({
-                id: id,
-                verified: ok,
-                message: ok ? undefined : 'Failed to set watchpoint'
-            });
+            let ok = r === 'OK';
+            let message = ok ? undefined : 'Failed to set watchpoint';
+            if (ok) {
+                dataBps.set(id, { id, addr, accessType: access, gdbType, condition: dbp.condition || null });
+                // DAP data breakpoints carry an optional `condition`; compile it native-side
+                // so the emulator only stops on the interesting store (e.g. "A == $10").
+                if (dbp.condition) {
+                    const cerr = await sendWatchCond(addr, dbp.condition);
+                    if (cerr) { ok = false; message = 'condition: ' + cerr; }
+                }
+            }
+            result.push({ id: id, verified: ok, message: message });
         }
         respond(req, { breakpoints: result });
+      });
+    },
+
+    // Extension-owned watchpoint EVENTS (module-scoped, conditional, with log/[save]/
+    // [stop] actions). The extension owns the list and re-sends the full set here — on
+    // session start (restoring persisted watchpoints), on edits, and after a module
+    // switch is unnecessary (the adapter rearms those itself). We reconcile: disarm the
+    // old set, store the new one, and arm the events whose module is active now.
+    async oricSetWatchpoints(req) {
+      return withBpLock(async () => {
+        for (const ev of watchEvents) if (ev.armed) await disarmWatch(ev);
+        watchEvents = (req.arguments.watchpoints || []).map(w => ({
+            id: w.id,
+            addr: (w.addr | 0) & 0xFFFF,
+            size: w.size || 1,
+            access: w.access || 'write',
+            module: (w.module === undefined ? null : w.module),
+            condition: w.condition || null,
+            logMessage: w.logMessage || null,
+            enabled: w.enabled !== false,
+            armed: false,
+        }));
+        for (const ev of watchEvents) if (watchDesired(ev)) await armWatch(ev);
+        // verified = armed, OR valid-but-waiting because its module isn't active yet.
+        respond(req, { watchpoints: watchEvents.map(ev => ({
+            id: ev.id, armed: ev.armed, verified: ev.armed || !watchDesired(ev),
+        })) });
       });
     },
 
