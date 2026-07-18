@@ -2086,6 +2086,17 @@ body {
     height: auto;
     image-rendering: pixelated;
 }
+/* CRT post-effect canvas (WebGL). Covers the raw screen when enabled; the grid/crosshair
+   overlay stays above it. pointer-events:none so it never blocks hover / click-to-control. */
+#crtCanvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    display: none;
+    pointer-events: none;
+}
 #overlayCanvas {
     position: absolute;
     top: 0;
@@ -2177,12 +2188,19 @@ body {
     </select>
     <label title="Show the turbo (fast-forward) / paused run-state badge on the screen"><input type="checkbox" id="osdToggle" checked> OSD</label>
     <label title="Square = 1:1 pixels; off = true 50Hz Oric aspect (wider pixels)"><input type="checkbox" id="squarePx" checked> Square px</label>
+    <label title="Retro CRT effect (scanlines + aperture mask, optional curvature)">CRT <select id="crtMode">
+        <option value="off" selected>Off</option>
+        <option value="flat">Flat CRT</option>
+        <option value="gentle">Curved (slight)</option>
+        <option value="curved">Curved (full)</option>
+    </select></label>
     <span style="flex:1"></span>
     <button id="btnSave" title="Save screenshot to project">Save PNG</button>
     <button id="btnCopy" title="Copy to clipboard">Copy</button>
 </div>
 <div class="screen-wrap" id="screenWrap">
     <canvas id="screenCanvas" width="240" height="224"></canvas>
+    <canvas id="crtCanvas"></canvas>
     <canvas id="overlayCanvas" width="240" height="224"></canvas>
     <div class="osd" id="osd"></div>
 </div>
@@ -2229,6 +2247,8 @@ const zoomRegionSel = document.getElementById('zoomRegion');
 const osdToggle = document.getElementById('osdToggle');
 const osd = document.getElementById('osd');
 const squarePxCb = document.getElementById('squarePx');
+const crtCanvas = document.getElementById('crtCanvas');
+const crtSel = document.getElementById('crtMode');
 
 // --- Settings persistence ---
 function saveSettings() {
@@ -2239,7 +2259,8 @@ function saveSettings() {
         zoomFactor: zoomFactorSel.value,
         zoomRegion: zoomRegionSel.value,
         osd: osdToggle.checked,
-        squarePx: squarePxCb.checked
+        squarePx: squarePxCb.checked,
+        crtMode: crtSel.value
     });
 }
 {
@@ -2252,7 +2273,154 @@ function saveSettings() {
         if (s.zoomRegion) zoomRegionSel.value = s.zoomRegion;
         if (s.osd !== undefined) osdToggle.checked = !!s.osd;
         if (s.squarePx !== undefined) squarePxCb.checked = !!s.squarePx;
+        if (s.crtMode) crtSel.value = s.crtMode;
     }
+}
+
+// --- CRT post-effect (optional WebGL shader over the screen) ---------------------
+// Renders the 240x224 screen (uploaded as a texture) through a single-pass CRT shader,
+// parameterised by mode: scanlines, an RGB aperture mask, barrel curvature and vignette,
+// each switchable via a uniform. Purely a display flourish over the 2D screen canvas.
+// When CURVATURE is active the grid overlay and hover→pixel mapping apply the SAME barrel
+// math (curveInv / curveFwd below) so the character matrix and inspector stay aligned.
+// Falls back gracefully if WebGL is absent. Barrel constants shared with the shader:
+const CRT_CURVE_X = 5.0, CRT_CURVE_Y = 4.0;   // larger = flatter (denominators in the curve)
+const CRT_MODES = {
+    off:    null,
+    flat:   { curve: 0.0, mask: 1, scan: 0.35, vig: 0 },   // scanlines + aperture, no curvature
+    gentle: { curve: 0.4, mask: 1, scan: 0.35, vig: 1 },   // a little curvature
+    curved: { curve: 1.0, mask: 1, scan: 0.35, vig: 1 }    // full curvature
+};
+const crt = (function () {
+    let gl = null, prog = null, tex = null, ready = false, params = null;
+    let U = {};
+    const VS = [
+        'attribute vec2 aPos;',
+        'varying vec2 vUv;',
+        'void main(){ vUv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }'
+    ].join('\\n');
+    const FS = [
+        'precision mediump float;',
+        'varying vec2 vUv;',
+        'uniform sampler2D uTex;',
+        'uniform vec2 uRes;',
+        'uniform float uCurve;',   // 0 = flat, 1 = barrel curvature
+        'uniform float uMask;',    // aperture mask strength
+        'uniform float uScan;',    // scanline strength
+        'uniform float uVig;',     // vignette strength
+        'vec2 curve(vec2 uv){',
+        '  vec2 cc = uv * 2.0 - 1.0;',
+        '  vec2 off = abs(cc.yx) / vec2(' + CRT_CURVE_X.toFixed(1) + ', ' + CRT_CURVE_Y.toFixed(1) + ');',
+        '  vec2 cv = (cc + cc * off * off) * 0.5 + 0.5;',
+        '  return mix(uv, cv, uCurve);',
+        '}',
+        'void main(){',
+        '  vec2 uv = curve(vUv);',
+        '  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }',
+        '  vec3 col = texture2D(uTex, uv).rgb;',
+        '  float sl = sin(uv.y * uRes.y * 6.28318) * 0.5 + 0.5;',
+        '  col *= mix(1.0, sl, uScan);',
+        '  float m = mod(gl_FragCoord.x, 3.0);',
+        '  vec3 mask = m < 1.0 ? vec3(1.05, 0.75, 0.75) : (m < 2.0 ? vec3(0.75, 1.05, 0.75) : vec3(0.75, 0.75, 1.05));',
+        '  col *= mix(vec3(1.0), mask, uMask);',
+        '  float vig = pow(16.0 * uv.x * uv.y * (1.0 - uv.x) * (1.0 - uv.y), 0.18);',
+        '  col *= mix(1.0, clamp(vig, 0.0, 1.0), uVig);',
+        '  col *= 1.0 + 0.45 * uScan + 0.22 * uMask;',   // compensate for the darkening
+        '  gl_FragColor = vec4(col, 1.0);',
+        '}'
+    ].join('\\n');
+    function compile(type, src) {
+        const sh = gl.createShader(type);
+        gl.shaderSource(sh, src); gl.compileShader(sh);
+        if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) { console.error('CRT shader: ' + gl.getShaderInfoLog(sh)); return null; }
+        return sh;
+    }
+    function init() {
+        try { gl = crtCanvas.getContext('webgl') || crtCanvas.getContext('experimental-webgl'); } catch (e) { gl = null; }
+        if (!gl) return false;
+        const vs = compile(gl.VERTEX_SHADER, VS), fs = compile(gl.FRAGMENT_SHADER, FS);
+        if (!vs || !fs) return false;
+        prog = gl.createProgram(); gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
+        if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { console.error('CRT link: ' + gl.getProgramInfoLog(prog)); return false; }
+        gl.useProgram(prog);
+        const buf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+        const loc = gl.getAttribLocation(prog, 'aPos');
+        gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+        tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+        ['uRes', 'uCurve', 'uMask', 'uScan', 'uVig'].forEach(n => { U[n] = gl.getUniformLocation(prog, n); });
+        ready = true;
+        return true;
+    }
+    function resize() {
+        if (!ready) return;
+        const rect = screenCanvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const w = Math.max(1, Math.round(rect.width * dpr)), h = Math.max(1, Math.round(rect.height * dpr));
+        if (crtCanvas.width !== w || crtCanvas.height !== h) { crtCanvas.width = w; crtCanvas.height = h; }
+    }
+    function render() {
+        if (!ready || !params || crtCanvas.style.display === 'none') return;
+        resize();
+        gl.viewport(0, 0, crtCanvas.width, crtCanvas.height);
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, screenCanvas);
+        gl.uniform2f(U.uRes, 240.0, 224.0);
+        gl.uniform1f(U.uCurve, params.curve);
+        gl.uniform1f(U.uMask, params.mask);
+        gl.uniform1f(U.uScan, params.scan);
+        gl.uniform1f(U.uVig, params.vig);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+    const available = init();
+    return {
+        available: available,
+        setMode(name) {
+            params = (available && CRT_MODES[name]) || null;
+            crtCanvas.style.display = params ? 'block' : 'none';
+            if (params) render();
+        },
+        curveAmount() { return params ? params.curve : 0; },
+        render: render,
+        resize: resize
+    };
+})();
+
+// Barrel curve shared with the CRT shader, blended by the current curvature amount k
+// (matching the shader's mix(uv, cv, uCurve)) so a "slight" curve bends the grid/hover by
+// exactly the same fraction the shader bends the image.
+// curveFwd: screen pos (0..1) -> texture/Oric pos (0..1)  — used by hover to find the pixel.
+// curveInv: texture pos -> screen pos (fixed-point iteration) — used to bend the grid lines.
+function crtCurved() { return crt.curveAmount() > 0; }
+function fullCurve(nx, ny) {   // the k=1 barrel map (in 0..1 space), identical to the shader
+    const ccx = nx * 2 - 1, ccy = ny * 2 - 1;
+    const offx = Math.abs(ccy) / CRT_CURVE_X, offy = Math.abs(ccx) / CRT_CURVE_Y;
+    return [(ccx + ccx * offx * offx) * 0.5 + 0.5, (ccy + ccy * offy * offy) * 0.5 + 0.5];
+}
+function curveFwd(nx, ny) {
+    const k = crt.curveAmount();
+    if (k <= 0) return [nx, ny];
+    const cv = fullCurve(nx, ny);
+    return [nx + (cv[0] - nx) * k, ny + (cv[1] - ny) * k];
+}
+function curveInv(tx, ty) {
+    const k = crt.curveAmount();
+    if (k <= 0) return [tx, ty];
+    // Solve curveFwd(s) = t for s by fixed-point: s = t - k*(fullCurve(s) - s).
+    let sx = tx, sy = ty;
+    for (let i = 0; i < 14; i++) {
+        const cv = fullCurve(sx, sy);
+        sx = tx - k * (cv[0] - sx);
+        sy = ty - k * (cv[1] - sy);
+    }
+    return [sx, sy];
 }
 
 const PALETTE = [
@@ -2301,6 +2469,7 @@ function renderScreen(msg) {
         screenImg.data[px + 3] = 255;
     }
     screenCtx.putImageData(screenImg, 0, 0);
+    crt.render();   // refresh the CRT effect from the new frame (no-op when disabled)
 
     status.textContent = 'Frame ' + msg.frameCounter +
         ' | ' + ((msg.vidMode & 4) ? 'HIRES' : 'TEXT') +
@@ -2322,10 +2491,34 @@ function resizeOverlay() {
         overlayCanvas.height = h;
     }
     drawOverlay();
+    crt.render();   // keep the CRT canvas sized to the screen and redraw
 }
 
 function getGridColor(alpha) {
     return 'rgba(' + gridColorSel.value + ',' + alpha + ')';
+}
+
+// Stroke a texture-space vertical line (constant tx) as it appears on the (possibly curved)
+// screen — a straight segment when flat, a bent polyline through curveInv when curved.
+function strokeCurvedV(tx, w, h, xShift) {
+    const steps = 20;
+    overlayCtx.beginPath();
+    for (let i = 0; i <= steps; i++) {
+        const p = curveInv(tx, i / steps);
+        const X = p[0] * w + (xShift || 0), Y = p[1] * h;
+        if (i === 0) overlayCtx.moveTo(X, Y); else overlayCtx.lineTo(X, Y);
+    }
+    overlayCtx.stroke();
+}
+function strokeCurvedH(ty, w, h, yShift) {
+    const steps = 20;
+    overlayCtx.beginPath();
+    for (let i = 0; i <= steps; i++) {
+        const p = curveInv(i / steps, ty);
+        const X = p[0] * w, Y = p[1] * h + (yShift || 0);
+        if (i === 0) overlayCtx.moveTo(X, Y); else overlayCtx.lineTo(X, Y);
+    }
+    overlayCtx.stroke();
 }
 
 function drawOverlay() {
@@ -2333,48 +2526,51 @@ function drawOverlay() {
     const h = overlayCanvas.height;
     const sx = w / 240;
     const sy = h / 224;
-    const color = getGridColor(0.5);
+    const curved = crtCurved();   // bend the grid/crosshair to match the CRT curvature
     overlayCtx.clearRect(0, 0, w, h);
-    overlayCtx.strokeStyle = color;
+    overlayCtx.strokeStyle = getGridColor(0.5);
     overlayCtx.lineWidth = 1;
     if (colGridCb.checked) {
         for (let col = 6; col < 240; col += 6) {
-            const dx = Math.round(col * sx) + 0.5;
-            overlayCtx.beginPath();
-            overlayCtx.moveTo(dx, 0);
-            overlayCtx.lineTo(dx, h);
-            overlayCtx.stroke();
+            if (curved) { strokeCurvedV(col / 240, w, h, 0); }
+            else {
+                const dx = Math.round(col * sx) + 0.5;
+                overlayCtx.beginPath(); overlayCtx.moveTo(dx, 0); overlayCtx.lineTo(dx, h); overlayCtx.stroke();
+            }
         }
     }
     if (rowGridCb.checked) {
         for (let row = 8; row < 224; row += 8) {
-            const dy = Math.round(row * sy) + 0.5;
-            overlayCtx.beginPath();
-            overlayCtx.moveTo(0, dy);
-            overlayCtx.lineTo(w, dy);
-            overlayCtx.stroke();
+            if (curved) { strokeCurvedH(row / 224, w, h, 0); }
+            else {
+                const dy = Math.round(row * sy) + 0.5;
+                overlayCtx.beginPath(); overlayCtx.moveTo(0, dy); overlayCtx.lineTo(w, dy); overlayCtx.stroke();
+            }
         }
     }
     // Crosshair at hover position (black-white-black for visibility on any background)
     if (hoverPx >= 0) {
-        const cx = Math.round((hoverPx + 0.5) * sx);
-        const cy = Math.round((hoverPy + 0.5) * sy);
         const lines = [
             { offset: -1, color: 'rgba(0,0,0,0.6)' },
             { offset:  0, color: 'rgba(255,255,255,0.8)' },
             { offset:  1, color: 'rgba(0,0,0,0.6)' }
         ];
         overlayCtx.lineWidth = 1;
-        for (const l of lines) {
-            overlayCtx.strokeStyle = l.color;
-            overlayCtx.beginPath();
-            overlayCtx.moveTo(cx + l.offset + 0.5, 0);
-            overlayCtx.lineTo(cx + l.offset + 0.5, h);
-            overlayCtx.stroke();
-            overlayCtx.beginPath();
-            overlayCtx.moveTo(0, cy + l.offset + 0.5);
-            overlayCtx.lineTo(w, cy + l.offset + 0.5);
-            overlayCtx.stroke();
+        if (curved) {
+            const tx = (hoverPx + 0.5) / 240, ty = (hoverPy + 0.5) / 224;
+            for (const l of lines) {
+                overlayCtx.strokeStyle = l.color;
+                strokeCurvedV(tx, w, h, l.offset);
+                strokeCurvedH(ty, w, h, l.offset);
+            }
+        } else {
+            const cx = Math.round((hoverPx + 0.5) * sx);
+            const cy = Math.round((hoverPy + 0.5) * sy);
+            for (const l of lines) {
+                overlayCtx.strokeStyle = l.color;
+                overlayCtx.beginPath(); overlayCtx.moveTo(cx + l.offset + 0.5, 0); overlayCtx.lineTo(cx + l.offset + 0.5, h); overlayCtx.stroke();
+                overlayCtx.beginPath(); overlayCtx.moveTo(0, cy + l.offset + 0.5); overlayCtx.lineTo(w, cy + l.offset + 0.5); overlayCtx.stroke();
+            }
         }
     }
 }
@@ -2383,6 +2579,12 @@ const resizeObs = new ResizeObserver(() => resizeOverlay());
 resizeObs.observe(screenCanvas);
 
 squarePxCb.addEventListener('change', () => { saveSettings(); applyAspect(); });
+crtSel.addEventListener('change', () => {
+    saveSettings();
+    crt.setMode(crtSel.value);
+    drawOverlay();   // grid straightens/bends with the mode
+    if (hoverPx >= 0) updateInspector(hoverPx, hoverPy);
+});
 colGridCb.addEventListener('change', () => { saveSettings(); drawOverlay(); });
 rowGridCb.addEventListener('change', () => { saveSettings(); drawOverlay(); });
 gridColorSel.addEventListener('change', () => { saveSettings(); drawOverlay(); if (hoverPx >= 0) updateInspector(hoverPx, hoverPy); });
@@ -2537,8 +2739,11 @@ function updateInspector(px, py) {
 // Mouse tracking on the screen canvas wrapper
 screenWrap.addEventListener('mousemove', (e) => {
     const rect = screenCanvas.getBoundingClientRect();
-    const px = Math.floor((e.clientX - rect.left) / rect.width * 240);
-    const py = Math.floor((e.clientY - rect.top) / rect.height * 224);
+    // Map the cursor through the CRT curve (identity when flat) so the located pixel is the
+    // one actually drawn under the cursor on a curved screen.
+    const t = curveFwd((e.clientX - rect.left) / rect.width, (e.clientY - rect.top) / rect.height);
+    const px = Math.floor(t[0] * 240);
+    const py = Math.floor(t[1] * 224);
     if (px >= 0 && px < 240 && py >= 0 && py < 224) {
         const wasHovering = hoverPx >= 0;
         hoverPx = px; hoverPy = py;
@@ -2610,6 +2815,10 @@ window.addEventListener('resize', scheduleFit);
 // A ResizeObserver on the root recomputes on the initial settle AND every later layout change.
 if (window.ResizeObserver) new ResizeObserver(scheduleFit).observe(document.documentElement);
 applyAspect();   // apply the restored square/Oric aspect + schedule the initial fit
+// CRT: disable the dropdown if WebGL is unavailable; otherwise apply the restored mode.
+if (!crt.available) { crtSel.value = 'off'; crtSel.disabled = true; }
+crt.setMode(crtSel.value);
+drawOverlay();   // reflect a restored "curved" mode in the grid immediately
 
 // Zoom controls: refresh inspector on change
 zoomFactorSel.addEventListener('change', () => {
