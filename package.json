@@ -186,6 +186,26 @@
                 "icon": "$(trash)"
             },
             {
+                "command": "oric-debug.addWatchpoint",
+                "title": "Oric: Add Watchpoint…",
+                "icon": "$(eye)"
+            },
+            {
+                "command": "oric-debug.editWatchpoint",
+                "title": "Oric: Edit Watchpoint",
+                "icon": "$(edit)"
+            },
+            {
+                "command": "oric-debug.removeWatchpoint",
+                "title": "Oric: Remove Watchpoint",
+                "icon": "$(trash)"
+            },
+            {
+                "command": "oric-debug.editWatchProp",
+                "title": "Oric: Edit Watchpoint Property",
+                "icon": "$(edit)"
+            },
+            {
                 "command": "oric-debug.snapshotSave",
                 "title": "Oric: Save Snapshot",
                 "icon": "$(save)"
@@ -383,6 +403,7 @@
         ],
         "menus": {
             "view/title": [
+                { "command": "oric-debug.addWatchpoint", "when": "view == oricBreakpoints", "group": "navigation@0" },
                 { "command": "oric-debug.bpEnableAll", "when": "view == oricBreakpoints", "group": "navigation@1" },
                 { "command": "oric-debug.bpDisableAll", "when": "view == oricBreakpoints", "group": "navigation@2" },
                 { "command": "oric-debug.snapshotSave", "when": "view == oricSnapshots", "group": "navigation@1" },
@@ -407,7 +428,14 @@
                 { "command": "oric-debug.bpRemove", "when": "view == oricBreakpoints && viewItem == oricBp", "group": "inline@2" },
                 { "command": "oric-debug.bpEdit", "when": "view == oricBreakpoints && viewItem == oricBp", "group": "1_bp@1" },
                 { "command": "oric-debug.bpRemove", "when": "view == oricBreakpoints && viewItem == oricBp", "group": "1_bp@2" },
-                { "command": "oric-debug.bpEditDetail", "when": "view == oricBreakpoints && viewItem == oricBpDetail", "group": "inline@1" }
+                { "command": "oric-debug.bpEditDetail", "when": "view == oricBreakpoints && viewItem == oricBpDetail", "group": "inline@1" },
+                { "command": "oric-debug.addWatchpoint", "when": "view == oricBreakpoints && viewItem == oricWatchGroup", "group": "inline@1" },
+                { "command": "oric-debug.editWatchpoint", "when": "view == oricBreakpoints && viewItem == oricWatchBp", "group": "inline@1" },
+                { "command": "oric-debug.removeWatchpoint", "when": "view == oricBreakpoints && viewItem == oricWatchBp", "group": "inline@2" },
+                { "command": "oric-debug.editWatchpoint", "when": "view == oricBreakpoints && viewItem == oricWatchBp", "group": "1_wp@1" },
+                { "command": "oric-debug.removeWatchpoint", "when": "view == oricBreakpoints && viewItem == oricWatchBp", "group": "1_wp@2" },
+                { "command": "oric-debug.editWatchProp", "when": "view == oricBreakpoints && viewItem == oricWatchDetail", "group": "inline@1" },
+                { "command": "oric-debug.editWatchProp", "when": "view == oricBreakpoints && viewItem == oricWatchDetail", "group": "1_wd@1" }
             ],
             "debug/toolBar": [
                 {

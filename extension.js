@@ -12,6 +12,12 @@ const LOG_LEVEL_KEY = 'oric-debug.logLevel';
 // re-arm them on session start. Stored as an array of numeric addresses.
 const ADDR_BP_KEY = 'oric-debug.addressBreakpoints';
 
+// workspaceState key: extension-owned WATCHPOINT events (access breakpoints with
+// module scope + condition + log/[save]/[stop] actions). Like address bps, VS Code
+// doesn't persist these; the extension is the source of truth and re-sends the full
+// set to the adapter (oricSetWatchpoints) on session start / first stop / edit.
+const WATCH_BP_KEY = 'oric-debug.watchpoints';
+
 // Shared dimming for live-data webviews when the debugger isn't stopped (no session,
 // or running): keep the last values but grey them out, so it's visually clear the data
 // is stale rather than live. Providers add `class="stale"` on <body>.
@@ -4298,10 +4304,24 @@ function render() {
     if (filterGroup !== 'all') list = list.filter(s => s.group === filterGroup);
     if (filterText) {
         const ft = filterText.toLowerCase();
-        list = list.filter(s => s.name.toLowerCase().includes(ft) ||
-            (s.aliases && s.aliases.some(a => a.toLowerCase().includes(ft))) ||
-            fmtValue(s).toLowerCase().includes(ft) ||
-            (s.addr >= 0 && h(s.addr, 4).toLowerCase().includes(ft)));
+        // Address queries: normalise "$94" / "0x94" / "94" so they match the padded
+        // hex ($0094). Strip a leading $ or 0x, then substring-match the 4-digit hex,
+        // so a short address finds the full one instead of needing all four digits.
+        let hexq = ft;
+        if (hexq.charAt(0) === '$') hexq = hexq.slice(1);
+        else if (hexq.slice(0, 2) === '0x') hexq = hexq.slice(2);
+        const hexLike = hexq.length > 0 && /^[0-9a-f]+$/.test(hexq);
+        list = list.filter(s => {
+            if (s.name.toLowerCase().includes(ft)) return true;
+            if (s.aliases && s.aliases.some(a => a.toLowerCase().includes(ft))) return true;
+            if (fmtValue(s).toLowerCase().includes(ft)) return true;
+            if (s.addr >= 0) {
+                const hx = s.addr.toString(16).padStart(4, '0');   // "0094"
+                if (('$' + hx).includes(ft)) return true;          // "$0094" / "0094" / "94"
+                if (hexLike && hx.includes(hexq)) return true;     // "$94" / "0x94" -> "94" in "0094"
+            }
+            return false;
+        });
     }
 
     list.sort((a, b) => {
@@ -5019,6 +5039,104 @@ function activate(context) {
     let bpTreeGen = 0;             // rebuild generation — drops superseded async rebuilds
     bpTreeEmitter = new vscode.EventEmitter();
 
+    // Extension-owned watchpoint events (source of truth; the tree reads this list
+    // directly). Each: { id, address, size, access:'write'|'read'|'readWrite', module,
+    // condition, logMessage, enabled, label }. Restored from workspaceState here.
+    let watchBpList = (context.workspaceState.get(WATCH_BP_KEY, []) || []).filter(w => w && typeof w.address === 'number');
+    const toAdapterWp = w => ({ id: w.id, addr: w.address, size: w.size || 1, access: w.access || 'write',
+        module: w.module == null ? null : w.module, condition: w.condition || null,
+        logMessage: w.logMessage || null, enabled: w.enabled !== false });
+    // Refresh the tree FIRST (never blocked by the adapter), then persist and push the
+    // full set to the adapter fire-and-forget. The adapter arms the module-active ones
+    // and handles rearm on module switch itself. A failed push (e.g. a stale adapter
+    // without the oricSetWatchpoints handler, or arming while running) is surfaced.
+    function pushWatchpoints() {
+        bpTreeEmitter.fire();
+        context.workspaceState.update(WATCH_BP_KEY, watchBpList);
+        const s = vscode.debug.activeDebugSession;
+        if (s && s.type === 'oric-debug') {
+            s.customRequest('oricSetWatchpoints', { watchpoints: watchBpList.map(toAdapterWp) })
+                .then(undefined, e => vscode.window.showWarningMessage('Oric: watchpoint arm failed — ' + (e && e.message ? e.message : String(e)) + ' (is the emulator the conditional-watchpoint build, and the session live?)'));
+        }
+    }
+    // Resolve a watch target: "$BFED"/"0xBFED" = hex addr, bare digits = decimal addr
+    // (the no-implicit-hex rule), anything else = a symbol resolved via the adapter.
+    async function resolveWatchTarget(t) {
+        t = (t || '').trim();
+        let m;
+        if ((m = t.match(/^\$([0-9a-fA-F]{1,4})$/)) || (m = t.match(/^0x([0-9a-fA-F]{1,4})$/i)))
+            return { address: parseInt(m[1], 16) & 0xFFFF, label: null };
+        if (/^[0-9]+$/.test(t)) return { address: parseInt(t, 10) & 0xFFFF, label: null };
+        const s = vscode.debug.activeDebugSession;
+        if (!s || s.type !== 'oric-debug') { vscode.window.showErrorMessage('Start a debug session to resolve symbol "' + t + '", or enter a $address.'); return null; }
+        try { const r = await s.customRequest('dataBreakpointInfo', { name: t }); if (r && r.dataId) return { address: parseInt(r.dataId, 16) & 0xFFFF, label: t }; } catch (_) { /* fall through */ }
+        vscode.window.showErrorMessage('Could not resolve "' + t + '" to an address.');
+        return null;
+    }
+    async function addWatchpointFlow() {
+        const input = await vscode.window.showInputBox({ title: 'Add watchpoint', prompt: 'Address ($BFED / 0xBFED) or symbol (_gSoundEnabled)', ignoreFocusOut: true });
+        if (input == null || !input.trim()) return;
+        const tgt = await resolveWatchTarget(input);
+        if (!tgt) return;
+        const acc = await vscode.window.showQuickPick(
+            [{ label: 'Write', v: 'write' }, { label: 'Read', v: 'read' }, { label: 'Read + Write', v: 'readWrite' }],
+            { title: 'Break when the memory is…', ignoreFocusOut: true });
+        if (!acc) return;
+        const sizeStr = await vscode.window.showInputBox({ title: 'Size (bytes)', value: '1', ignoreFocusOut: true, validateInput: v => (/^[1-9][0-9]*$/.test((v || '').trim()) ? null : 'positive integer') });
+        if (sizeStr == null) return;
+        const condition = ((await vscode.window.showInputBox({ title: 'Condition (optional)', prompt: 'e.g.  A == $10 && *$91 != 0   — blank = always', ignoreFocusOut: true })) || '').trim() || null;
+        const logMessage = ((await vscode.window.showInputBox({ title: 'Log message (optional)', prompt: 'Printed on hit; {expr} interpolates; add [save] to snapshot, [stop] to also break. Blank = stop only.', ignoreFocusOut: true })) || '').trim() || null;
+        watchBpList.push({
+            id: 'w' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36),
+            address: tgt.address, size: parseInt(sizeStr, 10) || 1, access: acc.v,
+            module: null, condition, logMessage, enabled: true, label: tgt.label || null,
+        });
+        await pushWatchpoints();
+        const hx = '$' + (tgt.address & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
+        vscode.window.showInformationMessage('Watchpoint added: ' + hx + ' [' + acc.v + ']' + (condition ? ' if ' + condition : '') +
+            (vscode.debug.activeDebugSession ? '' : ' — will arm when you start debugging'));
+    }
+    function removeWatchpoint(node) {
+        if (!node || !node.w) return;
+        watchBpList = watchBpList.filter(w => w.id !== node.w.id);
+        pushWatchpoints();
+    }
+    // Edit ONE property of a watchpoint in place (no delete/re-add). `w` is the live
+    // list entry; mutating it + pushWatchpoints() re-arms and refreshes the tree.
+    async function editWatchProp(w, prop) {
+        if (!w) return;
+        if (prop === 'access') {
+            const acc = await vscode.window.showQuickPick(
+                [{ label: 'Write', v: 'write' }, { label: 'Read', v: 'read' }, { label: 'Read + Write', v: 'readWrite' }],
+                { title: 'Break when the memory is…', ignoreFocusOut: true });
+            if (!acc) return; w.access = acc.v;
+        } else if (prop === 'size') {
+            const v = await vscode.window.showInputBox({ title: 'Size (bytes)', value: String(w.size || 1), ignoreFocusOut: true, validateInput: x => (/^[1-9][0-9]*$/.test((x || '').trim()) ? null : 'positive integer') });
+            if (v == null) return; w.size = parseInt(v, 10) || 1;
+        } else if (prop === 'condition') {
+            const v = await vscode.window.showInputBox({ title: 'Condition', value: w.condition || '', prompt: 'e.g.  A == $10 && *$91 != 0   — blank to clear', ignoreFocusOut: true });
+            if (v === undefined) return; w.condition = v.trim() || null;
+        } else if (prop === 'logMessage') {
+            const v = await vscode.window.showInputBox({ title: 'Log message', value: w.logMessage || '', prompt: '{expr} interpolates; add [save] to snapshot, [stop] to also break. Blank to clear.', ignoreFocusOut: true });
+            if (v === undefined) return; w.logMessage = v.trim() || null;
+        } else return;
+        pushWatchpoints();
+    }
+    // Main-row pencil: pick which property to edit (mirrors the exec-bp bpEdit picker).
+    async function editWatchpoint(node) {
+        const w = node && node.w && watchBpList.find(x => x.id === node.w.id);
+        if (!w) return;
+        const items = [
+            { label: 'Access', description: w.access, prop: 'access' },
+            { label: 'Size', description: String(w.size || 1), prop: 'size' },
+            { label: 'Condition', description: w.condition || '(none)', prop: 'condition' },
+            { label: 'Log message', description: w.logMessage || '(none)', prop: 'logMessage' },
+        ];
+        const hx = '$' + (w.address & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
+        const pick = await vscode.window.showQuickPick(items, { title: 'Edit watchpoint ' + hx, ignoreFocusOut: true });
+        if (pick) await editWatchProp(w, pick.prop);
+    }
+
     // Toggle by LOCATION against the LIVE breakpoint list, not the passed model
     // instances (which may be stale between a change and the tree rebuild). This
     // is idempotent: a breakpoint in a file shared by two modules is the SAME
@@ -5197,6 +5315,20 @@ function activate(context) {
         }
         return out;
     };
+    // Watchpoint child rows: access / size / condition / log, each independently
+    // editable (like a standard breakpoint's condition + logpoint detail rows). Shown
+    // even when empty ("(none)") so a condition or message can be ADDED from the row.
+    const watchDetails = w => {
+        const acc = w.access === 'read' ? 'Read' : w.access === 'readWrite' ? 'Read + Write' : 'Write';
+        const sz = w.size || 1;
+        const stops = w.logMessage && /\[stop\]/i.test(w.logMessage);
+        return [
+            { prop: 'access', icon: 'debug-breakpoint-data', text: 'access: ' + acc },
+            { prop: 'size', icon: 'symbol-number', text: 'size: ' + sz + (sz > 1 ? ' bytes' : ' byte') },
+            { prop: 'condition', icon: 'debug-breakpoint-conditional', text: w.condition ? ('if ' + w.condition) : 'condition: (none)' },
+            { prop: 'logMessage', icon: 'debug-breakpoint-log', text: w.logMessage ? ((stops ? 'log & stop: ' : 'log: ') + w.logMessage.replace(/\s*\[stop\]\s*/ig, ' ').trim()) : 'log: (none)' },
+        ];
+    };
 
     const bpTreeProvider = {
         onDidChangeTreeData: bpTreeEmitter.event,
@@ -5210,9 +5342,13 @@ function activate(context) {
                 }
                 // Address breakpoints (ROM / no-source) get their own category at the end.
                 if (bpTreeModel.addrBps && bpTreeModel.addrBps.length) roots.push({ kind: 'addrGroup' });
+                // Watchpoints (memory access events) get their own category too.
+                if (watchBpList.length) roots.push({ kind: 'watchGroup' });
                 return roots;
             }
             if (el.kind === 'addrGroup') return bpTreeModel.addrBps.map(a => ({ kind: 'addrBp', a }));
+            if (el.kind === 'watchGroup') return watchBpList.map(w => ({ kind: 'watchBp', w }));
+            if (el.kind === 'watchBp') return watchDetails(el.w).map((d, i) => ({ kind: 'watchDetail', w: el.w, idx: i, prop: d.prop, text: d.text, icon: d.icon }));
             if (el.kind === 'module') return el.mod.fileArr.map(f => ({ kind: 'file', file: f, mod: el.mod }));
             if (el.kind === 'file') return el.file.lineArr.map(l => ({ kind: 'line', ln: l, file: el.file, mod: el.mod }));
             if (el.kind === 'line') return lineDetails(el.ln).map((d, i) => ({ kind: 'detail', ln: el.ln, el, idx: i, ...d }));
@@ -5240,6 +5376,38 @@ function activate(context) {
                 it.iconPath = new vscode.ThemeIcon(enabled ? 'debug-breakpoint' : 'debug-breakpoint-disabled',
                     new vscode.ThemeColor(enabled ? 'debugIcon.breakpointForeground' : 'debugIcon.breakpointDisabledForeground'));
                 it.id = 'addrbp:' + a.address;
+                return it;
+            }
+            if (el.kind === 'watchGroup') {
+                const it = new vscode.TreeItem('Watchpoints', vscode.TreeItemCollapsibleState.Expanded);
+                it.description = String(watchBpList.length);
+                it.contextValue = 'oricWatchGroup';
+                it.iconPath = new vscode.ThemeIcon('eye');
+                it.id = 'watchgroup';
+                return it;
+            }
+            if (el.kind === 'watchBp') {
+                const w = el.w;
+                const enabled = w.enabled !== false;
+                const hx = '$' + (w.address & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
+                const acc = w.access === 'read' ? 'R' : w.access === 'readWrite' ? 'RW' : 'W';
+                const name = (w.label && w.label !== hx) ? (hx + ' ' + w.label) : hx;
+                // Access/size/condition/log live in editable child rows (below); the top row
+                // stays concise: address + access tag.
+                const it = new vscode.TreeItem(name + '  [' + acc + ']', vscode.TreeItemCollapsibleState.Expanded);
+                it.contextValue = 'oricWatchBp';
+                it.checkboxState = enabled ? vscode.TreeItemCheckboxState.Checked : vscode.TreeItemCheckboxState.Unchecked;
+                it.iconPath = new vscode.ThemeIcon(
+                    w.logMessage ? 'debug-breakpoint-log' : (w.condition ? 'debug-breakpoint-conditional' : 'debug-breakpoint-data'),
+                    new vscode.ThemeColor(enabled ? 'debugIcon.breakpointForeground' : 'debugIcon.breakpointDisabledForeground'));
+                it.id = 'watchbp:' + w.id;
+                return it;
+            }
+            if (el.kind === 'watchDetail') {
+                const it = new vscode.TreeItem(el.text, vscode.TreeItemCollapsibleState.None);
+                it.iconPath = new vscode.ThemeIcon(el.icon);
+                it.contextValue = 'oricWatchDetail';
+                it.id = 'watchdetail:' + el.w.id + ':' + el.prop;
                 return it;
             }
             if (el.kind === 'detail') {
@@ -5320,6 +5488,10 @@ function activate(context) {
                     s.customRequest('setAddressBreakpointEnabled',
                         { address: node.a.address, enabled: state === vscode.TreeItemCheckboxState.Checked }).catch(() => {});
             }
+            else if (node.kind === 'watchBp') {
+                const w = watchBpList.find(x => x.id === node.w.id);
+                if (w) { w.enabled = state === vscode.TreeItemCheckboxState.Checked; pushWatchpoints(); }
+            }
         }
     });
     const modBps = m => m.fileArr.flatMap(f => f.lineArr.flatMap(l => l.bps));
@@ -5341,7 +5513,14 @@ function activate(context) {
             const saved = context.workspaceState.get(ADDR_BP_KEY, []);
             if (Array.isArray(saved) && saved.length)
                 setTimeout(() => s.customRequest('setAddressBreakpoints', { breakpoints: saved }).catch(() => {}), 400);
+            // Re-send watchpoint events too (adapter-owned, like address bps).
+            if (watchBpList.length)
+                setTimeout(() => s.customRequest('oricSetWatchpoints', { watchpoints: watchBpList.map(toAdapterWp) }).catch(() => {}), 450);
         }),
+        vscode.commands.registerCommand('oric-debug.addWatchpoint', () => addWatchpointFlow()),
+        vscode.commands.registerCommand('oric-debug.removeWatchpoint', node => removeWatchpoint(node)),
+        vscode.commands.registerCommand('oric-debug.editWatchpoint', node => editWatchpoint(node)),
+        vscode.commands.registerCommand('oric-debug.editWatchProp', node => { if (node && node.w && node.prop) editWatchProp(watchBpList.find(x => x.id === node.w.id), node.prop); }),
         vscode.debug.onDidTerminateDebugSession(() => { activeOricModuleId = null; rebuildBpTree(); }),
         vscode.commands.registerCommand('oric-debug.bpEnableModule', node => { if (node && node.mod) setBpsEnabled(modBps(node.mod), true); }),
         vscode.commands.registerCommand('oric-debug.bpDisableModule', node => { if (node && node.mod) setBpsEnabled(modBps(node.mod), false); }),
@@ -6150,6 +6329,16 @@ function activate(context) {
                                 const saved = context.workspaceState.get(ADDR_BP_KEY, []);
                                 if (Array.isArray(saved) && saved.length)
                                     session.customRequest('setAddressBreakpoints', { breakpoints: saved }).catch(() => {});
+                                // Same for watchpoint events — re-send the full set once per session.
+                                const wsaved = context.workspaceState.get(WATCH_BP_KEY, []);
+                                if (Array.isArray(wsaved) && wsaved.length)
+                                    session.customRequest('oricSetWatchpoints', {
+                                        watchpoints: wsaved.filter(w => w && typeof w.address === 'number').map(w => ({
+                                            id: w.id, addr: w.address, size: w.size || 1, access: w.access || 'write',
+                                            module: w.module == null ? null : w.module, condition: w.condition || null,
+                                            logMessage: w.logMessage || null, enabled: w.enabled !== false,
+                                        })),
+                                    }).catch(() => {});
                             }
                             // Record the stop time so the imminent reveal-on-stop focus
                             // change (source editor) isn't mistaken for a user click that
