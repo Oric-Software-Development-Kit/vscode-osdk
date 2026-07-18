@@ -1134,6 +1134,13 @@ render('');
 let heatmapPanel = null;
 let screenPanel = null;
 let vizOutputChannel = null;
+let vizConnected = false;   // true while the viz stream socket is actually connected
+
+// Tell the Screen View whether the Oric is connected — gates its keyboard control
+// (no controlling a disconnected Oric) and the "click to control" badge.
+function postScreenConn(connected) {
+    if (screenPanel) screenPanel.webview.postMessage({ type: 'conn', connected: !!connected });
+}
 
 // ----------------------------------------------------------------
 // Shared viz_stream connection (single TCP, multiple consumers)
@@ -1245,6 +1252,8 @@ function vizConnect(host, port) {
 
     sock.connect(port, host, () => {
         vizLog('Connected to ' + host + ':' + port);
+        vizConnected = true;
+        postScreenConn(true);
         for (const c of vizConsumers) c.postStatus('Connected to ' + host + ':' + port);
     });
 
@@ -1369,6 +1378,8 @@ function vizConnect(host, port) {
     sock.on('close', () => {
         vizLog('Disconnected from viz server');
         vizSocket = null;
+        vizConnected = false;
+        postScreenConn(false);
         for (const c of vizConsumers) c.postStatus('Disconnected — reconnecting...');
         vizScheduleReconnect();
     });
@@ -1909,6 +1920,7 @@ function createScreenPanel() {
     const path = require('path');
 
     panel.webview.onDidReceiveMessage(msg => {
+        if (msg.type === 'screenReady') { postScreenConn(vizConnected); return; }
         if (msg.type === 'saveImage' && msg.dataUrl) {
             // Find workspace folder for screenshot subfolder
             let baseDir = null;
@@ -1977,17 +1989,26 @@ body {
     background: var(--vscode-editor-background);
     user-select: none;
 }
+/* Match the screen's max width so the toolbar / status line up with the screen's
+   right edge instead of the (letterboxed) view's far-right gray area. */
+.statusrow { display: flex; align-items: center; max-width: 720px; margin: 2px 0; }
 #status {
     color: var(--vscode-descriptionForeground, #888);
     font-size: 0.85em;
-    margin: 2px 0;
     white-space: nowrap;
+}
+/* Keyboard-control state — right-aligned on the status line (over the Copy button),
+   NOT overlaid on the live screen. */
+#kbdBadge {
+    margin-left: auto; padding-left: 12px;
+    font: 11px monospace; color: #888; white-space: nowrap;
 }
 #error {
     color: var(--vscode-errorForeground, #f44);
     font-size: 0.85em;
     margin: 2px 0;
     display: none;
+    max-width: 720px;
 }
 .controls {
     display: flex;
@@ -1995,6 +2016,7 @@ body {
     align-items: center;
     margin: 6px 0;
     font-size: 0.9em;
+    max-width: 720px;
 }
 .controls label { cursor: pointer; display: flex; align-items: center; gap: 4px; }
 .controls input[type="checkbox"] { cursor: pointer; }
@@ -2008,11 +2030,45 @@ body {
     font-size: inherit;
 }
 .controls button:hover { background: var(--vscode-button-hoverBackground); }
+/* Row by default: screen fills the space, inspector is a fixed narrow column beside it
+   (so a taller screen never squeezes the inspector until it wraps below → scroll). Only
+   a genuinely narrow view stacks them (media query) — then the inspector goes full-width. */
+.stage { display: flex; gap: 16px; align-items: flex-start; }
+/* Row mode: inspector shrinks to its CONTENT (the zoomer / info text) instead of a fixed
+   width, so no dead space is reserved beside it — the screen gets that width. Its internals
+   stack (zoomer over info, selects and pixel/col/row on their own lines) to stay narrow. */
+.inspect-panel { flex: 0 0 auto; min-width: 0; }
+.inspector { flex-direction: column; }
+.pxrow { flex-direction: column; }
+.inspect-panel .controls { flex-direction: column; align-items: flex-start; gap: 4px; }
+/* Fixed width so the panel width can't jitter as the (variable-length) hover text changes
+   — otherwise every mouse move would resize the panel and rescale the screen. */
+.info { flex: 0 0 auto; width: 150px; }
+/* Narrow OR portrait view: stack the screen over the inspector; the inspector then goes
+   full-width and its internals lay out side-by-side (zoomer beside info, one-line pixel/col/row). */
+@media (max-width: 640px), (max-aspect-ratio: 1/1) {
+    /* stretch (not flex-start) so the screen column fills the FULL view width — otherwise it
+       shrinks to its content, which is the button row, capping the screen at ~500px. */
+    .stage { flex-direction: column; align-items: stretch; }
+    .inspect-panel { flex: 1 1 auto; }
+    .inspector { flex-direction: row; flex-wrap: wrap; }
+    .pxrow { flex-direction: row; flex-wrap: wrap; column-gap: 14px; }
+    .inspect-panel .controls { flex-direction: row; align-items: center; gap: 16px; }
+    .info { flex: 1 1 160px; min-width: 160px; width: auto; }
+}
+/* The screen column holds the status row + button bar + screen, all the SAME width, so
+   the buttons and "click to control" badge always align to the screen's right edge (not
+   the whole view's). It's the flex item that grows; the inspector sits beside it. */
+.screen-col {
+    flex: 1 1 340px;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+.screen-col .statusrow, .screen-col .controls { max-width: none; }
 .screen-wrap {
     position: relative;
-    display: inline-block;
     width: 100%;
-    max-width: 720px;
     border: 1px solid #404040;
     cursor: none;
 }
@@ -2032,11 +2088,11 @@ body {
 }
 .inspector {
     display: flex;
-    gap: 16px;
+    gap: 12px;
     margin-top: 8px;
     align-items: flex-start;
-    min-height: 130px;
 }
+.pxrow { display: flex; }
 #zoomCanvas {
     border: 1px solid #404040;
     image-rendering: pixelated;
@@ -2049,6 +2105,12 @@ body {
 .info .label { color: var(--vscode-debugTokenExpression-name, #9cdcfe); }
 .info .value { color: var(--vscode-debugTokenExpression-number, #b5cea8); }
 .info .dim { color: var(--vscode-descriptionForeground, #888); }
+/* The "= $xx %bbbbbbbbb" byte value sits on its own line, slightly indented, so the
+   address line stays short (helps the panel reflow in a narrow column). */
+.info .byteline { margin-left: 12px; }
+/* The bit the hovered pixel maps to is marked directly in the binary (underlined +
+   accented) instead of a trailing "bit N" — reads at a glance, no counting. */
+.info .bit { color: var(--vscode-charts-orange, #e2a03f); font-weight: bold; text-decoration: underline; }
 .swatch {
     display: inline-block;
     width: 12px;
@@ -2058,18 +2120,23 @@ body {
     margin-left: 4px;
 }
 </style></head><body>
-<div id="status">Waiting for connection...</div>
+<div class="stage">
+<div class="screen-col">
+<div class="statusrow">
+    <div id="status">Waiting for connection...</div>
+    <div id="kbdBadge">⏸ Oric not connected</div>
+</div>
 <div id="error"></div>
 <div class="controls">
-    <label><input type="checkbox" id="colGrid"> Columns (6px)</label>
-    <label><input type="checkbox" id="rowGrid"> Rows (8px)</label>
+    <label><input type="checkbox" id="colGrid"> Columns</label>
+    <label><input type="checkbox" id="rowGrid"> Rows</label>
     <select id="gridColor" title="Grid color">
-        <option value="128,0,0">Dark Red</option>
-        <option value="0,128,0">Dark Green</option>
-        <option value="0,0,128">Dark Blue</option>
-        <option value="128,128,0">Dark Yellow</option>
-        <option value="128,0,128">Dark Magenta</option>
-        <option value="0,128,128">Dark Cyan</option>
+        <option value="128,0,0">Maroon</option>
+        <option value="0,128,0">Forest</option>
+        <option value="0,0,128">Navy</option>
+        <option value="128,128,0">Olive</option>
+        <option value="128,0,128">Purple</option>
+        <option value="0,128,128">Teal</option>
         <option value="128,128,128" selected>Gray</option>
         <option value="255,128,0">Orange</option>
     </select>
@@ -2081,6 +2148,8 @@ body {
     <canvas id="screenCanvas" width="240" height="224"></canvas>
     <canvas id="overlayCanvas" width="240" height="224"></canvas>
 </div>
+</div>
+<div class="inspect-panel">
 <div class="controls">
     <label>Zoom <select id="zoomFactor">
         <option value="2">2x</option>
@@ -2098,9 +2167,9 @@ body {
 </div>
 <div class="inspector">
     <canvas id="zoomCanvas" width="120" height="120"></canvas>
-    <div class="info" id="infoPanel">
-        <div class="dim">Hover over the screen to inspect</div>
-    </div>
+    <div class="info" id="infoPanel"></div>
+</div>
+</div>
 </div>
 <script>
 const vscode = acquireVsCodeApi();
@@ -2277,6 +2346,14 @@ gridColorSel.addEventListener('change', () => { saveSettings(); drawOverlay(); i
 function hex4(v) { return '$' + (v & 0xFFFF).toString(16).toUpperCase().padStart(4, '0'); }
 function hex2(v) { return '$' + (v & 0xFF).toString(16).toUpperCase().padStart(2, '0'); }
 function bin8(v) { return '%' + (v & 0xFF).toString(2).padStart(8, '0'); }
+// bin8 with the given bit position (0=LSB..7=MSB) wrapped for highlighting. In the
+// "%b7b6b5b4b3b2b1b0" string, bit N is at index (8 - N) (index 0 is the '%').
+function bin8hl(v, bitPos) {
+    const s = bin8(v);
+    if (bitPos === undefined || bitPos < 0 || bitPos > 7) return s;
+    const i = 8 - bitPos;
+    return s.slice(0, i) + '<span class="bit">' + s[i] + '</span>' + s.slice(i + 1);
+}
 
 function computeScreenAddress(x, y) {
     const col = Math.floor(x / 6);
@@ -2389,32 +2466,18 @@ function updateInspector(px, py) {
     const row = Math.floor(py / 8);
     const colorIdx = curScrBuf[py * 240 + px] & 7;
     const pri = computeScreenAddress(px, py);
-    const alt = computeAltAddress(px, py);
     const priB = lookupByte(pri.addr);
 
-    let html = '<div><span class="label">Pixel</span> <span class="value">(' + px + ', ' + py + ')</span>';
-    html += '  <span class="label">Col</span> <span class="value">' + col + '</span>';
-    html += '  <span class="label">Row</span> <span class="value">' + row + '</span></div>';
+    let html = '<div class="pxrow">'
+        + '<span><span class="label">Pixel</span> <span class="value">(' + px + ', ' + py + ')</span></span>'
+        + '<span><span class="label">Col</span> <span class="value">' + col + '</span> '
+        + '<span class="label">Row</span> <span class="value">' + row + '</span></span>'
+        + '</div>';
 
-    // Primary address
-    html += '<div><span class="label">' + pri.mode + '</span> <span class="value">' + hex4(pri.addr) + '</span>';
+    // Primary address (mode + address on one line, the byte value on the next)
+    html += '<div><span class="label">' + pri.mode + '</span> <span class="value">' + hex4(pri.addr) + '</span></div>';
     if (priB !== null) {
-        html += ' = <span class="value">' + hex2(priB) + '  ' + bin8(priB) + '</span>';
-        if (pri.bitPos !== undefined) {
-            html += '  <span class="dim">bit ' + pri.bitPos + '</span>';
-        }
-    }
-    html += '</div>';
-
-    // Alternate address (dimmed)
-    if (alt) {
-        const altB = lookupByte(alt.addr);
-        html += '<div class="dim">if ' + alt.mode + ' ' + hex4(alt.addr);
-        if (altB !== null) {
-            html += ' = ' + hex2(altB) + '  ' + bin8(altB);
-            if (alt.bitPos !== undefined) html += '  bit ' + alt.bitPos;
-        }
-        html += '</div>';
+        html += '<div class="byteline">= <span class="value">' + hex2(priB) + ' ' + bin8hl(priB, pri.bitPos) + '</span></div>';
     }
 
     // Color
@@ -2439,10 +2502,50 @@ screenWrap.addEventListener('mousemove', (e) => {
 
 screenWrap.addEventListener('mouseleave', () => {
     hoverPx = -1; hoverPy = -1;
-    infoPanel.innerHTML = '<div class="dim">Hover over the screen to inspect</div>';
+    infoPanel.innerHTML = '';
     zoomCtx.clearRect(0, 0, zoomCanvas.width, zoomCanvas.height);
     drawOverlay();
 });
+
+// Fit the screen to the available HEIGHT too: cap its width so its (aspect-locked)
+// height never exceeds what's on screen — so shrinking the view vertically scales the
+// screen down (like a stamp) instead of forcing a scrollbar. Width-capping keeps the
+// canvas aspect-correct, so the hover→pixel math (canvas bounding rect) stays valid.
+function fitScreen() {
+    const col = document.querySelector('.screen-col');
+    if (!col) return;
+    // Measure from the screen's own top (below the status + button bar) so the fit accounts
+    // for the height those rows consume. Cap the column width → the screen (width:100%) can't
+    // grow taller than the space left, so a short view scales it down instead of scrolling.
+    const top = screenWrap.getBoundingClientRect().top;
+    let availH = Math.max(60, (document.documentElement.clientHeight || window.innerHeight) - top - 12);
+    // When the inspector is stacked BELOW the screen (portrait/narrow), reserve its height
+    // so the screen doesn't grow tall enough to push the inspector off the bottom (scrollbar).
+    const stage = document.querySelector('.stage');
+    if (stage && getComputedStyle(stage).flexDirection === 'column') {
+        const insp = document.querySelector('.inspect-panel');
+        if (insp) availH = Math.max(60, availH - insp.offsetHeight - 16);
+    }
+    // No artificial max: the screen fills the space, bounded by available height (this cap)
+    // and, in row mode, by the flex width (view minus the inspector beside it).
+    const maxW = Math.floor(availH * 240 / 224);
+    const px = maxW + 'px';
+    if (col.style.maxWidth !== px) col.style.maxWidth = px;   // avoid redundant writes / observer churn
+}
+// Defer one frame so measurements are taken AFTER any media-query reflow (row↔column) has
+// settled — otherwise we'd read the pre-reflow inspector height/position and mis-size.
+let fitPending = false;
+function scheduleFit() {
+    if (fitPending) return;
+    fitPending = true;
+    requestAnimationFrame(() => { fitPending = false; fitScreen(); });
+}
+window.addEventListener('resize', scheduleFit);
+// The iframe often isn't at its final height when the script first runs (and no resize
+// event follows the settle), so a one-shot fit would lock the screen to a too-small height.
+// A ResizeObserver on the root recomputes on the initial settle AND every later layout change.
+if (window.ResizeObserver) new ResizeObserver(scheduleFit).observe(document.documentElement);
+scheduleFit();
 
 // Zoom controls: refresh inspector on change
 zoomFactorSel.addEventListener('change', () => {
@@ -2489,16 +2592,19 @@ window.addEventListener('message', e => {
 // extension, which writes them up the viz_stream socket to the emulator.
 (function(){
     const held = new Set();
-    const badge = document.createElement('div');
-    badge.style.cssText = 'position:fixed;top:4px;right:6px;font:11px monospace;'
-        + 'padding:2px 7px;border-radius:3px;background:rgba(0,0,0,0.55);'
-        + 'color:#888;pointer-events:none;z-index:99;';
-    badge.textContent = 'click to control the Oric';
-    document.body.appendChild(badge);
-    function setFocused(f){
-        badge.textContent = f ? '⌨ input → Oric' : 'click to control the Oric';
-        badge.style.color = f ? '#8f8' : '#888';
+    let connected = false, focused = false;
+    // Badge lives on the status line (right-aligned), NOT overlaid on the live screen.
+    const badge = document.getElementById('kbdBadge');
+    function updateBadge(){
+        if (!connected){ badge.textContent = '⏸ Oric not connected'; badge.style.color = '#888'; return; }
+        badge.textContent = focused ? '⌨ input → Oric' : 'click to control the Oric';
+        badge.style.color = focused ? '#8f8' : '#aaa';
     }
+    function setFocused(f){ focused = f; updateBadge(); }
+    // Connection state (viz stream) — no keyboard control when disconnected.
+    window.addEventListener('message', function(e){
+        if (e.data && e.data.type === 'conn'){ connected = !!e.data.connected; if (!connected) releaseAll(); updateBadge(); }
+    });
     window.addEventListener('focus', function(){ setFocused(true); });
     window.addEventListener('blur', function(){ setFocused(false); releaseAll(); });
     function isUiControl(){
@@ -2521,7 +2627,7 @@ window.addEventListener('message', e => {
     }
     function releaseAll(){ held.clear(); vscode.postMessage({ type: 'oricKeyReleaseAll' }); }
     window.addEventListener('keydown', function(e){
-        if (isUiControl()) return;
+        if (!connected || isUiControl()) return;   // no control of a disconnected Oric
         const id = mapKey(e); if (id == null) return;
         e.preventDefault();
         if (e.repeat) return;
@@ -2529,12 +2635,14 @@ window.addEventListener('message', e => {
         vscode.postMessage({ type: 'oricKey', id: id, down: true });
     });
     window.addEventListener('keyup', function(e){
-        if (isUiControl()) return;
+        if (!connected || isUiControl()) return;
         const id = mapKey(e); if (id == null) return;
         e.preventDefault();
         held.delete(id);
         vscode.postMessage({ type: 'oricKey', id: id, down: false });
     });
+    updateBadge();
+    vscode.postMessage({ type: 'screenReady' });   // ask the extension for the current connection state
 })();
 </script>
 </body></html>`;
