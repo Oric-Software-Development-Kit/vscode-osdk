@@ -375,6 +375,11 @@
                 "command": "oric-debug.stepIntoInstruction",
                 "key": "f11",
                 "when": "oricInstructionStepMode && debugType == 'oric-debug' && debugState == 'stopped'"
+            },
+            {
+                "command": "workbench.action.debug.stepBack",
+                "key": "shift+f10",
+                "when": "debugType == 'oric-debug' && debugState == 'stopped'"
             }
         ],
         "menus": {

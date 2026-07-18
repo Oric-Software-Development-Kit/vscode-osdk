@@ -6157,7 +6157,40 @@ const handlers = {
             for (const bp of fileBps) for (const b of bp.bindings) (b.armed ? bpAddrs : pendingAddrs).push(b.addr);
         }
 
-        respond(req, { instructions, pc, breakpoints: bpAddrs, pendingBreakpoints: pendingAddrs });
+        // Time-travel history line: how many steps back are available, and a one-line
+        // preview of where Step Back would land (the top of the ring). The target can be
+        // a far/unrelated address after a free-run, so the view shows it as a distinct
+        // row, NOT as the instruction physically above the PC.
+        let history = null;
+        try {
+            const hs = await gdbCmd('qOricHistStatus');   // "hist:<count>,<prevpchex|->"
+            const hm = /^hist:(\d+),([0-9a-fA-F]+|-)$/.exec(hs || '');
+            if (hm) {
+                const depth = parseInt(hm[1], 10);
+                if (depth > 0 && hm[2] !== '-') {
+                    const paddr = parseInt(hm[2], 16) & 0xFFFF;
+                    const mem = await readMem(paddr, 3);
+                    const op = mem[0], entry = OPS[op];
+                    let text;
+                    if (entry) {
+                        const mode = entry[3], sz = opSize(mode);
+                        const operand = fmtOp(mode, sz > 1 ? mem[1] : 0, sz > 2 ? mem[2] : 0, paddr);
+                        text = entry.substring(0, 3) + (operand ? ' ' + operand : '');
+                    } else {
+                        text = '.byte $' + op.toString(16).toUpperCase().padStart(2, '0');
+                    }
+                    const R = resolverInstance ? resolverInstance.resolve(paddr) : null;
+                    const label = (R && R.symbol)
+                        ? (R.symbol.offset ? R.symbol.name + '+$' + R.symbol.offset.toString(16).toUpperCase() : R.symbol.name)
+                        : (romLabelFor(paddr) || '');
+                    history = { depth, address: paddr, text, label };
+                } else {
+                    history = { depth };   // ring empty (or disabled → depth 0): no target
+                }
+            }
+        } catch (e) { /* old stub / history disabled — no history line */ }
+
+        respond(req, { instructions, pc, breakpoints: bpAddrs, pendingBreakpoints: pendingAddrs, history });
     },
 
     // -- Get last cycle annotation (custom request) -------------------

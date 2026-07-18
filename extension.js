@@ -3218,7 +3218,8 @@ function refreshDisasmPanel(session) {
     session.customRequest('disassembleRange', {
         address: disasmCenterAddr, count: 64, before: 24
     }).then(resp => {
-        for (const p of disasmPanels) p.webview.postMessage({ type: 'disasm', data: resp });
+        const following = disasmCenterAddr === null;   // null center = tracking the PC
+        for (const p of disasmPanels) p.webview.postMessage({ type: 'disasm', data: resp, following });
     }).catch(() => {});
 }
 
@@ -3233,8 +3234,10 @@ body {
     background: var(--vscode-editor-background);
     padding: 0;
 }
+/* Header (toolbar + history line) only makes sense while stopped — hidden otherwise. */
+.dheader { position: sticky; top: 0; z-index: 10; background: var(--vscode-editor-background); display: none; }
+body.dbg-stopped .dheader { display: block; }
 .toolbar {
-    position: sticky; top: 0; z-index: 10;
     background: var(--vscode-editor-background);
     padding: 6px 8px;
     display: flex; gap: 8px; align-items: center;
@@ -3254,10 +3257,11 @@ body {
     border: none; padding: 3px 10px; cursor: pointer;
     font-family: inherit; font-size: inherit;
 }
-.toolbar button:hover { opacity: 0.85; }
+.toolbar button:hover:not(:disabled) { opacity: 0.85; }
+.toolbar button:disabled { opacity: 0.4; cursor: default; }
 .toolbar .status {
-    color: var(--vscode-descriptionForeground, #888);
-    font-size: 0.9em; margin-left: auto;
+    color: var(--vscode-foreground);
+    font-weight: bold; margin-right: 12px;
 }
 table { width: 100%; border-collapse: collapse; user-select: text; table-layout: fixed; }
 tr { height: 20px; }
@@ -3297,6 +3301,19 @@ td.operand .act {
 body.dbg-stopped tr:hover td.operand .act { visibility: visible; }
 td.operand .act:hover { color: var(--vscode-foreground); }
 .no-session { padding: 20px; color: var(--vscode-descriptionForeground, #888); text-align: center; }
+/* Time-travel history line: where Step Back would land + ring depth. Styled DISTINCTLY
+   from the disassembly (it's often a far address, not the instruction above the PC). */
+.hist-line {
+    padding: 4px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    color: var(--vscode-descriptionForeground, #999);
+    background: var(--vscode-inputValidation-infoBackground, rgba(100,120,180,0.10));
+    border-bottom: 1px dashed var(--vscode-widget-border, #555);
+    border-left: 3px solid var(--vscode-debugIcon-stepBackForeground, #75beff);
+}
+.hist-line .hb { color: var(--vscode-debugIcon-stepBackForeground, #75beff); font-weight: bold; }
+.hist-line .hl { color: var(--vscode-symbolIcon-functionForeground, #75beff); }
+.hist-line .hi { color: var(--vscode-symbolIcon-keywordForeground, #c586c0); }
+.hist-line .hd { color: var(--vscode-descriptionForeground, #888); }
 .ctx-menu {
     position: fixed; z-index: 100; min-width: 180px;
     background: var(--vscode-menu-background, #252526);
@@ -3317,12 +3334,15 @@ td.operand .act:hover { color: var(--vscode-foreground); }
     margin-bottom: 3px;
 }
 </style></head><body>
+<div class="dheader">
 <div class="toolbar">
+    <span class="status" id="statusText"></span>
     <span style="color:var(--vscode-descriptionForeground,#888)">Go to:</span>
     <input type="text" id="gotoInput" placeholder="$XXXX" spellcheck="false">
     <button id="gotoBtn">Go</button>
     <button id="followBtn">Follow PC</button>
-    <span class="status" id="statusText"></span>
+</div>
+<div id="histLine"></div>
 </div>
 <div id="content"><div class="no-session">No debug session active</div></div>
 <script>
@@ -3361,7 +3381,17 @@ document.getElementById('content').addEventListener('mousedown', e => {
 
 document.getElementById('gotoBtn').addEventListener('click', doGoto);
 document.getElementById('gotoInput').addEventListener('keydown', e => { if (e.key === 'Enter') doGoto(); });
+document.getElementById('gotoInput').addEventListener('input', updateHeaderButtons);
 document.getElementById('followBtn').addEventListener('click', () => vscode.postMessage({ type: 'followPc' }));
+
+let following = true;   // true = view is tracking the PC (extension: disasmCenterAddr === null)
+// Go: only meaningful with a valid $addr typed. Follow PC: only when NOT already following.
+function updateHeaderButtons() {
+    const v = document.getElementById('gotoInput').value.trim().replace(/^\\$/, '');
+    document.getElementById('gotoBtn').disabled = !/^[0-9a-fA-F]{1,4}$/.test(v);
+    document.getElementById('followBtn').disabled = following;
+}
+updateHeaderButtons();
 
 // Drag a label out (e.g. into an editor) as plain text.
 document.getElementById('content').addEventListener('dragstart', e => {
@@ -3428,6 +3458,12 @@ document.getElementById('content').addEventListener('contextmenu', e => {
     ctxMenu.style.top = Math.min(e.clientY, window.innerHeight - mhgt - 4) + 'px';
 });
 
+// Suppress the browser's native context menu everywhere in the webview — Shift+F10
+// (our reverse-step key) and right-clicks off a row would otherwise pop the cut/
+// copy/paste menu. Our own line-action menu (right-click on a row) is built by the
+// handler above; text is still copyable via selection + Ctrl+C.
+document.addEventListener('contextmenu', e => e.preventDefault());
+
 function doGoto() {
     let v = document.getElementById('gotoInput').value.trim().replace(/^\\$/, '');
     if (/^[0-9a-fA-F]{1,4}$/.test(v)) {
@@ -3438,7 +3474,9 @@ function doGoto() {
 window.addEventListener('message', e => {
     if (e.data.type === 'disasm') {
         lastData = e.data.data;
+        following = !!e.data.following;
         render();
+        updateHeaderButtons();
     } else if (e.data.type === 'debugState') {
         // Stopped/running (pushed by the extension): line actions only make
         // sense on a stopped machine, so hide them while running / no session.
@@ -3448,18 +3486,37 @@ window.addEventListener('message', e => {
     }
 });
 
+function renderHistLine(history, h4) {
+    // Pinned in the sticky header (#histLine), so it stays visible while the
+    // disassembly scrolls beneath it. Shows where Step Back would land + ring depth.
+    const hl = document.getElementById('histLine');
+    if (!history || !history.depth) { hl.innerHTML = ''; return; }
+    const d = history.depth + ' step' + (history.depth > 1 ? 's' : '') + ' back';
+    if (history.address !== null && history.address !== undefined) {
+        hl.innerHTML = '<div class="hist-line">'
+            + '<span class="hb">\\u25C0 back \\u2192 $' + h4(history.address) + '</span>'
+            + (history.label ? '  <span class="hl">' + escHtml(history.label) + '</span>' : '')
+            + (history.text ? '  <span class="hi">' + escHtml(history.text) + '</span>' : '')
+            + '  <span class="hd">(' + d + ')</span></div>';
+    } else {
+        hl.innerHTML = '<div class="hist-line"><span class="hb">\\u25C0</span> <span class="hd">' + d + ' available</span></div>';
+    }
+}
+
 function render() {
     const el = document.getElementById('content');
+    const h4 = v => v.toString(16).toUpperCase().padStart(4, '0');
     if (!lastData || !lastData.instructions || lastData.instructions.length === 0) {
         el.innerHTML = '<div class="no-session">No debug session active</div>';
         document.getElementById('statusText').textContent = '';
+        renderHistLine(null, h4);
         return;
     }
-    const { instructions, pc, breakpoints, pendingBreakpoints } = lastData;
+    const { instructions, pc, breakpoints, pendingBreakpoints, history } = lastData;
     const bpSet = new Set(breakpoints || []);
     const pendingSet = new Set(pendingBreakpoints || []);
     const h2 = v => v.toString(16).toUpperCase().padStart(2, '0');
-    const h4 = v => v.toString(16).toUpperCase().padStart(4, '0');
+    renderHistLine(history, h4);
 
     let html = '<table>';
     let pcRowId = null;
