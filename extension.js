@@ -2175,7 +2175,8 @@ body {
         <option value="128,128,128" selected>Gray</option>
         <option value="255,128,0">Orange</option>
     </select>
-    <label><input type="checkbox" id="osdToggle" checked> State</label>
+    <label title="Show the turbo (fast-forward) / paused run-state badge on the screen"><input type="checkbox" id="osdToggle" checked> OSD</label>
+    <label title="Square = 1:1 pixels; off = true 50Hz Oric aspect (wider pixels)"><input type="checkbox" id="squarePx" checked> Square px</label>
     <span style="flex:1"></span>
     <button id="btnSave" title="Save screenshot to project">Save PNG</button>
     <button id="btnCopy" title="Copy to clipboard">Copy</button>
@@ -2227,6 +2228,7 @@ const zoomFactorSel = document.getElementById('zoomFactor');
 const zoomRegionSel = document.getElementById('zoomRegion');
 const osdToggle = document.getElementById('osdToggle');
 const osd = document.getElementById('osd');
+const squarePxCb = document.getElementById('squarePx');
 
 // --- Settings persistence ---
 function saveSettings() {
@@ -2236,7 +2238,8 @@ function saveSettings() {
         gridColor: gridColorSel.value,
         zoomFactor: zoomFactorSel.value,
         zoomRegion: zoomRegionSel.value,
-        osd: osdToggle.checked
+        osd: osdToggle.checked,
+        squarePx: squarePxCb.checked
     });
 }
 {
@@ -2248,6 +2251,7 @@ function saveSettings() {
         if (s.zoomFactor) zoomFactorSel.value = s.zoomFactor;
         if (s.zoomRegion) zoomRegionSel.value = s.zoomRegion;
         if (s.osd !== undefined) osdToggle.checked = !!s.osd;
+        if (s.squarePx !== undefined) squarePxCb.checked = !!s.squarePx;
     }
 }
 
@@ -2378,6 +2382,7 @@ function drawOverlay() {
 const resizeObs = new ResizeObserver(() => resizeOverlay());
 resizeObs.observe(screenCanvas);
 
+squarePxCb.addEventListener('change', () => { saveSettings(); applyAspect(); });
 colGridCb.addEventListener('change', () => { saveSettings(); drawOverlay(); });
 rowGridCb.addEventListener('change', () => { saveSettings(); drawOverlay(); });
 gridColorSel.addEventListener('change', () => { saveSettings(); drawOverlay(); if (hoverPx >= 0) updateInspector(hoverPx, hoverPy); });
@@ -2555,6 +2560,21 @@ screenWrap.addEventListener('mouseleave', () => {
 // height never exceeds what's on screen — so shrinking the view vertically scales the
 // screen down (like a stamp) instead of forcing a scrollbar. Width-capping keeps the
 // canvas aspect-correct, so the hover→pixel math (canvas bounding rect) stays valid.
+// Display pixel aspect. The Oric's 240x224 pixels are NOT square on a real 50Hz PAL CRT:
+// the frame spreads those lines over more scanlines than a 60Hz one, so the image is
+// COMPRESSED vertically (shorter/wider) by ~260/308 — round shapes render as flattened
+// (horizontal) ellipses. Matches Oricutron's own aspect-ratio correction. "Square px"
+// (default) = 1:1 pixels (also ≈ correct at 60Hz); unchecked = the shorter/wider 50Hz
+// look. Only the vertical DISPLAY size changes — the 240x224 pixel buffer, grid and hover
+// math are unchanged (everything derives from the canvas's live bounding rect).
+const ORIC_VSCALE = 260 / 308;   // ≈ 0.844 vertical compression (50Hz vs 60Hz scanline count)
+function displayAspectH() { return squarePxCb.checked ? 224 : Math.round(224 * ORIC_VSCALE); }
+function applyAspect() {
+    screenCanvas.style.aspectRatio = '240 / ' + displayAspectH();
+    resizeOverlay();   // overlay/grid re-derive from the new canvas size
+    scheduleFit();     // width cap depends on the aspect
+}
+
 function fitScreen() {
     const col = document.querySelector('.screen-col');
     if (!col) return;
@@ -2572,7 +2592,7 @@ function fitScreen() {
     }
     // No artificial max: the screen fills the space, bounded by available height (this cap)
     // and, in row mode, by the flex width (view minus the inspector beside it).
-    const maxW = Math.floor(availH * 240 / 224);
+    const maxW = Math.floor(availH * 240 / displayAspectH());
     const px = maxW + 'px';
     if (col.style.maxWidth !== px) col.style.maxWidth = px;   // avoid redundant writes / observer churn
 }
@@ -2589,7 +2609,7 @@ window.addEventListener('resize', scheduleFit);
 // event follows the settle), so a one-shot fit would lock the screen to a too-small height.
 // A ResizeObserver on the root recomputes on the initial settle AND every later layout change.
 if (window.ResizeObserver) new ResizeObserver(scheduleFit).observe(document.documentElement);
-scheduleFit();
+applyAspect();   // apply the restored square/Oric aspect + schedule the initial fit
 
 // Zoom controls: refresh inspector on change
 zoomFactorSel.addEventListener('change', () => {
