@@ -3036,7 +3036,11 @@ body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size
 .dbg-btn.rev .ic  { color: var(--vscode-debugIcon-stepBackForeground, #75beff); }
 </style></head><body>
 <div class="grp">
-    <button class="dbg-btn go" data-act="continue"><span class="ic">&#9654;</span>Continue</button>
+    <button class="dbg-btn go" id="playpause" data-act="playpause"><span class="ic" id="ppIcon">&#9654;</span><span id="ppLbl">Continue</span></button>
+    <button class="dbg-btn stop" data-act="stop"><span class="ic">&#9632;</span>Stop</button>
+    <button class="dbg-btn" data-act="restart"><span class="ic">&#8635;</span>Restart</button>
+</div>
+<div class="grp">
     <button class="dbg-btn" data-act="stepOver"><span class="ic">&#8631;</span>Step Over</button>
     <button class="dbg-btn" data-act="stepInto"><span class="ic">&#8628;</span>Step Into</button>
     <button class="dbg-btn" data-act="stepOut"><span class="ic">&#8630;</span>Step Out</button>
@@ -3045,23 +3049,28 @@ body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size
     <button class="dbg-btn rev" data-act="stepBack"><span class="ic">&#9664;</span>Step Back</button>
     <button class="dbg-btn rev" data-act="reverse"><span class="ic">&#9194;</span>Reverse</button>
 </div>
-<div class="grp">
-    <button class="dbg-btn" data-act="pause"><span class="ic">&#9208;</span>Pause</button>
-    <button class="dbg-btn" data-act="restart"><span class="ic">&#8635;</span>Restart</button>
-    <button class="dbg-btn stop" data-act="stop"><span class="ic">&#9632;</span>Stop</button>
-</div>
 <script>
 const vscode = acquireVsCodeApi();
 let stopped = true, active = false;
 document.body.addEventListener('click', e => {
     const b = e.target.closest('button.dbg-btn');
-    if (b && !b.disabled) vscode.postMessage({ type: 'debugAction', action: b.dataset.act });
+    if (!b || b.disabled) return;
+    // The play/pause button resolves to continue (when halted) or pause (when running).
+    let act = b.dataset.act;
+    if (act === 'playpause') act = stopped ? 'continue' : 'pause';
+    vscode.postMessage({ type: 'debugAction', action: act });
 });
 function apply() {
     const set = (act, on) => { const b = document.querySelector('[data-act="' + act + '"]'); if (b) b.disabled = !on; };
-    // No session -> everything disabled; else forward/reverse when stopped, Pause when running.
-    ['continue','stepOver','stepInto','stepOut','stepBack','reverse'].forEach(a => set(a, active && stopped));
-    set('pause', active && !stopped);
+    // Stepping (forward + reverse) only makes sense while halted.
+    ['stepOver','stepInto','stepOut','stepBack','reverse'].forEach(a => set(a, active && stopped));
+    // One button: Continue (green ▶) when halted, Pause (‖) when running; live whenever a session is.
+    const pp = document.getElementById('playpause');
+    if (pp) {
+        pp.disabled = !active;
+        if (stopped) { pp.classList.add('go'); document.getElementById('ppIcon').innerHTML = '&#9654;'; document.getElementById('ppLbl').textContent = 'Continue'; }
+        else { pp.classList.remove('go'); document.getElementById('ppIcon').innerHTML = '&#9208;'; document.getElementById('ppLbl').textContent = 'Pause'; }
+    }
     set('restart', active);
     set('stop', active);
 }
