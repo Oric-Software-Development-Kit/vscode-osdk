@@ -4925,6 +4925,77 @@ vscode.postMessage({ type: 'mruGet' }); // load the persisted search history
 }
 
 // ----------------------------------------------------------------
+// MCP server registration — write/merge .mcp.json for Claude Code, then health-check.
+// ----------------------------------------------------------------
+//
+// Claude Code discovers MCP servers from a plain-JSON `.mcp.json` at the project root, so
+// registering is just merging in our `oric` entry (pointing at the server shipped inside this
+// extension). We then run the REAL MCP handshake against it (mcp/validate.cjs) so the user gets
+// "registered AND proven healthy — N tools", not just a file written. We can't force Claude Code
+// to ingest it (it reads .mcp.json at session start), so we tell the user to run /mcp / restart.
+async function registerMcpServerFlow(context) {
+    const fs = require('fs');
+    const path = require('path');
+    const serverPath = path.join(context.extensionPath, 'mcp', 'oric-mcp-server.cjs');
+    if (!fs.existsSync(serverPath)) {
+        vscode.window.showErrorMessage('Oric MCP: server not found at ' + serverPath);
+        return;
+    }
+
+    // Pick the target workspace folder (the project whose .mcp.json we write).
+    const folders = vscode.workspace.workspaceFolders || [];
+    if (!folders.length) {
+        vscode.window.showErrorMessage('Oric MCP: open a project folder first (nowhere to write .mcp.json).');
+        return;
+    }
+    let folder = folders[0];
+    if (folders.length > 1) {
+        const pick = await vscode.window.showQuickPick(
+            folders.map(f => ({ label: f.name, description: f.uri.fsPath, folder: f })),
+            { title: 'Register Oric MCP server in which project?', ignoreFocusOut: true });
+        if (!pick) return;
+        folder = pick.folder;
+    }
+    const mcpPath = path.join(folder.uri.fsPath, '.mcp.json');
+
+    // Read + merge (preserve any other servers the user already registered).
+    let cfg = { mcpServers: {} };
+    if (fs.existsSync(mcpPath)) {
+        try { cfg = JSON.parse(fs.readFileSync(mcpPath, 'utf8')) || {}; }
+        catch (e) {
+            const go = await vscode.window.showWarningMessage(
+                '.mcp.json exists but is not valid JSON (' + (e.message || e) + '). Overwrite it with a fresh Oric entry?',
+                { modal: true }, 'Overwrite');
+            if (go !== 'Overwrite') return;
+            cfg = { mcpServers: {} };
+        }
+        if (!cfg.mcpServers || typeof cfg.mcpServers !== 'object') cfg.mcpServers = {};
+    }
+    cfg.mcpServers.oric = { command: 'node', args: [serverPath] };
+    try { fs.writeFileSync(mcpPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8'); }
+    catch (e) { vscode.window.showErrorMessage('Oric MCP: could not write ' + mcpPath + ' — ' + (e.message || e)); return; }
+
+    // Health-check it the way an MCP client would (spawn + initialize + tools/list).
+    let result;
+    await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'Oric MCP: validating server…' },
+        async () => { try { result = await require('./mcp/validate.cjs').validateServer(serverPath); } catch (e) { result = { ok: false, error: e.message || String(e) }; } });
+
+    const rel = vscode.workspace.asRelativePath(mcpPath);
+    if (result && result.ok) {
+        const action = await vscode.window.showInformationMessage(
+            'Oric MCP registered in ' + rel + ' and validated — ' + result.count + ' tools healthy. ' +
+            'In your Claude session, run /mcp (or restart it) to load it.',
+            'Show .mcp.json');
+        if (action === 'Show .mcp.json') vscode.window.showTextDocument(vscode.Uri.file(mcpPath));
+    } else {
+        vscode.window.showWarningMessage(
+            'Oric MCP: wrote ' + rel + ', but the server FAILED validation — ' + (result && result.error || 'unknown error') +
+            '. The entry is written; fix the server before using it.');
+    }
+}
+
+// ----------------------------------------------------------------
 // Extension activation
 // ----------------------------------------------------------------
 
@@ -5841,6 +5912,7 @@ function activate(context) {
         vscode.commands.registerCommand('oric-debug.stopAutomationScript', () => {
             vscode.window.showInformationMessage(stopAutomation('stopped by user') ? 'Oric automation: stopped.' : 'No Oric automation script is running.');
         }),
+        vscode.commands.registerCommand('oric-debug.registerMcpServer', () => registerMcpServerFlow(context)),
         // Ending the debug session must also stop any running script — otherwise it spins on a
         // dead session (ops swallow the errors) and can't be stopped or re-run.
         vscode.debug.onDidTerminateDebugSession(s => { if (!s || s.type === 'oric-debug') stopAutomation('debug session ended'); }),

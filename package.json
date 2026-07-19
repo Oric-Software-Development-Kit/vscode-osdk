@@ -211,6 +211,11 @@
                 "icon": "$(debug-stop)"
             },
             {
+                "command": "oric-debug.registerMcpServer",
+                "title": "Oric: Register MCP Server (for Claude)…",
+                "icon": "$(plug)"
+            },
+            {
                 "command": "oric-debug.addWatchpoint",
                 "title": "Oric: Add Watchpoint…",
                 "icon": "$(eye)"
