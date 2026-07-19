@@ -1189,7 +1189,14 @@ function postScreenConn(connected) {
 // OSD badge. `active` = an oric-debug session is live; the badge is hidden otherwise.
 function postScreenRunState() {
     if (screenPanel) screenPanel.webview.postMessage({
-        type: 'runstate', active: oricSessionActive, stopped: oricDebugStopped, warp: oricWarpOn
+        type: 'runstate', active: oricSessionActive,
+        // "stopped" = the machine is GENUINELY halted for inspection. During automation the
+        // script cycles stop/continue rapidly (the game is animating), so the pause indicator
+        // must NOT track that churn — only a real USER pause counts. Outside automation it's
+        // the normal stopped state.
+        stopped: automationRunning ? oricUserPaused : oricDebugStopped,
+        warp: oricWarpOn,               // ▶▶ follows t.warp(true) / the turbo toggle
+        scripted: !!automationRunning   // a scripted automation is driving — badge in the opposite corner
     });
 }
 
@@ -2106,6 +2113,22 @@ body {
 }
 .osd.turbo  { color: #7ee787; }   /* ▶▶ warp/turbo */
 .osd.paused { color: #e2a03f; }   /* ‖ halted at a breakpoint */
+/* Scripted-automation badge — OPPOSITE (top-left) corner so it coexists with the turbo/pause
+   OSD, showing that a script is driving. Same non-interactive, hover-hiding behaviour. */
+.osd-script {
+    position: absolute;
+    top: 6px;
+    left: 8px;
+    display: none;
+    pointer-events: none;
+    font: bold 15px/1 monospace;
+    padding: 5px 10px;
+    border-radius: 5px;
+    background: rgba(0, 0, 0, 0.55);
+    color: #58a6ff;
+    letter-spacing: 1px;
+    z-index: 5;
+}
 /* Pause = two thick bars, like a tape recorder's pause button (rather than the thin ‖). */
 .osd .pausebar {
     display: inline-block;
@@ -2187,6 +2210,7 @@ body {
     <canvas id="crtCanvas"></canvas>
     <canvas id="overlayCanvas" width="240" height="224"></canvas>
     <div class="osd" id="osd"></div>
+    <div class="osd-script" id="osdScript">● SCRIPT</div>
 </div>
 </div>
 <div class="inspect-panel">
@@ -2840,7 +2864,8 @@ document.getElementById('btnCopy').addEventListener('click', () => {
 
 // Run-state OSD: ▶▶ when warp/turbo is on, ‖ when halted at a breakpoint, nothing while
 // running normally or with no session. Purely a status indicator (see the "State" toggle).
-let runState = { active: false, stopped: false, warp: false };
+let runState = { active: false, stopped: false, warp: false, scripted: false };
+const osdScript = document.getElementById('osdScript');
 function updateOsd() {
     let html = '', cls = 'osd';
     // Hidden while the mouse is over the screen (hoverPx >= 0) so it never sits under the
@@ -2852,6 +2877,9 @@ function updateOsd() {
     osd.className = cls;
     osd.innerHTML = html;
     osd.style.display = html ? 'block' : 'none';
+    // Scripted badge in the opposite corner — shown whenever a script is driving (regardless
+    // of turbo/pause), and hidden under the crosshair on hover like the OSD.
+    osdScript.style.display = (osdToggle.checked && runState.scripted && hoverPx < 0) ? 'block' : 'none';
 }
 
 window.addEventListener('message', e => {
@@ -2859,7 +2887,7 @@ window.addEventListener('message', e => {
     if (e.data.type === 'status') { status.textContent = e.data.text; errorDiv.style.display = 'none'; }
     if (e.data.type === 'error') { errorDiv.textContent = e.data.text; errorDiv.style.display = 'block'; }
     if (e.data.type === 'runstate') {
-        runState = { active: !!e.data.active, stopped: !!e.data.stopped, warp: !!e.data.warp };
+        runState = { active: !!e.data.active, stopped: !!e.data.stopped, warp: !!e.data.warp, scripted: !!e.data.scripted };
         updateOsd();
     }
 });
@@ -2958,6 +2986,10 @@ let debugControlsProvider = null; // Oric Debug Controls webview view (button to
 let oricSessionActive = false; // true between an oric-debug session's start and terminate (activeDebugSession races on terminate)
 let oricWarpOn = false;       // current warp/turbo speed state (mirrors the toggleWarp toggle) — for the Screen View OSD
 let dimLiveViews = null;      // set in activate: greys the live-data views (regs/peripherals/…) when not stopped
+let refreshAllViews = null;   // set in activate = refreshAll; lets module-level code repaint the panels
+let automationUiTimer = null; // debounces UI repaints while an automation script cycles stop/continue
+let oricUserPaused = false;   // true when the USER paused the debugger mid-automation (not an automation-issued pause) — waits suspend
+let automationPauseInFlight = false; // set while the automation itself issues a pause, so its own stop isn't mistaken for a user pause
 
 // Central stopped-state switch: gates the source CodeLens AND the disasm
 // panel's line actions (the webview hides its buttons/menu while the program
@@ -2968,6 +3000,22 @@ function setOricDebugStopped(v, reason) {
     // value-watch hit ('data breakpoint') from a manual pause / step — a waitFor must
     // NOT be satisfied by the user pausing to look around.
     automationEvents.fire({ type: oricDebugStopped ? 'stopped' : 'continued', reason: reason });   // drive the automation runner's waits
+    if (automationRunning) {
+        // A running script drives rapid continue/pause cycles; repainting on each is the
+        // flicker. But a genuine USER pause (not one the automation issued) must still refresh
+        // the UI and suspend the script's waits. Detect it, and debounce the repaint so it
+        // only fires once the state has SETTLED — which is exactly a real pause, never cycling.
+        if (oricDebugStopped) { if (reason === 'pause' && !automationPauseInFlight) oricUserPaused = true; }
+        else { oricUserPaused = false; }   // resumed (by the user or the automation)
+        scheduleAutomationUiSync();
+        return;
+    }
+    applyDebugStateVisuals();
+}
+
+// The per-state UI repaint (line actions, bp tree, disasm state, control buttons, live-view
+// dimming, Screen View OSD). Immediate outside automation; debounced during it (below).
+function applyDebugStateVisuals() {
     if (!oricDebugStopped) { currentStopLoc = null; updatePcLineContext(); }
     if (lineActionLens) lineActionLens.refresh();
     if (bpTreeEmitter) bpTreeEmitter.fire();   // clear/redraw the "stopped here" marker
@@ -2977,6 +3025,22 @@ function setOricDebugStopped(v, reason) {
     // values are stale. When stopped, refreshAll() re-renders them live.
     if (!oricDebugStopped && dimLiveViews) dimLiveViews();
     postScreenRunState();   // update the Screen View turbo/paused OSD
+}
+
+// Debounced repaint for while an automation script runs: only fires after ~350 ms with no
+// further stop/continue, i.e. the state has settled (a user pause, or the script sitting
+// stopped) — so it never flickers during the rapid cycling, yet a real pause DOES refresh
+// (including the panels, when stopped).
+function scheduleAutomationUiSync() {
+    if (automationUiTimer) clearTimeout(automationUiTimer);
+    automationUiTimer = setTimeout(() => {
+        automationUiTimer = null;
+        applyDebugStateVisuals();   // cheap: just posts webview messages (buttons/dim/OSD)
+        // The HEAVY panel refresh (regs/memory/symbols/disasm — many serialized adapter
+        // round-trips) runs ONLY on a genuine user pause, not on every transient settle
+        // between script steps — otherwise those bursts pile up and drain for seconds.
+        if (oricUserPaused && refreshAllViews) refreshAllViews();
+    }, 350);
 }
 
 // --- In-session automation runner --------------------------------------------
@@ -2998,8 +3062,12 @@ function inSessionOps(session) {
     // So every stub-dependent op halts first (pause = out-of-band \x03, always works).
     const self = {
         async continue() { if (oricDebugStopped) await session.customRequest('continue', { threadId: 1 }).catch(() => {}); },
-        async pause() { if (!oricDebugStopped) { const p = waitSessionEvent('stopped', 4000); await session.customRequest('pause', { threadId: 1 }).catch(() => {}); await p.catch(() => {}); } },
+        // automationPauseInFlight brackets the automation's OWN pause so the resulting stop
+        // isn't mistaken for a user pause (see setOricDebugStopped's detection).
+        async pause() { if (!oricDebugStopped) { automationPauseInFlight = true; const p = waitSessionEvent('stopped', 4000); await session.customRequest('pause', { threadId: 1 }).catch(() => {}); await p.catch(() => {}); automationPauseInFlight = false; } },
         async ensureStopped() { if (!oricDebugStopped) await self.pause(); return oricDebugStopped; },
+        // True while the USER has paused the debugger mid-run — the core's waits suspend on it.
+        isUserPaused() { return oricUserPaused; },
         // Optional `reason` filters which stop resolves the wait (e.g. 'data breakpoint'
         // for a value-watch hit) so a manual pause/step during a waitFor is ignored.
         waitStopped(ms, reason) { return waitSessionEvent('stopped', ms || 30000, reason ? (e => e.reason === reason) : null); },
@@ -3014,6 +3082,10 @@ function inSessionOps(session) {
         },
         sendKey(id, down) { vizSendInput(vizProto.keyFrame(id, down)); },
         releaseKeys() { vizSendInput(vizProto.releaseAllFrame()); },
+        // Enqueue an emulator-owned key tap: Oricutron holds it `hold` emulated frames then
+        // releases (reliable, one-at-a-time). Needs the TAP-queue emulator build; press()
+        // falls back to sendKey down/up if this op is absent.
+        tapKey(id, hold) { vizSendInput(vizProto.tapFrame(id, hold)); },
         vizFrame() { return vizLastFrame; },
         vizScreen() { return vizLastScrB64 ? Buffer.from(vizLastScrB64, 'base64') : null; },
         async setWatch(addr, access, cond) {
@@ -3034,7 +3106,41 @@ function inSessionOps(session) {
             if (r && r.error) throw new Error('value-watch: ' + r.error);
         },
         async clearValueWatch(addr) { await session.customRequest('oricClearValueWatch', { addr: addr & 0xffff }).catch(() => {}); },
-        async warp(on) { if (!!on !== oricWarpOn) doToggleWarp(); },
+        // Active overlay module + list (pure adapter-state read — no stub, safe while running).
+        async getModules() { try { return await session.customRequest('getModules'); } catch (_) { return null; } },
+        // One-shot run-to: arm a temp breakpoint at target (symbol/addr) and run until hit.
+        // Uses turboRun (which sets a one-shot temp bp); must be halted to arm it.
+        async runTo(target, opts = {}) {
+            await self.ensureStopped();
+            const arg = (typeof target === 'number') ? { addr: target & 0xffff } : { symbol: String(target) };
+            arg.warp = opts.warp === true;   // normal speed by default
+            const stopP = self.waitStopped(opts.timeoutMs || 60000);
+            stopP.catch(() => {});           // avoid an unhandled rejection if turboRun throws below
+            try { await session.customRequest('turboRun', arg); }
+            catch (e) { throw new Error('runTo(' + target + '): ' + (e && e.message ? e.message : e)); }
+            await stopP;
+        },
+        // Reliable warp for scripts: an idempotent SET, AWAITED and confirmed — not the
+        // fire-and-forget toggle (which returned before applying and raced on stale state,
+        // so a warp(false) could be dropped and bleed warp into the next section). Halt first
+        // so the stub actually applies it (a 'c' in flight would queue it), then reflect the
+        // confirmed state in the tracker + Screen View OSD.
+        async warp(on) {
+            on = !!on;
+            if (vizConnected) {
+                // Always-live uplink: applies IMMEDIATELY even while the CPU runs — no halt,
+                // no queuing behind a 'c'. This is the reliable path (viz is connected for the run).
+                vizSendInput(vizProto.warpFrame(on));
+                oricWarpOn = on;
+            } else {
+                // No viz stream — fall back to the halted-only GDB-stub set.
+                await self.ensureStopped();
+                const r = await session.customRequest('setWarp', { on }).catch(() => null);
+                if (r) oricWarpOn = !!r.warp;
+            }
+            vscode.commands.executeCommand('setContext', 'oric-debug.warp', oricWarpOn);
+            postScreenRunState();
+        },
         waitSignal(id, ms) { return waitSessionEvent('signal', ms || 60000, e => !id || e.id === id); },
         // Resolve a real name (_gCurrentLocation / e_LOC_LARGE_STAIRCASE) to { addr, value, ... }
         // so scripts never hardcode addresses/enum values. Pure symbol-table lookup (no stub).
@@ -3042,10 +3148,77 @@ function inSessionOps(session) {
     };
     return self;
 }
+
+// Start an oric-debug session from cold (the F5 equivalent) and wait until the adapter is
+// LIVE — so a script can run with nothing already open, and the MCP has one tested path to a
+// fully-hooked session (right emulator args, symbols, viz). Resolves to the session, or null
+// (with a reported reason). Picks the oric-debug config from launch.json (quick-picks if >1).
+async function startOricDebugSession(log) {
+    log = log || (() => {});
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || !folders.length) { vscode.window.showErrorMessage('Oric: open the project folder first (need its launch.json).'); return null; }
+    const candidates = [];
+    for (const f of folders) {
+        const cfgs = vscode.workspace.getConfiguration('launch', f.uri).get('configurations') || [];
+        for (const c of cfgs) if (c && c.type === 'oric-debug') candidates.push({ folder: f, config: c });
+    }
+    if (!candidates.length) { vscode.window.showErrorMessage('Oric: no "oric-debug" configuration found in launch.json.'); return null; }
+    let chosen = candidates[0];
+    if (candidates.length > 1) {
+        const pick = await vscode.window.showQuickPick(
+            candidates.map((c, i) => ({ label: c.config.name || ('configuration ' + i), description: c.folder.name, i })),
+            { placeHolder: 'Which Oric debug configuration should the script start?' });
+        if (!pick) return null;
+        chosen = candidates[pick.i];
+    }
+    // Capture the session the moment it starts (startDebugging only returns a bool).
+    const startedP = new Promise(resolve => {
+        const sub = vscode.debug.onDidStartDebugSession(s => { if (s && s.type === 'oric-debug') { sub.dispose(); resolve(s); } });
+        setTimeout(() => { sub.dispose(); resolve(null); }, 30000);
+    });
+    log('Launching "' + (chosen.config.name || 'oric-debug') + '"…');
+    const ok = await vscode.debug.startDebugging(chosen.folder, chosen.config.name || chosen.config);
+    if (!ok) { vscode.window.showErrorMessage('Oric: failed to start the debug session.'); return null; }
+    const session = await startedP;
+    if (!session) { vscode.window.showErrorMessage('Oric: the debug session did not start in time.'); return null; }
+    // Wait until the adapter answers a lightweight request (connected + symbols loaded). The
+    // script's own waits (ensureGame / waitFor) then cover any tape/disk load time.
+    for (let i = 0; i < 60; i++) {
+        try { if (await session.customRequest('getModules')) { log('Session live.'); return session; } } catch (_) {}
+        await new Promise(r => setTimeout(r, 500));
+    }
+    log('Session started but the adapter did not become ready in time — running anyway.');
+    return session;
+}
+
+// The automation OWNS its viz connection so it never depends on the Oric Screen View being
+// open — the frame counter (runFrames/waitModule*) and screenshots come from the viz stream.
+// A no-op consumer keeps the socket alive; vizRegisterConsumer auto-connects when a session
+// is active, and unregistering leaves it connected if a panel is still using it.
+const automationVizConsumer = { postFrame() {}, postStatus() {}, postError() {} };
+function waitVizConnected(ms) {
+    return new Promise(resolve => {
+        if (vizConnected) return resolve(true);
+        const t0 = Date.now();
+        const iv = setInterval(() => {
+            if (vizConnected) { clearInterval(iv); resolve(true); }
+            else if (Date.now() - t0 > (ms || 8000)) { clearInterval(iv); resolve(false); }
+        }, 100);
+    });
+}
+
 async function runAutomationScript(scriptPath) {
-    const session = vscode.debug.activeDebugSession;
-    if (!session || session.type !== 'oric-debug') { vscode.window.showErrorMessage('Oric: start a debug session first, then run the automation script.'); return; }
     if (automationRunning) { vscode.window.showWarningMessage('An Oric automation script is already running — Stop it first.'); return; }
+    // No active session? Start one (the equivalent of F5) and wait until the adapter is live,
+    // so you can "just run the script" from cold — the same reliable, fully-hooked launch the
+    // MCP will use. An already-running oric-debug session is reused as-is.
+    let session = vscode.debug.activeDebugSession;
+    if (!session || session.type !== 'oric-debug') {
+        const chan = automationChannel(); chan.show(true);
+        chan.appendLine('No debug session — starting one (F5)…');
+        session = await startOricDebugSession(m => chan.appendLine(m));
+        if (!session) return;   // startOricDebugSession reported why
+    }
     let scriptFn;
     // Fresh each run: bust the require cache for the script AND every sibling module in its
     // folder (e.g. automation/encounter.js helpers), so editing a helper reloads without a
@@ -3064,10 +3237,18 @@ async function runAutomationScript(scriptPath) {
     try { ({ makeApi } = require('./mcp/playthrough-core.cjs')); }
     catch (e) { vscode.window.showErrorMessage('Automation core failed to load: ' + (e && e.message ? e.message : e)); return; }
     const chan = automationChannel(); chan.clear(); chan.show(true);
+    // Own the viz stream for the run (frame timing + screenshots) — independent of any panel.
+    vizRegisterConsumer(automationVizConsumer);
+    if (!vizConnected) {
+        chan.appendLine('Connecting viz stream (screen + frame timing)…');
+        if (!(await waitVizConnected(8000)))
+            chan.appendLine('⚠ viz stream not connected — frame timing/screenshots may not work (is the emulator up?).');
+    }
     const outDir = nodePath.join(nodePath.dirname(scriptPath), 'out');
     const t = makeApi(inSessionOps(session), { log: m => chan.appendLine(m), outDir });
     automationRunning = t;
     vscode.commands.executeCommand('setContext', 'oric-debug.automationRunning', true);
+    postScreenRunState();   // show the "SCRIPT" badge on the Screen View OSD right away
     chan.appendLine('▶ ' + nodePath.basename(scriptPath) + '   (session: ' + session.name + ')');
     const t0 = Date.now();
     try { await scriptFn(t); }
@@ -3075,9 +3256,36 @@ async function runAutomationScript(scriptPath) {
     const sum = t.summary();
     chan.appendLine('──────────────────────────────');
     chan.appendLine((sum.allPassed ? '✓ ' : '✗ ') + sum.pass + '/' + sum.total + ' checks passed   (' + ((Date.now() - t0) / 1000).toFixed(1) + 's)');
-    automationRunning = null;
-    vscode.commands.executeCommand('setContext', 'oric-debug.automationRunning', false);
+    // Clean up ONLY if we're still the current run — a force-Stop / session-end (stopAutomation)
+    // may already have torn this down, or a new run may have started; don't clobber either.
+    if (automationRunning === t) {
+        vizUnregisterConsumer(automationVizConsumer);   // leaves it up if a panel still uses it
+        automationRunning = null;
+        oricUserPaused = false;
+        if (automationUiTimer) { clearTimeout(automationUiTimer); automationUiTimer = null; }
+        vscode.commands.executeCommand('setContext', 'oric-debug.automationRunning', false);
+        // Repaint once now that the rapid-cycling suppression is off (buttons/dim/panels live again).
+        applyDebugStateVisuals();
+        if (refreshAllViews) refreshAllViews();
+    }
     vscode.window.showInformationMessage('Oric automation: ' + sum.pass + '/' + sum.total + (sum.allPassed ? ' passed ✓' : ' — some FAILED ✗') + ' (see "Oric Automation" output)');
+}
+
+// Stop a running automation script and FORCE the state clean, so it can never wedge: cancel
+// it cooperatively (its next checkpoint throws), AND clear the running flag / context key /
+// UI-debounce / viz consumer right now — so "Stop", and ending the debug session, always
+// recover even if the script was stuck in a wait against a dead session. Returns true if one
+// was running.
+function stopAutomation(reason) {
+    if (!automationRunning) return false;
+    try { automationRunning._cancel(); } catch (_) {}
+    automationRunning = null;
+    oricUserPaused = false;
+    if (automationUiTimer) { clearTimeout(automationUiTimer); automationUiTimer = null; }
+    try { vizUnregisterConsumer(automationVizConsumer); } catch (_) {}
+    vscode.commands.executeCommand('setContext', 'oric-debug.automationRunning', false);
+    if (automationChan) automationChan.appendLine('■ automation ' + (reason || 'stopped'));
+    return true;
 }
 
 // Array-valued context key for the line-number gutter menu: the PC line when
@@ -3722,6 +3930,19 @@ function syncMonitorBreakpoints(body) {
 function doToggleWarp() {
     const session = vscode.debug.activeDebugSession;
     if (!session || session.type !== 'oric-debug') return;
+    if (vizConnected) {
+        // Always-live uplink: the toggle applies immediately, even mid-run — so a warp
+        // KEYBINDING pressed while the program is running (or warping) can't lag behind a
+        // 'c' on the halted-only GDB stub, which is why it "didn't always stop in time".
+        const newState = !oricWarpOn;
+        vizSendInput(vizProto.warpFrame(newState));
+        oricWarpOn = newState;
+        vscode.commands.executeCommand('setContext', 'oric-debug.warp', oricWarpOn);
+        vscode.window.setStatusBarMessage(oricWarpOn ? 'Warp: ON' : 'Warp: OFF', 3000);
+        postScreenRunState();
+        return;
+    }
+    // No viz stream (e.g. no Screen View open) — fall back to the GDB-stub toggle.
     session.customRequest('toggleWarp').then(resp => {
         if (resp) {
             oricWarpOn = !!resp.warp;
@@ -5618,9 +5839,11 @@ function activate(context) {
             if (pick) runAutomationScript(pick.fsPath);
         }),
         vscode.commands.registerCommand('oric-debug.stopAutomationScript', () => {
-            if (automationRunning) { automationRunning._cancel(); vscode.window.showInformationMessage('Oric automation: stopping…'); }
-            else vscode.window.showInformationMessage('No Oric automation script is running.');
+            vscode.window.showInformationMessage(stopAutomation('stopped by user') ? 'Oric automation: stopped.' : 'No Oric automation script is running.');
         }),
+        // Ending the debug session must also stop any running script — otherwise it spins on a
+        // dead session (ops swallow the errors) and can't be stopped or re-run.
+        vscode.debug.onDidTerminateDebugSession(s => { if (!s || s.type === 'oric-debug') stopAutomation('debug session ended'); }),
         vscode.commands.registerCommand('oric-debug.addWatchpoint', () => addWatchpointFlow()),
         vscode.commands.registerCommand('oric-debug.removeWatchpoint', node => removeWatchpoint(node)),
         vscode.commands.registerCommand('oric-debug.editWatchpoint', node => editWatchpoint(node)),
@@ -5966,6 +6189,7 @@ function activate(context) {
     const periphProvider = new PeripheralsWebviewProvider();
     // Grey the live-data views when the debugger isn't stopped (see setOricDebugStopped).
     dimLiveViews = () => { regsProvider.markStale(); periphProvider.markStale(); markInstrStale(); refreshWatchValues(null); setMemoryPanelsStale(true); };
+    refreshAllViews = refreshAll;   // module-level hook so the automation debounce can repaint the panels
 
     debugControlsProvider = new DebugControlsWebviewProvider();
     context.subscriptions.push(
@@ -6451,27 +6675,33 @@ function activate(context) {
                                         })),
                                     }).catch(() => {});
                             }
-                            // Record the stop time so the imminent reveal-on-stop focus
-                            // change (source editor) isn't mistaken for a user click that
-                            // would flip step mode.
-                            lastStopMs = Date.now();
-                            // Drop the previous line's annotation at once so it can't
-                            // flicker there during the post-step navigation churn; the
-                            // fresh one is applied when refreshAll's resolve returns.
-                            clearInstrDecoration();
-                            setTimeout(() => refreshAll(), 50);
-                            // While instruction-stepping (the disassembly panel is visible,
-                            // tracked by the oricInstructionStepMode context key) don't yank
-                            // the user to a source editor on each stop — that focus theft is
-                            // what broke instruction-stepping. Source navigation resumes when
-                            // they leave the disassembly view.
-                            if (!instrStepMode) {
-                                pendingNavigate = true;
-                            }
-                            // Auto-open custom disassembly panel on first stop of session
-                            if (!disassemblyAutoOpened) {
-                                disassemblyAutoOpened = true;
-                                setTimeout(() => createDisasmPanel(), 200);
+                            // An automation script drives rapid stop/continue cycles — don't
+                            // repaint panels or yank the editor on each one (that's the flicker);
+                            // runAutomationScript repaints once at the end. (The bp restore above
+                            // still runs, once, so a cold-started automation session is armed.)
+                            if (!automationRunning) {
+                                // Record the stop time so the imminent reveal-on-stop focus
+                                // change (source editor) isn't mistaken for a user click that
+                                // would flip step mode.
+                                lastStopMs = Date.now();
+                                // Drop the previous line's annotation at once so it can't
+                                // flicker there during the post-step navigation churn; the
+                                // fresh one is applied when refreshAll's resolve returns.
+                                clearInstrDecoration();
+                                setTimeout(() => refreshAll(), 50);
+                                // While instruction-stepping (the disassembly panel is visible,
+                                // tracked by the oricInstructionStepMode context key) don't yank
+                                // the user to a source editor on each stop — that focus theft is
+                                // what broke instruction-stepping. Source navigation resumes when
+                                // they leave the disassembly view.
+                                if (!instrStepMode) {
+                                    pendingNavigate = true;
+                                }
+                                // Auto-open custom disassembly panel on first stop of session
+                                if (!disassemblyAutoOpened) {
+                                    disassemblyAutoOpened = true;
+                                    setTimeout(() => createDisasmPanel(), 200);
+                                }
                             }
                         }
                         // Refresh disasm dots once the adapter has actually applied a

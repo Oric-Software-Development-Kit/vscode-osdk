@@ -5608,6 +5608,17 @@ const handlers = {
         respond(req, { warp: newState });
     },
 
+    // Idempotent SET (vs the toggle) — reliable for scripts: forces warp to exactly `on`
+    // regardless of the current state, so a dropped/duplicated call can't invert it. Returns
+    // the applied state. (qOricWarp is a stub command, so the caller should be halted — while
+    // a 'c' is in flight it would queue behind it; the automation's warp op ensureStopped's.)
+    async setWarp(req) {
+        const on = !!(req.arguments && req.arguments.on);
+        const reply = await gdbCmd('qOricWarp,' + (on ? '1' : '0'));
+        if (reply === null) { respond(req, {}, false, 'Not connected'); return; }
+        respond(req, { warp: on });
+    },
+
     // -- Turbo Run Until (custom request) -----------------------------
     // Run at warp speed to a target (symbol, file+line, or addr), or just
     // warp-continue to the next breakpoint; warp is restored when we stop.
