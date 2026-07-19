@@ -5056,6 +5056,33 @@ function stopMcpBridge() {
 // extension). We then run the REAL MCP handshake against it (mcp/validate.cjs) so the user gets
 // "registered AND proven healthy — N tools", not just a file written. We can't force Claude Code
 // to ingest it (it reads .mcp.json at session start), so we tell the user to run /mcp / restart.
+// Pre-approve the Oric MCP server's tools in the project's Claude settings so the assistant
+// isn't prompted ("Do you want to proceed?") on every call. ONE server-level rule ("mcp__<name>")
+// covers every current AND future tool; we also drop any now-redundant per-tool rules that a
+// prior "don't ask again" left behind. Written to .claude/settings.json (committed, consistent
+// with the .mcp.json the register step writes). Non-fatal — returns {ok,error} for the caller.
+function addMcpAllowRule(folderFsPath, serverName) {
+    const fs = require('fs'); const path = require('path');
+    const rule = 'mcp__' + serverName;
+    const dir = path.join(folderFsPath, '.claude');
+    const file = path.join(dir, 'settings.json');
+    let s = {};
+    if (fs.existsSync(file)) {
+        try { s = JSON.parse(fs.readFileSync(file, 'utf8')) || {}; }
+        catch (e) { return { ok: false, error: '.claude/settings.json is not valid JSON (' + (e.message || e) + ')' }; }
+    }
+    if (!s.permissions || typeof s.permissions !== 'object') s.permissions = {};
+    const allow = Array.isArray(s.permissions.allow) ? s.permissions.allow : [];
+    const perTool = allow.filter(r => typeof r === 'string' && r.indexOf(rule + '__') === 0).length;   // mcp__oric__* superseded
+    const already = allow.includes(rule);
+    const kept = allow.filter(r => r !== rule && !(typeof r === 'string' && r.indexOf(rule + '__') === 0));
+    kept.push(rule);
+    s.permissions.allow = kept;
+    try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(file, JSON.stringify(s, null, 2) + '\n', 'utf8'); }
+    catch (e) { return { ok: false, error: (e.message || String(e)) }; }
+    return { ok: true, rule, file, cleaned: perTool, already };
+}
+
 async function registerMcpServerFlow(context) {
     const fs = require('fs');
     const path = require('path');
@@ -5098,6 +5125,12 @@ async function registerMcpServerFlow(context) {
     try { fs.writeFileSync(mcpPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8'); }
     catch (e) { vscode.window.showErrorMessage('Oric MCP: could not write ' + mcpPath + ' — ' + (e.message || e)); return; }
 
+    // Pre-approve the server's tools so the assistant isn't prompted per call (one mcp__oric rule).
+    const allowRes = addMcpAllowRule(folder.uri.fsPath, 'oric');
+    const allowMsg = allowRes.ok
+        ? ' Tools pre-approved (mcp__oric in .claude/settings.json' + (allowRes.cleaned ? ', ' + allowRes.cleaned + ' redundant per-tool rule' + (allowRes.cleaned > 1 ? 's' : '') + ' cleaned up' : '') + ') — no per-tool prompts.'
+        : ' (Could not pre-approve tools: ' + allowRes.error + ' — you may be prompted per tool.)';
+
     // Health-check it the way an MCP client would (spawn + initialize + tools/list).
     let result;
     await vscode.window.withProgress(
@@ -5107,7 +5140,7 @@ async function registerMcpServerFlow(context) {
     const rel = vscode.workspace.asRelativePath(mcpPath);
     if (result && result.ok) {
         const action = await vscode.window.showInformationMessage(
-            'Oric MCP registered in ' + rel + ' and validated — ' + result.count + ' tools healthy. ' +
+            'Oric MCP registered in ' + rel + ' and validated — ' + result.count + ' tools healthy.' + allowMsg + ' ' +
             'In your Claude session, run /mcp (or restart it) to load it.',
             'Show .mcp.json');
         if (action === 'Show .mcp.json') vscode.window.showTextDocument(vscode.Uri.file(mcpPath));
