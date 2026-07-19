@@ -79,19 +79,32 @@ viz is then at base+2 automatically (port + 1).
 | `oric_backtrace` | call stack (symbol + source per frame). |
 | `oric_get_output` | recent console output **including logpoint / trace lines**. |
 | `oric_screenshot` | **PNG of the screen** so the model can SEE (`scale` 1–6, default 3). |
-| `oric_send_keys` | **type into the Oric** (`{text}`; `\n` = Return; machine must be running). |
+| `oric_send_keys` | **type into the Oric RELIABLY** (`{text}`; `\n` = Return) — each key played by the emulator's tap queue (held across scans, one at a time), so keystrokes aren't dropped under warp. |
+| `oric_press` | press one key: a letter, a NAME (`RETURN`/`ESC`/`UP`/`SPACE`/`CTRL`…), or a code. |
+| `oric_warp` | `{on}` — fast-forward on/off; applies immediately even while running. |
+| `oric_wait_for` | `{expr}` — run until a variable holds a value (`_gCurrentLocation == e_LOC_MARKETPLACE`); the reliable "wait until", any write path, frame-based timeout. |
+| `oric_run_to` | `{target}` — run to a symbol (`_AskInput`) or `$hex`, then stop. |
+| `oric_run_frames` | `{frames}` — let N emulated frames pass (~50 = 1 s), then stop. |
+| `oric_module` / `oric_wait_module` | active OSDK overlay (Splash/Intro/Game/…) / run until a given one. |
+| `oric_wait_signal` | `{id}` — run until a logpoint/watchpoint tagged `[signal:<id>]` fires. |
 
-The combination that makes an agent effective: `oric_screenshot` (sight) + `oric_send_keys`
-(input) + the symbol-aware debug tools → it can form a hypothesis, act, and observe the result.
+The interaction tools (`send_keys`/`press`/`warp`/`wait_for`/`run_to`/`module`/`wait_signal`) run
+on the **same `makeApi(ops)` control core** the VS Code automation uses — so the MCP inherits the
+same reliability: emulator-owned key timing, the always-live control channel, deterministic
+"wait until a variable holds a value", and overlay-module awareness. Combined with
+`oric_screenshot` (sight) + the symbol-aware debug tools, an agent can form a hypothesis, act
+reliably, and observe the result.
 
 ## Known limitations (this is a scaffold)
 
-- **Not yet exercised against a live emulator** — the MCP transport, tool registry and PNG
-  encoder are validated; the DAP round-trips assume the adapter behaves as it does for VS Code.
-- **`oric_send_keys`** handles printable ASCII + Return; other special keys (arrows, FUNCT,
-  etc.) need the emulator's `0x80+` special-code mapping — not wired yet.
+- **Not exercised end-to-end against a live emulator via an MCP client** — the transport, tool
+  registry, PNG encoder and the shared control core are validated (selftests); a full agent run
+  through an MCP client is the remaining check.
 - **No symbol-address breakpoints** — breakpoints are `file:line` (DAP `setBreakpoints`).
   Symbol/address bps could be added via the adapter's address-bp / custom requests.
+- **Command-line typing verification is game-specific** — `oric_send_keys` types reliably, but
+  the input-buffer *verify/retry* (as in the Encounter `enc.command` helper) lives in game
+  scripts, not the generic MCP tool.
 - **`disassemble` / `read_memory`** aren't exposed as tools yet (the adapter has the
   machinery — `disassembleRange` etc.; easy follow-ups).
 - **Launch config** is passed through verbatim; no discovery of `.vscode/launch.json`.

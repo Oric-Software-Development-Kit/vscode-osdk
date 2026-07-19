@@ -24,7 +24,8 @@
 'use strict';
 
 const path = require('path');
-const { DapClient, VizClient, screenToPng, VIZ_PORT_OFFSET, ADAPTER, setLog } = require('./oric-debug-client.cjs');
+const { DapClient, VizClient, screenToPng, VIZ_PORT_OFFSET, ADAPTER, setLog, makeClientOps } = require('./oric-debug-client.cjs');
+const { makeApi } = require('./playthrough-core.cjs');
 
 // Everything that is not JSON-RPC MUST go to stderr — stdout is the MCP channel.
 function log(...a) { process.stderr.write('[oric-mcp] ' + a.join(' ') + '\n'); }
@@ -35,7 +36,7 @@ setLog(m => log(m));   // route the shared client log through ours
 // Session — ties a DAP client + viz client together, tracks breakpoints.
 // ---------------------------------------------------------------------------
 const session = {
-    dap: null, viz: null, config: null, host: 'localhost', port: null,
+    dap: null, viz: null, t: null, config: null, host: 'localhost', port: null,
     bpByFile: new Map(),        // file -> Map(line -> {condition?})
     watchpoints: new Map(),     // addrHex -> { accessType, condition }
 };
@@ -63,6 +64,10 @@ async function launch(config) {
     session.viz = new VizClient();
     const connectViz = () => session.viz.connect(session.host, session.port + VIZ_PORT_OFFSET);
     connectViz(); setTimeout(() => { if (!session.viz.connected) connectViz(); }, 1500);
+    // The reliable control center: the SAME makeApi(ops) the VS Code automation uses — so the
+    // MCP's keys go through the emulator TAP queue, warp through the always-live uplink, plus
+    // runTo / value-watch waitFor / module awareness. One core, one set of guarantees.
+    session.t = makeApi(makeClientOps(session.dap, session.viz), { log: m => log(m) });
     return { launched: true, port: session.port, vizPort: session.port + VIZ_PORT_OFFSET };
 }
 
@@ -70,7 +75,7 @@ async function shutdown() {
     try { if (session.dap) await session.dap.request('disconnect', { terminateDebuggee: true }); } catch (_) {}
     if (session.viz) session.viz.disconnect();
     if (session.dap) session.dap.stop();
-    session.dap = null; session.viz = null; session.bpByFile.clear(); session.watchpoints.clear();
+    session.dap = null; session.viz = null; session.t = null; session.bpByFile.clear(); session.watchpoints.clear();
     return { shutdown: true };
 }
 
@@ -257,22 +262,49 @@ const TOOLS = {
         },
     },
     oric_send_keys: {
-        description: 'Type into the Oric (keyboard injection over the viz uplink, via the AY matrix). Printable ASCII is sent as-is; "\\n" sends Return. The machine must be RUNNING to consume keys.',
+        description: 'Type text into the Oric RELIABLY. Each key is played by the emulator itself — pressed and held a guaranteed number of keyboard scans, one at a time — so keystrokes are not dropped regardless of speed/warp (unlike naive injection). "\\n" (or "\\r") sends Return. The machine runs while typing.',
         schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
-        run: async a => {
-            requireSession();
-            if (!session.viz) return { content: [{ type: 'text', text: 'viz not connected' }], isError: true };
-            const s = String(a.text);
-            for (const ch of s) {
-                let code = ch.charCodeAt(0);
-                if (ch === '\n' || ch === '\r') code = 0x0d;         // Return (best-effort)
-                if (code > 0xff) continue;
-                session.viz.send([0x01, 0x02, code & 0xff, 1]);      // KEY down
-                session.viz.send([0x01, 0x02, code & 0xff, 0]);      // KEY up
-            }
-            session.viz.send([0x02, 0x00]);                          // RELEASE_ALL
-            return T('Sent ' + s.length + ' key(s).');
-        },
+        run: async a => { requireSession(); await session.t.type(String(a.text)); return T('Typed ' + JSON.stringify(String(a.text)) + '.'); },
+    },
+    oric_press: {
+        description: 'Press one key reliably (emulator-held tap). `key` is a letter ("a"), a NAME ("RETURN"/"ESC"/"UP"/"DOWN"/"LEFT"/"RIGHT"/"SPACE"/"CTRL"/"SHIFT"/"TAB"/"KEY_RETURN"), or a numeric code. Use for attract-mode skips / menus.',
+        schema: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] },
+        run: async a => { requireSession(); await session.t.press(a.key); return T('Pressed ' + a.key + '.'); },
+    },
+    oric_warp: {
+        description: 'Set fast-forward (turbo) on/off. Applies IMMEDIATELY even while running (goes through the always-live control channel, not the halted-only debug stub). Speeds up long waits.',
+        schema: { type: 'object', properties: { on: { type: 'boolean' } }, required: ['on'] },
+        run: async a => { requireSession(); await session.t.warp(!!a.on); return T('Warp ' + (a.on ? 'ON' : 'off') + '.'); },
+    },
+    oric_wait_for: {
+        description: 'Run full-speed until a VARIABLE HOLDS A VALUE, then stop — the reliable "wait until" primitive. `expr` uses the game\'s real names, e.g. "_gCurrentLocation == e_LOC_MARKETPLACE" or "gGameOverCondition != 0". It fires no matter HOW the byte was written (STA/INC/DMA/…), and the timeout is measured in emulated frames. Returns when the condition holds.',
+        schema: { type: 'object', properties: { expr: { type: 'string' }, timeoutFrames: { type: 'number' } }, required: ['expr'] },
+        run: async a => { requireSession(); await session.t.waitFor(a.expr, a.timeoutFrames ? { timeoutFrames: a.timeoutFrames } : undefined); return T('Condition held: ' + a.expr + '. ' + await whereString()); },
+    },
+    oric_run_to: {
+        description: 'Run (one-shot "run to here") until the CPU reaches `target` — a symbol name (e.g. "_AskInput", "_InputCheckKey") or a $hex address — then stop there. Deterministic sync on the program reaching a point.',
+        schema: { type: 'object', properties: { target: { type: 'string' }, warp: { type: 'boolean' } }, required: ['target'] },
+        run: async a => { requireSession(); await session.t.runTo(a.target, { warp: !!a.warp }); return T('Reached ' + a.target + '. ' + await whereString()); },
+    },
+    oric_run_frames: {
+        description: 'Let N emulated frames pass while running (~50 = one second at 50 Hz), then stop. Use to let an animation/message play out.',
+        schema: { type: 'object', properties: { frames: { type: 'number' } }, required: ['frames'] },
+        run: async a => { requireSession(); const n = await session.t.runFrames(a.frames || 50); return T('Ran ' + n + ' frames. ' + await whereString()); },
+    },
+    oric_module: {
+        description: 'The active OSDK overlay module name (e.g. Splash/Intro/Game/…), or "(none)". Lets you branch on where the machine is (entry point).',
+        schema: { type: 'object', properties: {} },
+        run: async () => { requireSession(); return T('module: ' + (await session.t.module() || '(none)')); },
+    },
+    oric_wait_module: {
+        description: 'Run until the given overlay module is active (e.g. "Game"), then stop.',
+        schema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
+        run: async a => { requireSession(); await session.t.waitModule(a.name); return T('module: ' + (await session.t.module() || '(none)')); },
+    },
+    oric_wait_signal: {
+        description: 'Run full-speed until a logpoint/watchpoint tagged [signal:<id>] fires, then stop. The checkpoint lives in the code (a breakpoint), not here.',
+        schema: { type: 'object', properties: { id: { type: 'string' }, timeoutMs: { type: 'number' } }, required: ['id'] },
+        run: async a => { requireSession(); await session.t.waitSignal(a.id, { timeoutMs: a.timeoutMs }); return T('Signal "' + a.id + '" fired. ' + await whereString()); },
     },
 };
 
