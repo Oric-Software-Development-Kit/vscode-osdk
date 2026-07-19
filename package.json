@@ -216,6 +216,16 @@
                 "icon": "$(plug)"
             },
             {
+                "command": "oric-debug.startMcpBridge",
+                "title": "Oric: AI Collaboration — Start/Stop Bridge",
+                "icon": "$(broadcast)"
+            },
+            {
+                "command": "oric-debug.takeControl",
+                "title": "Oric: Take Debug Control (from AI)",
+                "icon": "$(person)"
+            },
+            {
                 "command": "oric-debug.addWatchpoint",
                 "title": "Oric: Add Watchpoint…",
                 "icon": "$(eye)"

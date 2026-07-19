@@ -219,7 +219,142 @@ function makeClientOps(dap, viz) {
     };
 }
 
+// --- Collaborative bridge client -------------------------------------------------------------
+// Attach to the extension-hosted bridge (bridge-server.cjs) and present the SAME DapClient /
+// VizClient surfaces that makeClientOps + the MCP tools expect — but backed by the LIVE VS Code
+// session. So the AI and the human share one screen / breakpoints / CPU, and every existing tool
+// runs unchanged. See oric-bridge-protocol.cjs for the wire format.
+const bridgeProto = require('./oric-bridge-protocol.cjs');
+
+class BridgeClient extends EventEmitter {
+    constructor() { super(); this.sock = null; this.buf = ''; this.seq = 1; this.pending = new Map(); this.connected = false; }
+    connect(host, port) {
+        return new Promise((resolve, reject) => {
+            const sock = net.connect(port, host); this.sock = sock; sock.setEncoding('utf8');
+            sock.on('connect', () => { this.connected = true; LOG('bridge connected ' + host + ':' + port); resolve(); });
+            sock.on('error', e => { if (!this.connected) reject(e); else LOG('bridge error: ' + e.message); });
+            sock.on('close', () => { this.connected = false; this.emit('event', { event: 'closed' }); });
+            sock.on('data', c => this._onData(c));
+        });
+    }
+    _onData(chunk) {
+        this.buf += chunk; let nl;
+        while ((nl = this.buf.indexOf('\n')) >= 0) {
+            const line = this.buf.slice(0, nl).trim(); this.buf = this.buf.slice(nl + 1);
+            if (!line) continue;
+            let m; try { m = JSON.parse(line); } catch (_) { continue; }
+            if (m.method === 'event') { this.emit('event', m.params || {}); continue; }
+            if (m.id != null && this.pending.has(m.id)) {
+                const { resolve, reject } = this.pending.get(m.id); this.pending.delete(m.id);
+                if (m.error) reject(Object.assign(new Error(m.error.message || 'bridge error'), { code: m.error.code, bridge: true }));
+                else resolve(m.result);
+            }
+        }
+    }
+    call(method, params) {
+        return new Promise((resolve, reject) => {
+            if (!this.connected) return reject(new Error('bridge not connected'));
+            const id = this.seq++; this.pending.set(id, { resolve, reject });
+            try { this.sock.write(JSON.stringify({ jsonrpc: '2.0', id, method, params: params || {} }) + '\n'); } catch (e) { reject(e); }
+        });
+    }
+    close() { if (this.sock) { try { this.sock.destroy(); } catch (_) {} this.sock = null; } this.connected = false; }
+}
+
+// DapClient look-alike backed by the bridge (request/once_event/stopped/lastStop/topFrameId/output).
+class BridgeDapShim extends EventEmitter {
+    constructor(bridge) {
+        super(); this.bridge = bridge; this.stopped = false; this.ended = false; this.lastStop = null; this.output = []; this._frameId = null;
+        bridge.on('event', p => this._onEvent(p));
+    }
+    _onEvent(p) {
+        switch (p && p.event) {
+            case 'stopped': this.stopped = true; this.lastStop = p; this._frameId = null; this.emit('stopped', p); break;
+            case 'continued': this.stopped = false; this._frameId = null; this.emit('continued', p); break;
+            case 'signal': this.emit('dap:oricSignal', p); break;
+            case 'output': this.output.push(p.text || ''); break;
+            case 'ended': this.ended = true; this.emit('ended', p); break;
+            case 'control': this.emit('control', p); break;
+            case 'closed': this.ended = true; this.emit('closed', p); break;
+        }
+    }
+    start() {} stop() { this.bridge.close(); }
+    request(cmd, args) { return this.bridge.call('dap', { cmd, args: args || {} }); }
+    customRequest(cmd, args) { return this.request(cmd, args); }
+    once_event(name, ms, filter) {
+        return new Promise((resolve, reject) => {
+            const to = setTimeout(() => { this.off(name, h); reject(new Error('timeout waiting for ' + name)); }, ms || 30000);
+            const h = b => { if (filter && !filter(b)) return; clearTimeout(to); this.off(name, h); resolve(b); };
+            this.on(name, h);
+        });
+    }
+    async topFrameId() {
+        if (this._frameId != null) return this._frameId;
+        try { const st = await this.request('stackTrace', { threadId: 1, startFrame: 0, levels: 1 }); this._frameId = st && st.stackFrames && st.stackFrames[0] ? st.stackFrames[0].id : null; }
+        catch (_) { this._frameId = null; }
+        return this._frameId;
+    }
+}
+
+// VizClient look-alike backed by the bridge — polls the live frame/screen and routes key uplink
+// through viz.input (which the bridge gates on the AI holding control).
+class BridgeVizShim {
+    constructor(bridge) { this.bridge = bridge; this.latest = null; this.connected = true; this._tick = 0; this._iv = setInterval(() => this._poll(), 120); if (this._iv.unref) this._iv.unref(); }
+    async _poll() {
+        try {
+            const f = await this.bridge.call('viz.frame');
+            const frame = f ? f.frame : (this.latest ? this.latest.frame : -1);
+            // Frame counter every tick (cheap); the screen + its meta (vidMode/vidAddr) every 3rd,
+            // carrying the last-known meta forward so `latest` is always fully populated (a partial
+            // object was what crashed oric_screenshot's vidAddr.toString()).
+            if ((this._tick++ % 3) === 0) {
+                const s = await this.bridge.call('viz.screen');
+                this.latest = {
+                    frame,
+                    vidMode: s && s.vidMode != null ? s.vidMode : (this.latest ? this.latest.vidMode : 0),
+                    vidAddr: s && s.vidAddr != null ? s.vidAddr : (this.latest ? this.latest.vidAddr : 0),
+                    scr: s && s.scr ? Buffer.from(s.scr, 'base64') : (this.latest ? this.latest.scr : null),
+                };
+            } else if (this.latest) {
+                this.latest = Object.assign({}, this.latest, { frame });
+            }
+        } catch (_) {}
+    }
+    connect() {} disconnect() { if (this._iv) clearInterval(this._iv); this._iv = null; }
+    send(bytes) { this.bridge.call('viz.input', { b64: Buffer.from(bytes).toString('base64') }).catch(() => {}); }
+    keyDown(id) { this.send(viz.keyFrame(id, 1)); }
+    keyUp(id) { this.send(viz.keyFrame(id, 0)); }
+    releaseAll() { this.send(viz.releaseAllFrame()); }
+    tap(id, hold) { this.send(viz.tapFrame(id, hold)); }
+    frame() { return this.latest ? this.latest.frame : -1; }
+}
+
+// Find the bridge the extension advertised (.oric-bridge.json at the project root).
+function readBridgeDiscovery(cwd) {
+    try { const j = JSON.parse(require('fs').readFileSync(require('path').join(cwd || process.cwd(), bridgeProto.DISCOVERY_FILE), 'utf8')); return { host: j.host || '127.0.0.1', port: j.port }; }
+    catch (_) { return null; }
+}
+// Attach: connect + return { bridge, dap, viz } shims + the hello/state. Does NOT grab control
+// (the human holds it until the AI explicitly requests it).
+async function attachBridge(opts = {}) {
+    let host = opts.host, port = opts.port;
+    if (!port) {
+        const d = readBridgeDiscovery(opts.cwd);
+        if (!d) throw new Error('no live session bridge found — in VS Code run "Oric: AI Collaboration — Start/Stop Bridge" (no ' + bridgeProto.DISCOVERY_FILE + ' under ' + (opts.cwd || process.cwd()) + ')');
+        host = d.host; port = d.port;
+    }
+    const bridge = new BridgeClient();
+    await bridge.connect(host || '127.0.0.1', port);
+    const hello = await bridge.call('bridge.hello', {});
+    const dap = new BridgeDapShim(bridge);
+    const state = await bridge.call('bridge.state', {}).catch(() => null);
+    if (state) dap.stopped = !!state.stopped;
+    const vizShim = new BridgeVizShim(bridge);
+    return { bridge, dap, viz: vizShim, hello, state };
+}
+
 module.exports = {
     DapClient, VizClient, encodePng, screenToPng, makeClientOps,
+    BridgeClient, BridgeDapShim, BridgeVizShim, attachBridge, readBridgeDiscovery,
     ADAPTER, VIZ_PORT_OFFSET, VIZ_MAGIC, SCR_W, SCR_H, PALETTE, setLog,
 };

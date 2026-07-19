@@ -61,6 +61,8 @@ const { KEYS: ORIC_KEY_TABLE } = require('./mcp/oric-keys.cjs');
 // The one shared viz wire-protocol definition (framing, constants, palette, key uplink),
 // mirrored from the emulator's viz_stream.c and shared with the MCP/playthrough VizClient.
 const vizProto = require('./mcp/oric-viz-protocol.cjs');
+const { createBridgeServer } = require('./mcp/bridge-server.cjs');
+const { CONTROL: BRIDGE_CONTROL, DISCOVERY_FILE } = require('./mcp/oric-bridge-protocol.cjs');
 const { VIZ_PORT_OFFSET } = vizProto;   // viz port = gdb port + 1
 // Only the field sizes the frame DECODER below needs (framing itself lives in the module).
 const VIZ_SCR_SIZE = vizProto.SCR_SIZE;
@@ -1175,6 +1177,8 @@ let vizConnected = false;   // true while the viz stream socket is actually conn
 // --- Automation runner state (in-session playthrough scripts) ----------------
 let vizLastFrame = -1;              // latest viz frame counter (for runFrames/waitScreen)
 let vizLastScrB64 = null;           // latest 240x224 screen buffer, base64 (for screenshots)
+let vizLastVidMode = 0;             // latest video mode byte (bit2 = HIRES) — for the bridge screenshot caption
+let vizLastVidAddr = 0;             // latest video base address
 const automationEvents = new vscode.EventEmitter();   // fires {type:'stopped'|'continued'|'signal', id?}
 let automationRunning = null;       // the running script's `t` (for Stop), or null
 let automationChan = null;          // lazily-created Output channel
@@ -1196,7 +1200,8 @@ function postScreenRunState() {
         // the normal stopped state.
         stopped: automationRunning ? oricUserPaused : oricDebugStopped,
         warp: oricWarpOn,               // ▶▶ follows t.warp(true) / the turbo toggle
-        scripted: !!automationRunning   // a scripted automation is driving — badge in the opposite corner
+        scripted: !!automationRunning,  // a scripted automation is driving — badge in the opposite corner
+        aiPiloting: !!bridgeServer && bridgeControl === BRIDGE_CONTROL.AI   // AI holds control via the collab bridge
     });
 }
 
@@ -1366,6 +1371,7 @@ function vizConnect(host, port) {
 
             vizLastFrame = msg.frameCounter;                 // tap for the automation runner
             if (msg.scrBuf) vizLastScrB64 = msg.scrBuf;
+            vizLastVidMode = msg.vidMode; vizLastVidAddr = msg.vidAddr;   // for the bridge screenshot caption
             for (const c of vizConsumers) c.postFrame(msg);
         }
     });
@@ -2129,6 +2135,22 @@ body {
     letter-spacing: 1px;
     z-index: 5;
 }
+/* AI-piloting badge — top-left, below the SCRIPT badge (both rarely show at once), so it's
+   an unmistakable "the assistant holds debug control" indicator. */
+.osd-ai {
+    position: absolute;
+    top: 44px;
+    left: 8px;
+    display: none;
+    pointer-events: none;
+    font: bold 15px/1 monospace;
+    padding: 5px 10px;
+    border-radius: 5px;
+    background: rgba(0, 0, 0, 0.55);
+    color: #d2a8ff;
+    letter-spacing: 1px;
+    z-index: 5;
+}
 /* Pause = two thick bars, like a tape recorder's pause button (rather than the thin ‖). */
 .osd .pausebar {
     display: inline-block;
@@ -2211,6 +2233,7 @@ body {
     <canvas id="overlayCanvas" width="240" height="224"></canvas>
     <div class="osd" id="osd"></div>
     <div class="osd-script" id="osdScript">● SCRIPT</div>
+    <div class="osd-ai" id="osdAi">● AI</div>
 </div>
 </div>
 <div class="inspect-panel">
@@ -2864,8 +2887,9 @@ document.getElementById('btnCopy').addEventListener('click', () => {
 
 // Run-state OSD: ▶▶ when warp/turbo is on, ‖ when halted at a breakpoint, nothing while
 // running normally or with no session. Purely a status indicator (see the "State" toggle).
-let runState = { active: false, stopped: false, warp: false, scripted: false };
+let runState = { active: false, stopped: false, warp: false, scripted: false, aiPiloting: false };
 const osdScript = document.getElementById('osdScript');
+const osdAi = document.getElementById('osdAi');
 function updateOsd() {
     let html = '', cls = 'osd';
     // Hidden while the mouse is over the screen (hoverPx >= 0) so it never sits under the
@@ -2880,6 +2904,7 @@ function updateOsd() {
     // Scripted badge in the opposite corner — shown whenever a script is driving (regardless
     // of turbo/pause), and hidden under the crosshair on hover like the OSD.
     osdScript.style.display = (osdToggle.checked && runState.scripted && hoverPx < 0) ? 'block' : 'none';
+    osdAi.style.display = (osdToggle.checked && runState.aiPiloting && hoverPx < 0) ? 'block' : 'none';
 }
 
 window.addEventListener('message', e => {
@@ -2887,7 +2912,7 @@ window.addEventListener('message', e => {
     if (e.data.type === 'status') { status.textContent = e.data.text; errorDiv.style.display = 'none'; }
     if (e.data.type === 'error') { errorDiv.textContent = e.data.text; errorDiv.style.display = 'block'; }
     if (e.data.type === 'runstate') {
-        runState = { active: !!e.data.active, stopped: !!e.data.stopped, warp: !!e.data.warp, scripted: !!e.data.scripted };
+        runState = { active: !!e.data.active, stopped: !!e.data.stopped, warp: !!e.data.warp, scripted: !!e.data.scripted, aiPiloting: !!e.data.aiPiloting };
         updateOsd();
     }
 });
@@ -2990,6 +3015,11 @@ let refreshAllViews = null;   // set in activate = refreshAll; lets module-level
 let automationUiTimer = null; // debounces UI repaints while an automation script cycles stop/continue
 let oricUserPaused = false;   // true when the USER paused the debugger mid-automation (not an automation-issued pause) — waits suspend
 let automationPauseInFlight = false; // set while the automation itself issues a pause, so its own stop isn't mistaken for a user pause
+// --- Collaborative MCP bridge state (share the LIVE session with an external MCP client) ---
+let bridgeServer = null;            // net server (null = collaboration off)
+let bridgeControl = BRIDGE_CONTROL.HUMAN;   // who pilots execution/breakpoints: 'human' | 'ai'
+let bridgeStatusBar = null;         // status-bar indicator + one-click "take control"
+const bridgeDiscoveryPaths = [];    // .oric-bridge.json files we wrote (cleaned up on stop)
 
 // Central stopped-state switch: gates the source CodeLens AND the disasm
 // panel's line actions (the webview hides its buttons/menu while the program
@@ -3000,6 +3030,7 @@ function setOricDebugStopped(v, reason) {
     // value-watch hit ('data breakpoint') from a manual pause / step — a waitFor must
     // NOT be satisfied by the user pausing to look around.
     automationEvents.fire({ type: oricDebugStopped ? 'stopped' : 'continued', reason: reason });   // drive the automation runner's waits
+    if (bridgeServer) bridgeServer.broadcast(oricDebugStopped ? 'stopped' : 'continued', { reason });   // let a collaborating MCP client track run state
     if (automationRunning) {
         // A running script drives rapid continue/pause cycles; repainting on each is the
         // flicker. But a genuine USER pause (not one the automation issued) must still refresh
@@ -4925,6 +4956,98 @@ vscode.postMessage({ type: 'mruGet' }); // load the persisted search history
 }
 
 // ----------------------------------------------------------------
+// Collaborative MCP bridge — let an external MCP client share the LIVE debug session, so the
+// human and the AI look at ONE screen / one set of breakpoints / one CPU. Observation is
+// always open to both; execution control (pause/continue/step/breakpoints/warp/AI-keys) is
+// gated on who holds control. The human's OWN keyboard goes through the Screen View webview,
+// never through the bridge, so it's never blocked. See mcp/bridge-server.cjs.
+// ----------------------------------------------------------------
+// Keep the viz stream alive while the bridge is up (AI screenshots/frames work with no panel open).
+const bridgeVizConsumer = { postFrame() {}, postStatus() {}, postError() {} };
+
+function bridgeUpdateStatusBar() {
+    if (!bridgeStatusBar) return;
+    // Visible whenever the bridge is up OR a session is active, so you can always SEE the state
+    // (off / you-pilot / AI-pilots) — the label itself carries it (no tooltip needed).
+    if (!bridgeServer && !oricSessionActive) { bridgeStatusBar.hide(); return; }
+    if (!bridgeServer) {
+        bridgeStatusBar.text = '$(broadcast) AI bridge: off';
+        bridgeStatusBar.tooltip = 'AI collaboration bridge is OFF. Click to start sharing this session with an MCP assistant.';
+        bridgeStatusBar.backgroundColor = undefined;
+        bridgeStatusBar.show();
+        return;
+    }
+    const ai = bridgeControl === BRIDGE_CONTROL.AI;
+    bridgeStatusBar.text = ai ? '$(hubot) AI bridge: AI piloting' : '$(broadcast) AI bridge: you piloting';
+    bridgeStatusBar.tooltip = ai
+        ? 'The AI holds debug control (pause/continue/step/breakpoints). Click to TAKE CONTROL. You can always type into the Screen View and inspect.'
+        : 'Bridge on — you hold debug control; the AI can observe but not drive until it requests control. Click for bridge options.';
+    bridgeStatusBar.backgroundColor = ai ? new vscode.ThemeColor('statusBarItem.warningBackground') : undefined;
+    bridgeStatusBar.show();
+}
+
+// Flip control ownership + reflect it everywhere (status bar, Screen View OSD, connected clients).
+function setBridgeControl(owner) {
+    bridgeControl = (owner === BRIDGE_CONTROL.AI) ? BRIDGE_CONTROL.AI : BRIDGE_CONTROL.HUMAN;
+    bridgeUpdateStatusBar();
+    postScreenRunState();
+    if (bridgeServer) bridgeServer.broadcast('control', { control: bridgeControl });
+}
+
+// The injected surface the bridge server proxies to (everything routes through the live
+// session's customRequest + the extension's already-multiplexed viz).
+function bridgeDeps() {
+    return {
+        customRequest: (cmd, args) => {
+            const s = vscode.debug.activeDebugSession;
+            if (!s || s.type !== 'oric-debug') return Promise.reject(new Error('NO_SESSION'));
+            return s.customRequest(cmd, args);
+        },
+        hasSession: () => { const s = vscode.debug.activeDebugSession; return !!(s && s.type === 'oric-debug'); },
+        vizFrame: () => vizLastFrame,
+        vizScreen: () => vizLastScrB64 || null,
+        vizMeta: () => ({ frame: vizLastFrame, vidMode: vizLastVidMode, vidAddr: vizLastVidAddr }),
+        vizInput: buf => vizSendInput(buf),
+        getState: () => ({ stopped: oricDebugStopped, userPaused: oricUserPaused, warp: oricWarpOn, module: activeOricModuleId }),
+        getControl: () => bridgeControl,
+        setControl: o => setBridgeControl(o),
+        sessionName: () => { const s = vscode.debug.activeDebugSession; return s ? s.name : null; },
+        log: m => { if (vizOutputChannel) vizOutputChannel.appendLine('[BRIDGE] ' + m); },
+    };
+}
+
+async function toggleMcpBridge() {
+    if (bridgeServer) { stopMcpBridge(); vscode.window.showInformationMessage('Oric: AI collaboration bridge stopped.'); return; }
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || !folders.length) { vscode.window.showErrorMessage('Oric: open the project folder first (nowhere to advertise the bridge).'); return; }
+    const fs = require('fs'); const path = require('path');
+    bridgeServer = createBridgeServer(bridgeDeps());
+    let port;
+    try { port = await bridgeServer.listen(0); }
+    catch (e) { bridgeServer = null; vscode.window.showErrorMessage('Oric: could not start the bridge — ' + (e.message || e)); return; }
+    bridgeControl = BRIDGE_CONTROL.HUMAN;
+    vizRegisterConsumer(bridgeVizConsumer);
+    // Advertise the port in each workspace folder so the MCP (cwd = project root) finds it.
+    const info = JSON.stringify({ port, host: '127.0.0.1', pid: process.pid }) + '\n';
+    for (const f of folders) {
+        try { const p = path.join(f.uri.fsPath, DISCOVERY_FILE); fs.writeFileSync(p, info); bridgeDiscoveryPaths.push(p); } catch (_) {}
+    }
+    bridgeUpdateStatusBar();
+    vscode.window.showInformationMessage('Oric: AI collaboration bridge live (127.0.0.1:' + port + '). In your assistant, call oric_attach. You hold control until the AI requests it.');
+}
+
+function stopMcpBridge() {
+    const fs = require('fs');
+    for (const p of bridgeDiscoveryPaths) { try { fs.unlinkSync(p); } catch (_) {} }
+    bridgeDiscoveryPaths.length = 0;
+    try { vizUnregisterConsumer(bridgeVizConsumer); } catch (_) {}
+    if (bridgeServer) { bridgeServer.close(); bridgeServer = null; }
+    bridgeControl = BRIDGE_CONTROL.HUMAN;
+    bridgeUpdateStatusBar();
+    postScreenRunState();
+}
+
+// ----------------------------------------------------------------
 // MCP server registration — write/merge .mcp.json for Claude Code, then health-check.
 // ----------------------------------------------------------------
 //
@@ -5913,6 +6036,12 @@ function activate(context) {
             vscode.window.showInformationMessage(stopAutomation('stopped by user') ? 'Oric automation: stopped.' : 'No Oric automation script is running.');
         }),
         vscode.commands.registerCommand('oric-debug.registerMcpServer', () => registerMcpServerFlow(context)),
+        vscode.commands.registerCommand('oric-debug.startMcpBridge', () => toggleMcpBridge()),
+        vscode.commands.registerCommand('oric-debug.takeControl', async () => {
+            if (!bridgeServer) { const go = await vscode.window.showInformationMessage('The AI collaboration bridge is off.', 'Start Bridge'); if (go === 'Start Bridge') toggleMcpBridge(); return; }
+            if (bridgeControl === BRIDGE_CONTROL.AI) { setBridgeControl(BRIDGE_CONTROL.HUMAN); vscode.window.setStatusBarMessage('Oric: you now hold debug control.', 3000); }
+            else vscode.window.showInformationMessage('You already hold debug control. The AI can observe (read/screenshot) but not drive until it requests it.');
+        }),
         // Ending the debug session must also stop any running script — otherwise it spins on a
         // dead session (ops swallow the errors) and can't be stopped or re-run.
         vscode.debug.onDidTerminateDebugSession(s => { if (!s || s.type === 'oric-debug') stopAutomation('debug session ended'); }),
@@ -6039,7 +6168,7 @@ function activate(context) {
         vscode.window.registerFileDecorationProvider(snapDecoProvider),
         vscode.debug.onDidReceiveDebugSessionCustomEvent(e => {
             if (e.event === 'oricSnapshotsChanged') refreshSnapshots();
-            else if (e.event === 'oricSignal') automationEvents.fire({ type: 'signal', id: e.body && e.body.id, pc: e.body && e.body.pc });
+            else if (e.event === 'oricSignal') { automationEvents.fire({ type: 'signal', id: e.body && e.body.id, pc: e.body && e.body.pc }); if (bridgeServer) bridgeServer.broadcast('signal', { id: e.body && e.body.id, pc: e.body && e.body.pc }); }
         }),
         vscode.debug.onDidStartDebugSession(() => setTimeout(refreshSnapshots, 300)),
         vscode.debug.onDidTerminateDebugSession(() => refreshSnapshots()),
@@ -6266,8 +6395,8 @@ function activate(context) {
     debugControlsProvider = new DebugControlsWebviewProvider();
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider('oricDebugControls', debugControlsProvider),
-        vscode.debug.onDidStartDebugSession(s => { if (s && s.type === 'oric-debug') { oricSessionActive = true; oricWarpOn = false; } debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); }),
-        vscode.debug.onDidTerminateDebugSession(() => { oricSessionActive = false; oricWarpOn = false; debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); }),
+        vscode.debug.onDidStartDebugSession(s => { if (s && s.type === 'oric-debug') { oricSessionActive = true; oricWarpOn = false; } debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); bridgeUpdateStatusBar(); }),
+        vscode.debug.onDidTerminateDebugSession(() => { oricSessionActive = false; oricWarpOn = false; debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); bridgeUpdateStatusBar(); }),
         vscode.window.registerWebviewViewProvider('oricCpuRegs', regsProvider),
         vscode.window.registerWebviewViewProvider('oricPeripherals', periphProvider),
         vscode.commands.registerCommand('oric-debug.openMemoryView', () => createMemoryPanel(context)),
@@ -6631,6 +6760,19 @@ function activate(context) {
     context.subscriptions.push(moduleStatusBar);
     context.subscriptions.push(vscode.debug.onDidTerminateDebugSession(() => moduleStatusBar.hide()));
 
+    // AI-collaboration control indicator — shown only while the bridge is up; click = take control.
+    bridgeStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 91);
+    bridgeStatusBar.command = 'oric-debug.takeControl';
+    context.subscriptions.push(bridgeStatusBar);
+    bridgeUpdateStatusBar();   // reflect initial state (e.g. after a mid-session window reload)
+    // A collaborating client must re-attach per session; tell it the session ended and re-assert
+    // human control (so the AI can't keep "piloting" a dead session).
+    context.subscriptions.push(vscode.debug.onDidTerminateDebugSession(s => {
+        if (s && s.type !== 'oric-debug') return;
+        if (bridgeServer) bridgeServer.broadcast('ended', {});
+        if (bridgeControl === BRIDGE_CONTROL.AI) setBridgeControl(BRIDGE_CONTROL.HUMAN);
+    }));
+
     // Debug console verbosity — click to pick Errors / Normal / Verbose.
     const logLevelStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 89);
     logLevelStatusBar.command = 'oric-debug.selectLogLevel';
@@ -6904,6 +7046,7 @@ function activate(context) {
 }
 
 function deactivate() {
+    try { stopMcpBridge(); } catch (_) {}   // close the collab bridge + remove its discovery file
     vizDisconnect();
     vizOutputChannel = null;
 }

@@ -24,7 +24,7 @@
 'use strict';
 
 const path = require('path');
-const { DapClient, VizClient, screenToPng, VIZ_PORT_OFFSET, ADAPTER, setLog, makeClientOps } = require('./oric-debug-client.cjs');
+const { DapClient, VizClient, screenToPng, VIZ_PORT_OFFSET, ADAPTER, setLog, makeClientOps, attachBridge } = require('./oric-debug-client.cjs');
 const { makeApi } = require('./playthrough-core.cjs');
 
 // Everything that is not JSON-RPC MUST go to stderr — stdout is the MCP channel.
@@ -39,6 +39,9 @@ const session = {
     dap: null, viz: null, t: null, config: null, host: 'localhost', port: null,
     bpByFile: new Map(),        // file -> Map(line -> {condition?})
     watchpoints: new Map(),     // addrHex -> { accessType, condition }
+    // Collaborative attach: when set, we're sharing the human's LIVE VS Code session via the
+    // bridge (not running our own emulator). `control` tracks who pilots execution.
+    bridge: null, attached: false, control: 'human',
 };
 
 // Normalise an address argument ("$94" / "0x94" / "94" / 148) to lowercase hex, no prefix.
@@ -71,11 +74,41 @@ async function launch(config) {
     return { launched: true, port: session.port, vizPort: session.port + VIZ_PORT_OFFSET };
 }
 
+// Attach to the human's LIVE VS Code session via the bridge (collaborative mode). Unlike
+// launch(), this does NOT start an emulator — it shares the one the human is driving, so both
+// see the same screen/breakpoints/CPU. Starts observe-only; call oric_request_control to pilot.
+async function attach(opts) {
+    if (session.dap) await shutdown();
+    const a = await attachBridge({ cwd: (opts && opts.cwd) || process.cwd(), host: opts && opts.host, port: opts && opts.port });
+    session.bridge = a.bridge; session.dap = a.dap; session.viz = a.viz; session.attached = true;
+    session.control = (a.hello && a.hello.control) || 'human';
+    // Track control changes the human makes (e.g. clicking "Take control"), and session end.
+    a.dap.on('control', p => { session.control = p && p.control ? p.control : 'human'; });
+    a.dap.on('ended', () => { session.control = 'human'; });
+    session.t = makeApi(makeClientOps(session.dap, session.viz), { log: m => log(m) });
+    return { attached: true, session: a.hello && a.hello.session, control: session.control, hasSession: a.hello && a.hello.hasSession };
+}
+
+async function setControl(want) {
+    if (!session.attached || !session.bridge) throw new Error('not attached to a live session (use oric_attach)');
+    const r = await session.bridge.call(want === 'ai' ? 'control.request' : 'control.release', {});
+    session.control = (r && r.control) || want;
+    return session.control;
+}
+
 async function shutdown() {
-    try { if (session.dap) await session.dap.request('disconnect', { terminateDebuggee: true }); } catch (_) {}
-    if (session.viz) session.viz.disconnect();
-    if (session.dap) session.dap.stop();
-    session.dap = null; session.viz = null; session.t = null; session.bpByFile.clear(); session.watchpoints.clear();
+    if (session.attached) {
+        // NEVER terminate the human's session. Just hand control back and disconnect the bridge.
+        try { if (session.control === 'ai') await session.bridge.call('control.release', {}); } catch (_) {}
+        try { if (session.viz) session.viz.disconnect(); } catch (_) {}
+        try { if (session.bridge) session.bridge.close(); } catch (_) {}
+    } else {
+        try { if (session.dap) await session.dap.request('disconnect', { terminateDebuggee: true }); } catch (_) {}
+        if (session.viz) session.viz.disconnect();
+        if (session.dap) session.dap.stop();
+    }
+    session.dap = null; session.viz = null; session.t = null; session.bridge = null; session.attached = false; session.control = 'human';
+    session.bpByFile.clear(); session.watchpoints.clear();
     return { shutdown: true };
 }
 
@@ -123,6 +156,15 @@ async function whereString() {
 // ---------------------------------------------------------------------------
 const T = (text) => ({ content: [{ type: 'text', text }] });
 
+// Tools that DRIVE execution / mutate breakpoints / send keys — gated on holding control when
+// attached to the human's live session. Everything else is observation and always allowed.
+const CONTROL_TOOLS = new Set([
+    'oric_continue', 'oric_pause', 'oric_step_over', 'oric_step_into', 'oric_step_out',
+    'oric_step_back', 'oric_reverse', 'oric_set_breakpoint', 'oric_clear_breakpoints',
+    'oric_watch_memory', 'oric_clear_watchpoints', 'oric_send_keys', 'oric_press',
+    'oric_warp', 'oric_wait_for', 'oric_run_to', 'oric_run_frames', 'oric_wait_module',
+]);
+
 const TOOLS = {
     oric_launch: {
         description: 'Build (if stale) and launch Oricutron under the debugger, then connect. `config` mirrors a VS Code oric-debug launch config: { port, emulatorPath|launchScript, diskImage?, symbolFile?, cwd?, gdbBreak?, emulatorArgs?, build? }. IMPORTANT: set `port` to the human base gdb port + 1 so this agent runs its own emulator.',
@@ -130,9 +172,28 @@ const TOOLS = {
         run: async a => { const r = await launch(a.config || {}); return T('Launched. gdb ' + r.port + ', viz ' + r.vizPort + '. ' + await whereString()); },
     },
     oric_shutdown: {
-        description: 'Terminate the emulator and debug session.',
+        description: 'End the session. If launched, terminates the emulator; if ATTACHED (collaborative), just detaches — the human\'s session keeps running.',
         schema: { type: 'object', properties: {} },
         run: async () => { await shutdown(); return T('Shut down.'); },
+    },
+    oric_attach: {
+        description: 'COLLABORATIVE mode: attach to the human\'s LIVE VS Code debug session instead of launching your own emulator, so you both share ONE screen / breakpoints / CPU. Requires the human to have started "Oric: AI Collaboration — Start/Stop Bridge" in VS Code (found automatically via .oric-bridge.json in `cwd`). You start OBSERVE-ONLY (screenshots, reads, backtrace, evaluate) — the human keeps control until you call oric_request_control. Their keyboard into the game always works.',
+        schema: { type: 'object', properties: { cwd: { type: 'string', description: 'project root holding .oric-bridge.json (default: server cwd)' }, host: { type: 'string' }, port: { type: 'number', description: 'override discovery' } } },
+        run: async a => {
+            const r = await attach(a || {});
+            return T('Attached to the live VS Code session (' + (r.session || 'oric-debug') + ')' + (r.hasSession ? '' : ' — NOTE: no oric-debug session is active yet; the human should press F5') +
+                '. Control: ' + r.control + ' (you are observe-only until you call oric_request_control). ' + (r.hasSession ? await whereString() : ''));
+        },
+    },
+    oric_request_control: {
+        description: 'Ask to pilot execution (pause/continue/step/breakpoints/keys) in the shared session. Sets the Screen View indicator to "AI piloting"; the human can reclaim any time by clicking "Take control". Only meaningful when attached.',
+        schema: { type: 'object', properties: {} },
+        run: async () => { const c = await setControl('ai'); return T('Control: ' + c + (c === 'ai' ? '. You are now piloting — the human can take it back any time.' : ' (the human still holds control).')); },
+    },
+    oric_release_control: {
+        description: 'Hand debug control back to the human (you stay attached and can still observe).',
+        schema: { type: 'object', properties: {} },
+        run: async () => { const c = await setControl('human'); return T('Control handed back — now: ' + c + '.'); },
     },
     oric_status: {
         description: 'Current run state: running / stopped (with reason + top frame + source location) / ended.',
@@ -252,11 +313,13 @@ const TOOLS = {
         schema: { type: 'object', properties: { scale: { type: 'number' } } },
         run: async a => {
             requireSession();
-            if (!session.viz || !session.viz.latest) return { content: [{ type: 'text', text: 'No screen frame yet (viz not connected or no frame received). Is the emulator running?' }], isError: true };
-            const png = screenToPng(session.viz.latest.scr, a.scale || 3);
-            const mode = (session.viz.latest.vidMode & 4) ? 'HIRES' : 'TEXT';
+            const L = session.viz && session.viz.latest;
+            if (!L || !L.scr) return { content: [{ type: 'text', text: 'No screen frame yet (viz not connected or no frame received). Is the emulator running? In attach mode, give the bridge a moment after oric_attach.' }], isError: true };
+            const png = screenToPng(L.scr, a.scale || 3);
+            const mode = ((L.vidMode || 0) & 4) ? 'HIRES' : 'TEXT';
+            const vid = (L.vidAddr != null ? L.vidAddr : 0).toString(16);
             return { content: [
-                { type: 'text', text: 'Oric screen — frame ' + session.viz.latest.frame + ', ' + mode + ', vid $' + session.viz.latest.vidAddr.toString(16) },
+                { type: 'text', text: 'Oric screen — frame ' + (L.frame != null ? L.frame : '?') + ', ' + mode + ', vid $' + vid },
                 { type: 'image', data: png.toString('base64'), mimeType: 'image/png' },
             ] };
         },
@@ -357,8 +420,16 @@ async function handleRpc(line) {
         } else if (method === 'tools/list') {
             reply(id, { tools: Object.entries(TOOLS).map(([name, t]) => ({ name, description: t.description, inputSchema: t.schema })) });
         } else if (method === 'tools/call') {
-            const t = TOOLS[params && params.name];
-            if (!t) return replyError(id, -32602, 'unknown tool: ' + (params && params.name));
+            const name = params && params.name;
+            const t = TOOLS[name];
+            if (!t) return replyError(id, -32602, 'unknown tool: ' + name);
+            // Collaborative control gate: while ATTACHED and the human holds control, control-class
+            // tools (drive execution / set breakpoints / send keys) are refused with a clear hint
+            // rather than silently no-op'ing. Observation tools always run. (No gate when we launched
+            // our own emulator — there's no human sharing it.)
+            if (session.attached && session.control !== 'ai' && CONTROL_TOOLS.has(name)) {
+                return reply(id, { content: [{ type: 'text', text: 'The human holds debug control, so "' + name + '" is blocked. Call oric_request_control to pilot (they can take it back any time). You can still observe: screenshot, read memory/registers, backtrace, evaluate.' }], isError: true });
+            }
             try { const res = await t.run(params.arguments || {}); reply(id, res); }
             catch (e) { reply(id, { content: [{ type: 'text', text: 'ERROR: ' + (e && e.message ? e.message : String(e)) }], isError: true }); }
         } else if (id != null) {
