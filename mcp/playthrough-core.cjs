@@ -144,16 +144,92 @@ function makeApi(ops, cfg = {}) {
             }
             const addr = await _num(target, 'addr');
             await ops.armValueWatch(addr & 0xffff, cond || null);
-            // Only the value-watch firing ('data breakpoint') ends the wait — a manual
-            // pause/step (the user inspecting) is ignored, so the CPU just freezes and the
-            // wait resumes when they continue, instead of the wait falsely completing.
-            const stopP = ops.waitStopped(opts.timeoutMs || 30000, 'data breakpoint');
+            // Only the value-watch firing ('data breakpoint') ends the wait — a manual pause/
+            // step (the user inspecting) is ignored, so the CPU just freezes and the wait
+            // resumes on continue. The timeout is measured in EMULATED frames (the viz counter),
+            // which FREEZE while the machine is paused — so pausing to inspect never trips a
+            // spurious timeout; it only fires if the game actually RAN that long without hitting.
+            let stopped = false, stopErr = null;
+            ops.waitStopped(opts.timeoutMs || 3600000, 'data breakpoint').then(() => { stopped = true; }).catch(e => { stopErr = e; });
             await ops.continue();
-            try { await stopP; } finally { await ops.clearValueWatch(addr & 0xffff).catch(() => {}); }
+            const budget = opts.timeoutFrames || 3000;   // ~60s of RUNNING @ 50 Hz
+            const start = ops.vizFrame();
+            try {
+                while (!stopped) {
+                    await _check();   // let Stop / a terminated session abort this wait
+                    if (stopErr) throw stopErr;
+                    if (ops.vizFrame() - start > budget) throw new Error('waitFor timeout — not met while running: ' + (cond || ('$' + addr.toString(16))));
+                    await sleep(30);
+                }
+            } finally { await ops.clearValueWatch(addr & 0xffff).catch(() => {}); }
         },
         // Resolve a real name to { addr, value, size, type, enumName } (or null). Lets a
         // script read the live address/enum value instead of copying a magic number.
         async sym(name) { return ops.resolve ? ops.resolve(name) : null; },
+
+        // --- Overlay modules ---------------------------------------------------------
+        // The active OSDK overlay module NAME (or null). Lets one script work no matter the
+        // entry point (splash/intro/game/credits): branch on where the machine actually is.
+        async module() {
+            if (!ops.getModules) return null;
+            const r = await ops.getModules();
+            if (!r) return null;
+            const m = (r.modules || []).find(x => x.id === r.active);
+            return m ? m.name : null;
+        },
+        // All module names known to this build.
+        async modules() { const r = ops.getModules ? await ops.getModules() : null; return r && r.modules ? r.modules.map(m => m.name) : []; },
+        // Wait until the active module becomes `name`. Polls (cheap — reads adapter state, no
+        // stub round-trip) while running a few frames between checks; a module switch is
+        // detected as the overlay's _osdk_dbg_module byte changes. Returns at once if already there.
+        async waitModule(name, opts = {}) {
+            await _check();
+            if ((await this.module()) === name) return;
+            const budget = opts.timeoutFrames || 900, poll = opts.pollFrames || 10;   // ~18s of RUNNING @ 50 Hz
+            let ran = 0;
+            while (ran < budget) {
+                const adv = await this.runFrames(poll); ran += adv > 0 ? adv : poll;   // frames FROZEN while user-paused → no burn
+                if ((await this.module()) === name) return;
+            }
+            throw new Error("timeout waiting for module '" + name + "'");
+        },
+        // Wait until ANY overlay module is active (module() stops being null) — e.g. right
+        // after a cold start, let the machine BOOT until the first overlay stamps itself
+        // (the adapter can't name the module before then). Runs frames while polling; returns
+        // the module name.
+        async waitModuleKnown(opts = {}) {
+            await _check();
+            const budget = opts.timeoutFrames || 1500, poll = opts.pollFrames || 10;   // ~30s of RUNNING (cold boot / tape load)
+            let ran = 0;
+            for (;;) {
+                const m = await this.module();
+                if (m != null) return m;
+                if (ran >= budget) throw new Error('timeout: no overlay module active yet (did the program boot?)');
+                const adv = await this.runFrames(poll); ran += adv > 0 ? adv : poll;
+            }
+        },
+        // Wait until the active module is no longer `from` (it switched to anything else).
+        // Pairs with press() for explicit overlay navigation: press the skip key, then wait
+        // for the switch before re-checking where you are.
+        async waitModuleChange(from, opts = {}) {
+            await _check();
+            const budget = opts.timeoutFrames || 900, poll = opts.pollFrames || 10;
+            let ran = 0;
+            while (ran < budget) {
+                if ((await this.module()) !== from) return;
+                const adv = await this.runFrames(poll); ran += adv > 0 ? adv : poll;   // paused → frozen → no burn
+            }
+            throw new Error("timeout: module still '" + from + "'");
+        },
+        // One-shot "run to here": run (normal speed; {warp:true} to rush) until the CPU
+        // reaches `target` (a symbol name like '_AskInput', or an address), then stop there.
+        // The DIRECT, deterministic way to sync on the game REACHING a point — you can't miss
+        // it the way a transient state flag can, so it's ideal for nested/repeated prompts.
+        async runTo(target, opts = {}) {
+            await _check();
+            if (!ops.runTo) throw new Error('this driver does not support runTo');
+            await ops.runTo(target, opts);
+        },
         // Wait until a logpoint/watchpoint tagged [signal:<id>] fires — the checkpoint lives
         // in the code (a persisted, module-scoped breakpoint), not in the script. Runs
         // full-speed until the signal; then pauses (unless opts.keepRunning) so you can assert.
@@ -171,26 +247,65 @@ function makeApi(ops, cfg = {}) {
             await _waitUntil(() => { const s = ops.vizScreen(); return s && predFn(s); }, opts.timeoutMs || 20000, 'screen condition');
             await ops.pause();
         },
-        // Run n emulator frames, then stop (used to hold a key across keyboard scans).
+        // Run n emulator frames, then stop (used to hold a key across keyboard scans, and as
+        // the polling step for the module/state waits). Returns the frames that ACTUALLY
+        // advanced. Respects a USER pause: while the user has the machine paused to inspect,
+        // it does NOT resume — it blocks until they continue — so the automation never fights
+        // the pause, and callers that budget on the return value don't count paused time.
         async runFrames(n) {
             await _check();
+            while (ops.isUserPaused && ops.isUserPaused()) { await sleep(150); await _check(); }
             const start = ops.vizFrame();
             await ops.continue();
             await _waitUntil(() => ops.vizFrame() >= start + n, 10000, n + ' frames').catch(() => {});
             await ops.pause();
+            return Math.max(0, ops.vizFrame() - start);
         },
         // Press a key held over `holdFrames` scans. `key` is a letter ('u'), a name
         // ('RETURN'/'KEY_RETURN'/'UP'/'CTRL'), or a numeric code — resolved by the shared
         // keyId() so the automation and the Screen View speak the exact same key ids.
-        async press(key, holdFrames, gapFrames) {
-            await _check();
-            const id = keyId(key);
-            if (id == null) throw new Error("unknown key '" + key + "' (use a letter, a name like RETURN/UP/CTRL, or a numeric code)");
-            ops.sendKey(id, 1);
-            await this.runFrames(holdFrames == null ? KEY_HOLD_FRAMES : holdFrames);   // held across scans
-            ops.sendKey(id, 0);
-            ops.releaseKeys();
-            await this.runFrames(gapFrames == null ? KEY_GAP_FRAMES : gapFrames);       // gap before the next key
+        // Two call forms:
+        //   press(key[, holdFrames[, gapFrames]])   one press.
+        //   press(key, { until, timeoutFrames, pollFrames, hold, gap })   MASH the key until
+        //     the async predicate `until()` returns truthy — for attract modes / sub-prompts
+        //     that sample the keyboard intermittently (a single press can be missed, and warp
+        //     makes an individual press unreliable). Bounded by timeoutFrames so a wrong key
+        //     errors instead of hanging. Returns at once if `until` is already true. Examples:
+        //       await t.press('ESC',   { until: async () => (await t.read('gGameStarting',1))[0] === 1 });
+        //       await t.press('SPACE', { until: async () => (await t.module()) !== 'Intro' });
+        async press(key, holdOrOpts, gapArg) {
+            const o = (holdOrOpts && typeof holdOrOpts === 'object') ? holdOrOpts : { hold: holdOrOpts, gap: gapArg };
+            const once = async () => {
+                await _check();
+                const id = keyId(key);
+                if (id == null) throw new Error("unknown key '" + key + "' (use a letter, a name like RETURN/UP/CTRL, or a numeric code)");
+                const hold = o.hold == null ? KEY_HOLD_FRAMES : o.hold;
+                const gap = o.gap == null ? KEY_GAP_FRAMES : o.gap;
+                if (ops.tapKey) {
+                    // Emulator-OWNED tap: Oricutron presses the key and holds it for `hold`
+                    // emulated frames (= guaranteed keyboard scans) then releases, playing one
+                    // key at a time. Reliable regardless of host speed/warp, and it can't spam
+                    // the input path — we just let it play out. (No timing race here.)
+                    ops.tapKey(id, hold);
+                    await this.runFrames(hold + gap + 3);
+                } else {
+                    // Fallback for an emulator without the TAP queue: raw down/hold/up — this
+                    // is the timing-sensitive path (a press can be missed under warp).
+                    ops.sendKey(id, 1);
+                    await this.runFrames(hold);
+                    ops.sendKey(id, 0);
+                    ops.releaseKeys();
+                    await this.runFrames(gap);
+                }
+            };
+            if (!o.until) return once();
+            const budget = o.timeoutFrames || 1500, poll = o.pollFrames || 15;
+            let ran = 0;
+            while (!(await o.until())) {
+                if (ran > budget) throw new Error("press('" + key + "'): condition still not met after " + budget + " frames");
+                await once();
+                const adv = await this.runFrames(poll); ran += adv > 0 ? adv : poll;
+            }
         },
         // Type a string at a human pace; '\n'/'\r' submit the line via the RETURN key (the
         // real matrix key — the game reads it back as its own KEY_RETURN). A short settle

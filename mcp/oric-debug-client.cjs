@@ -76,6 +76,7 @@ class VizClient {
     keyDown(id) { this.send(viz.keyFrame(id, 1)); }
     keyUp(id) { this.send(viz.keyFrame(id, 0)); }
     releaseAll() { this.send(viz.releaseAllFrame()); }
+    tap(id, hold) { this.send(viz.tapFrame(id, hold)); }   // emulator-owned press/hold/release
     frame() { return this.latest ? this.latest.frame : -1; }
     // Framing/sizing/resync is done once in oric-viz-protocol.nextFrame(); we only decode
     // the fields this client needs (latest screen + counter). v0 has no screen (scrOff < 0).

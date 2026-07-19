@@ -25,8 +25,17 @@ const KEYS = {
 // '$hex'/'0x..'/decimal string parses.
 function keyId(k) {
     if (typeof k === 'number') return k & 0xff;
-    const s = String(k).trim();
-    if (s.length === 1) { const c = s.charCodeAt(0); return c >= 0x20 && c < 0x7f ? c : null; }
+    const raw = String(k);
+    // A single character is its ASCII code — checked BEFORE trimming so ' ' (space, 0x20)
+    // and other printable keys survive (trimming a space would leave an empty string).
+    // Map A-Z to a-z: the uplink keys on the PHYSICAL Oric key (SDL letter keysyms are
+    // lowercase), and the game lowercases text input itself — so 'TAKE BAG' types fine.
+    if (raw.length === 1) {
+        let c = raw.charCodeAt(0);
+        if (c >= 0x41 && c <= 0x5a) c += 0x20;
+        return c >= 0x20 && c < 0x7f ? c : null;
+    }
+    const s = raw.trim();
     if (/^(\$|0x)/i.test(s)) return parseInt(s.replace(/^\$/, '').replace(/^0x/i, ''), 16) & 0xff;
     if (/^\d+$/.test(s)) return parseInt(s, 10) & 0xff;
     const norm = s.replace(/^KEY_/i, '').toUpperCase();

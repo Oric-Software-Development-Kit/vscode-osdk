@@ -28,9 +28,15 @@ const V1_SIZE = V0_SIZE + SCREEN_BLOCK;        // v1: v0 + screen block
 
 // Keyboard/input uplink frames (client -> emulator), decoded by viz_process_input in
 // viz_stream.c: [op][len][payload]. KEY payload = [keyid, down]; RELEASE_ALL has none.
-const UPLINK_KEY = 0x01, UPLINK_RELEASE_ALL = 0x02;
+const UPLINK_KEY = 0x01, UPLINK_RELEASE_ALL = 0x02, UPLINK_TAP = 0x03, UPLINK_WARP = 0x04;
 function keyFrame(id, down) { return [UPLINK_KEY, 0x02, id & 0xff, down ? 1 : 0]; }
 function releaseAllFrame() { return [UPLINK_RELEASE_ALL, 0x00]; }
+// TAP: enqueue "press id, hold `hold` emulated frames, release" — Oricutron owns the timing
+// (guaranteed keyboard scans, one key at a time), so scripted typing is reliable under warp.
+function tapFrame(id, hold) { return [UPLINK_TAP, 0x02, id & 0xff, (hold || 3) & 0xff]; }
+// WARP: set warp/turbo on/off IMMEDIATELY via the always-live uplink (not the halted-only
+// GDB stub), so the toggle can't lag behind a running program.
+function warpFrame(on) { return [UPLINK_WARP, 0x01, on ? 1 : 0]; }
 
 // Pull the next complete frame from an accumulated RX buffer. This centralises the fiddly
 // part — magic resync + per-version sizing — so callers never re-derive byte offsets. Each
@@ -78,5 +84,6 @@ function nextFrame(buf) {
 module.exports = {
     VIZ_PORT_OFFSET, VIZ_MAGIC, SCR_W, SCR_H, SCR_SIZE, PALETTE,
     VIZ_VIDBASES, VIZ_VIDRAM_MAIN, VIZ_VIDRAM_BOTTOM, SCREEN_BLOCK, V0_SIZE, V1_SIZE,
-    UPLINK_KEY, UPLINK_RELEASE_ALL, keyFrame, releaseAllFrame, nextFrame,
+    UPLINK_KEY, UPLINK_RELEASE_ALL, UPLINK_TAP, UPLINK_WARP,
+    keyFrame, releaseAllFrame, tapFrame, warpFrame, nextFrame,
 };
