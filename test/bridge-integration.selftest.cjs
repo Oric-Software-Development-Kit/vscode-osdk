@@ -29,7 +29,12 @@ async function main() {
         getState: () => ({ stopped: true, userPaused: false, warp: false, module: 'Game' }),
         getControl: () => control, setControl: o => { control = o; },
         sessionName: () => 'live', log: () => {},
+        // Breakpoints via VS Code's own model (fake).
+        bpList: () => bps.slice(),
+        bpSet: (file, line, condition) => { bps.push({ file, line, condition: condition || null, enabled: true }); return { ok: true }; },
+        bpClearAll: file => { const before = bps.length; bps = file ? bps.filter(b => b.file !== file) : []; return { removed: before - bps.length }; },
     });
+    let bps = [{ file: 'bytestream.s', line: 17, condition: null, enabled: true }];
     const port = await srv.listen(0);
 
     const a = await attachBridge({ host: '127.0.0.1', port });
@@ -67,6 +72,18 @@ async function main() {
     const b = await t.read(0x400, 2);
     assert.strictEqual(b[0], 0x1a, 't.read via bridge');
     assert.strictEqual(await t.eval('_x'), '42', 't.eval via bridge');
+
+    // Breakpoints route through VS Code's shared model (the human's panel), not a private set:
+    assert.strictEqual((await a.bridge.call('bp.list', {})).breakpoints.length, 1, 'bp.list shows the panel breakpoint');
+    await a.bridge.call('bp.set', { file: 'intro_main.c', line: 42 });
+    assert.strictEqual((await a.bridge.call('bp.list', {})).breakpoints.length, 2, 'bp.set added to the shared panel');
+    assert.strictEqual((await a.bridge.call('bp.clearAll', {})).removed, 2, 'bp.clearAll removed all');
+    assert.strictEqual((await a.bridge.call('bp.list', {})).breakpoints.length, 0, 'panel empty after clearAll');
+    // Breakpoint mutation is control-gated too:
+    control = CONTROL.HUMAN;
+    let bpDenied = false;
+    try { await a.bridge.call('bp.set', { file: 'x.s', line: 1 }); } catch (e) { bpDenied = /NO_CONTROL/.test(e.message); }
+    assert.ok(bpDenied, 'bp.set denied while human controls');
 
     a.viz.disconnect(); a.bridge.close(); srv.close();
     console.log('BRIDGE INTEGRATION SELFTEST: PASS');

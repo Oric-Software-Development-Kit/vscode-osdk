@@ -55,6 +55,14 @@ function createBridgeServer(deps) {
                 deps.setControl(CONTROL.HUMAN);
                 return reply(sock, id, { control: deps.getControl() });
             }
+            // Breakpoints as VS Code OWNS them (the panel) — so the AI manages the SAME breakpoints
+            // the human sees, and the panel + adapter stay in sync (unlike raw setBreakpoints).
+            if (method === 'bp.list') return reply(sock, id, { breakpoints: deps.bpList ? deps.bpList() : [] });
+            if (method === 'bp.set' || method === 'bp.clearAll') {
+                if (deps.getControl() !== CONTROL.AI) return replyErr(sock, id, 1, ERR_NO_CONTROL + ": the human holds control (can't change breakpoints)");
+                if (method === 'bp.set') { const r = deps.bpSet ? deps.bpSet((params || {}).file, (params || {}).line, (params || {}).condition) : { ok: false }; return reply(sock, id, r); }
+                const r = deps.bpClearAll ? deps.bpClearAll((params || {}).file) : { removed: 0 }; return reply(sock, id, r);
+            }
             if (method === 'viz.frame') return reply(sock, id, { frame: deps.vizFrame() });
             if (method === 'viz.screen') {
                 const meta = deps.vizMeta ? deps.vizMeta() : {};

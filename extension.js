@@ -5008,6 +5008,25 @@ function bridgeDeps() {
         vizScreen: () => vizLastScrB64 || null,
         vizMeta: () => ({ frame: vizLastFrame, vidMode: vizLastVidMode, vidAddr: vizLastVidAddr }),
         vizInput: buf => vizSendInput(buf),
+        // Breakpoints via VS Code's OWN model so the AI manages the SAME ones shown in the panel
+        // (and VS Code re-syncs the adapter). Clears the panel too — not just an adapter-side set.
+        bpList: () => vscode.debug.breakpoints
+            .filter(b => b instanceof vscode.SourceBreakpoint)
+            .map(b => ({ file: b.location.uri.fsPath, line: b.location.range.start.line + 1, condition: b.condition || null, enabled: b.enabled })),
+        bpSet: (file, line, condition) => {
+            if (!file || !line) return { ok: false, error: 'file and line required' };
+            const bp = new vscode.SourceBreakpoint(new vscode.Location(vscode.Uri.file(file), new vscode.Position(line - 1, 0)), true, condition || undefined);
+            vscode.debug.addBreakpoints([bp]);
+            return { ok: true };
+        },
+        bpClearAll: file => {
+            const all = vscode.debug.breakpoints;
+            const target = file
+                ? all.filter(b => b instanceof vscode.SourceBreakpoint && (b.location.uri.fsPath === file || nodePath.basename(b.location.uri.fsPath) === file))
+                : all;   // no file → remove EVERYTHING (source + function breakpoints)
+            vscode.debug.removeBreakpoints(target);
+            return { removed: target.length };
+        },
         getState: () => ({ stopped: oricDebugStopped, userPaused: oricUserPaused, warp: oricWarpOn, module: activeOricModuleId }),
         getControl: () => bridgeControl,
         setControl: o => setBridgeControl(o),

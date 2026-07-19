@@ -213,6 +213,12 @@ const TOOLS = {
         schema: { type: 'object', properties: { file: { type: 'string' }, line: { type: 'number' }, condition: { type: 'string' } }, required: ['file', 'line'] },
         run: async a => {
             requireSession();
+            // ATTACHED: go through VS Code's OWN breakpoint model so it lands in the human's panel
+            // (and VS Code syncs the adapter) — not the MCP's private set behind VS Code's back.
+            if (session.attached) {
+                await session.bridge.call('bp.set', { file: a.file, line: a.line, condition: a.condition || null });
+                return T('Breakpoint ' + a.file + ':' + a.line + (a.condition ? ' if ' + a.condition : '') + ' added to the shared panel (binds when its module is loaded).');
+            }
             if (!session.bpByFile.has(a.file)) session.bpByFile.set(a.file, new Map());
             session.bpByFile.get(a.file).set(a.line, a.condition ? { condition: a.condition } : {});
             const bps = await resendBreakpoints(a.file);
@@ -221,20 +227,29 @@ const TOOLS = {
         },
     },
     oric_clear_breakpoints: {
-        description: 'Clear breakpoints in one file (pass `file`) or all files (omit it).',
+        description: 'Clear breakpoints in one file (pass `file`) or ALL breakpoints (omit it). In collaborative mode this clears the human\'s VS Code Breakpoints panel too, not just this session\'s.',
         schema: { type: 'object', properties: { file: { type: 'string' } } },
         run: async a => {
             requireSession();
+            if (session.attached) {
+                const r = await session.bridge.call('bp.clearAll', a.file ? { file: a.file } : {});
+                return T('Cleared ' + (a.file ? a.file : 'ALL breakpoints') + ' from the shared VS Code panel (' + ((r && r.removed) || 0) + ' removed).');
+            }
             const files = a.file ? [a.file] : [...session.bpByFile.keys()];
             for (const f of files) { session.bpByFile.set(f, new Map()); await resendBreakpoints(f); session.bpByFile.delete(f); }
             return T('Cleared ' + (a.file ? a.file : 'all files') + '.');
         },
     },
     oric_list_breakpoints: {
-        description: 'List the breakpoints this session has set.',
+        description: 'List breakpoints. In collaborative mode this is the human\'s VS Code panel (the ones you both see); standalone it\'s the ones this session set.',
         schema: { type: 'object', properties: {} },
         run: async () => {
             requireSession();
+            if (session.attached) {
+                const r = await session.bridge.call('bp.list', {});
+                const out = (r && r.breakpoints || []).map(b => path.basename(b.file) + ':' + b.line + (b.condition ? '  if ' + b.condition : '') + (b.enabled ? '' : '  (disabled)'));
+                return T(out.length ? out.join('\n') : '(none)');
+            }
             const out = [];
             for (const [f, m] of session.bpByFile) for (const [line, o] of m) out.push(path.basename(f) + ':' + line + (o.condition ? '  if ' + o.condition : ''));
             return T(out.length ? out.join('\n') : '(none)');
