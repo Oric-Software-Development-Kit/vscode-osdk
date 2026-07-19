@@ -25,11 +25,13 @@ Connects VS Code to Oricutron's GDB Remote Serial Protocol (RSP) stub over TCP.
 
 - **Launch** mode: build your project (with staleness check), launch Oricutron, and attach automatically
 - **Attach** mode: connect to an already-running Oricutron instance
-- **Step** (F10/F11), **Continue** (F5), **Pause** (F6)
-- **Instruction breakpoints** via the Breakpoints panel
+- **Step** (F10/F11), **Step Out** (Shift+F11, native), **Continue** (F5), **Pause** (F6)
+- **Instruction / address breakpoints** via the Breakpoints panel — adapter-owned, persisted per workspace, individually enable/disable-able (useful for source-less RE work where you break on a raw `$address`)
 - **Function breakpoints** using symbol names
-- **Data breakpoints (watchpoints)** — break on read / write / access of a memory address. Right-click a variable in Variables or the Symbol Browser watch → *Break on Value Read/Change/Access*. (Single address per watchpoint; the stub allows up to 16.)
-- **Logpoints (print breakpoints)** — a breakpoint that prints instead of stopping. Right-click the editor gutter → *Add Logpoint*, and enter a message with `{expr}` placeholders. On hit the message is evaluated, written to the Debug Console (in cyan, to stand out from the emulator's own output), and execution resumes automatically. Placeholders accept a register (`{a}`, `{pc}` — decoded via its type tag), a symbol (`{gCurrentLocation}` — fully typed: enum name, struct, etc.), or a `$hex` address (`{$C000}`). `{{`/`}}` are literal braces. Put **`[stop]`** anywhere in the message to both log **and** stop at that line (VS Code allows only one breakpoint-or-logpoint per line, so this is how to get both behaviours at one spot); the `[stop]` marker itself is not printed.
+- **Conditional breakpoints** — put a condition on any line breakpoint (VS Code: right-click gutter → *Edit Breakpoint… → Expression*). The condition is compiled to a tiny **bytecode VM that runs inside the emulator**, so it's evaluated at full speed with no debugger round-trip, and it also works from the standalone monitor. Conditions understand registers/flags (`X == 30`), C variables including members/subscripts/enums (`e->hp < 0`, `g_entities[i].hp == 0`, `_gCurrentLocation == e_LOC_MARKETPLACE`), and memory (`*$94:w > 1000`). Conditions persist across sessions.
+- **Data breakpoints (watchpoints)** — break on read / write / access of a memory address. Right-click a variable in Variables or the Symbol Browser watch → *Break on Value Read/Change/Access*, or **Oric: Add Watchpoint…**. Watchpoints can carry a **condition** too (break only when the written value matches), and are managed in the **Oric Breakpoints** panel. (Single address per watchpoint; the stub allows up to 16.)
+- **Time-travel / reverse debugging** — step backwards through recent history (see *Time-Travel Debugging* below).
+- **Logpoints (print breakpoints)** — a breakpoint that prints instead of stopping. Right-click the editor gutter → *Add Logpoint*, and enter a message with `{expr}` placeholders. On hit the message is evaluated, written to the Debug Console (in cyan, to stand out from the emulator's own output), and execution resumes automatically. Placeholders accept a register (`{a}`, `{pc}` — decoded via its type tag), a symbol (`{gCurrentLocation}` — fully typed: enum name, struct, etc.), or a `$hex` address (`{$C000}`). `{{`/`}}` are literal braces. Put **`[stop]`** anywhere in the message to both log **and** stop at that line (VS Code allows only one breakpoint-or-logpoint per line, so this is how to get both behaviours at one spot); the `[stop]` marker itself is not printed. Put **`[save]`** in the message to take a machine **snapshot** every time the line is hit (see *Snapshots*) — e.g. a logpoint `Entering level {level} [save]` gives you a restore point at each level. Marker tokens are never printed.
 - **Call stack** walking (reconstructed from the hardware stack)
 - **Disassembly view** with symbol resolution in operands
 - **Virtual disassembly source**: when no source mapping exists, the extension generates a disassembly document centered on the current PC
@@ -38,12 +40,16 @@ Connects VS Code to Oricutron's GDB Remote Serial Protocol (RSP) stub over TCP.
 
 ## Debug Panels
 
-Two dedicated panels appear in the Debug sidebar when a session is active:
+Dedicated panels appear in the Debug sidebar when a session is active:
 
 | Panel | Description |
 |---|---|
-| **Oric Registers** | CPU registers (A, X, Y, SP, PC), processor flags (N, V, B, D, I, Z, C), last PC, cycle counter, frame count, raster line, and interrupt vectors (NMI, RST, IRQ). A/X/Y show their decoded value when the register carries a type tag (see *Register type tags*). |
-| **Oric Peripherals** | Live state of the VIA 6522, AY-3-8912 (PSG), WD1793 floppy disk controller, Microdisc interface, and ACIA 6551 serial controller |
+| **Oric Debug Controls** | A compact toolbar of the Oric-specific actions (warp, reverse-step, skip, reset cycles, show current location, snapshot) so they're one click away without hunting the Command Palette. |
+| **Current Instruction** | The instruction about to execute, decoded with its operand values and the symbols/types they resolve to — the same annotation shown inline, in a persistent panel (globals/locals/members/subscripts/enums). |
+| **Oric Registers** | CPU registers (A, X, Y, SP, PC), processor flags (N, V, B, D, I, Z, C), last PC, cycle counter, frame count, raster line, and interrupt vectors (NMI, RST, IRQ). A/X/Y show their decoded value when the register carries a type tag. |
+| **Oric Breakpoints** | All breakpoints as a tree: **module → file → line**, with a child row per condition / hit-count / watchpoint property. Enable/disable or delete at any level (all / module / file / line), and optionally *follow the active module*. |
+| **Oric Snapshots** | Saved machine-state snapshots for this project — restore, rename, or delete (see *Snapshots*). |
+| **Oric Peripherals** | Live state of the VIA 6522, AY-3-8912 (PSG), WD1793 floppy disk controller, Microdisc interface, and ACIA 6551 serial controller. |
 
 (Zero-page variables are no longer a separate panel — view them in the **Symbol Browser** with the group filter set to *Zero Page*.)
 
@@ -76,13 +82,16 @@ Live Oric screen display rendered from Oricutron's 240x224 screen buffer.
 
 Open via command palette: **Oric: Screen View**
 
+- **Interactive**: the Oric keyboard works while the view is focused — type directly into the running program.
+- **CRT shader**: optional WebGL CRT effect (curvature-aware scanlines; the grid and hover crosshair follow the curvature). **Pixel-aspect toggle** switches between square pixels and the Oric's true pixel aspect.
+- **On-screen status (OSD)**: badges show when the emulator is **paused**, running in **turbo/warp**, or being driven by an **automation script** (`● SCRIPT`).
 - **Column grid** (6px) and **row grid** (8px) overlays with selectable colors
 - **Pixel inspector**: hover to see address, byte value, bit position, and color info
 - **Zoom**: configurable zoom factor (2x/4x/6x/8x/12x) and region size
 - **Crosshair**: black-white-black crosshair on main view, pixel highlight in zoom
 - **Screenshot**: save PNG to project `screenshots/` folder with timestamp
 - **Clipboard**: copy screen to clipboard (Windows)
-- All settings (grids, color, zoom) persisted across reloads
+- All settings (grids, color, zoom, aspect, CRT) persisted across reloads
 
 ### Symbol Browser
 
@@ -116,6 +125,32 @@ The Symbol Browser doubles as a **watch panel**, kept above the symbol table and
 
 - **OSDK: XA Quick Reference** - searchable XA assembler directive reference
 - **OSDK: 6502 Opcode Reference** - searchable 6502 instruction set reference with cycle counts
+
+---
+
+## Time-Travel Debugging
+
+The emulator keeps an in-memory **history ring** of recent machine states, so when you're stopped you can move *backwards*, not just forwards:
+
+- **Step Back** — **Shift+F10** (or the reverse button in *Oric Debug Controls*) steps one step into the past.
+- **Reverse continue** — run backwards to the previous breakpoint/stop.
+
+History is bounded to the recent past (it's a ring buffer, not a full recording), which is exactly what you want for "how did I *get* into this bad state?" — stop on the symptom, step back to the cause. For a durable point you can return to at any time, use a **Snapshot** instead.
+
+---
+
+## Snapshots
+
+Save and restore the **entire machine state** (CPU, RAM, peripherals, and the current breakpoints) as a named snapshot, per project, under `.oric-snapshots/`.
+
+- **Save** — **Oric: Save Snapshot** (or the snapshot button in *Oric Debug Controls*). Snapshots get a **self-describing auto-name** (you can rename them later).
+- **Restore** — **Oric: Restore Snapshot**, or pick one from the **Oric Snapshots** panel → *Restore*. Restoring re-syncs breakpoints so the ones saved with the snapshot don't linger.
+- **Restart to Most Recent** — **Oric: Restart to Most Recent Snapshot** jumps straight back to your latest restore point; combined with an **entry baseline** captured at launch, "restart the program" is near-instant (no rebuild/relaunch).
+- **Rename / Delete** — from the *Oric Snapshots* panel; **Oric: Delete Snapshot** / **Refresh Snapshots** are also on the palette.
+- **Auto-snapshot on hit** — add **`[save]`** to a logpoint message to snapshot every time that line is reached (see *Logpoints*), e.g. a save point at the start of each level.
+- **Build-aware** — each snapshot records a checksum of the build it was taken against; if you rebuild, stale snapshots are flagged rather than restored into mismatched code.
+
+Snapshots are the manual counterpart to *Time-Travel Debugging*: history is automatic-but-recent; snapshots are explicit-and-durable.
 
 ---
 
@@ -214,6 +249,72 @@ Requires either a V2 symbol file (with source location info) or a `#define` dire
 
 ---
 
+## Automation Scripting
+
+Drive the emulator from a JavaScript script that runs **against your live debug session** — the program plays in the **Screen View**, and you can pause, inspect, and resume it like any debug session. Scripts are for reproducible playthroughs, regression checks, "get me to the interesting state" setup, and hunting timing/state bugs.
+
+Put scripts in your project under `automation/*.js`:
+
+```js
+// automation/example.js
+module.exports = async (t) => {
+    await t.waitModuleKnown();            // wait until an overlay module is active
+    if (await t.module() === 'Splash') await t.press('SPACE', { until: async () => (await t.module()) !== 'Splash' });
+    await t.waitFor('_gCurrentLocation', '== e_LOC_MARKETPLACE');   // run full-speed, stop EXACTLY here
+    t.screenshot('at-marketplace');
+    await t.type('take bag\n');           // reliable keystrokes (see below)
+};
+```
+
+Run it with **Oric: Run Automation Script…** (pick from a list), stop it with **Oric: Stop Automation Script**. Edit the file and re-run — the whole `automation/` folder is reloaded each time, so scripts *and* your helper modules iterate live. Stopping the debug session also stops the script.
+
+### The `t` API
+
+Everything is `async` unless noted. Values that take a "name" (`waitFor`, `assertMem`, key names) resolve **real symbols and enums** (`_gCurrentLocation`, `e_LOC_MARKETPLACE`) — never hard-code magic numbers.
+
+| Method | What it does |
+|---|---|
+| `t.waitFor(varName, cond, opts?)` | **The reliable "wait until".** Arms a value-watch on `varName` and runs at full speed until it holds a value — `t.waitFor('_gCurrentLocation', '== e_LOC_MARKETPLACE')`. It fires on *any* write path (STA/STX/INC/DMA…), because you care about the value, not the instruction. Frame-based timeout (doesn't count while you pause). |
+| `t.runTo(target, opts?)` | Run to a symbol or `$hex`, then stop. |
+| `t.runFrames(n)` | Let N emulated frames pass (~50 = 1 s). Blocks while you've paused. |
+| `t.press(key, hold?, gap?)` / `t.press(key, {until})` | Press one key — a letter, a NAME (`RETURN`/`ESC`/`UP`/`SPACE`/`CTRL`…), or a code. Each key is played by the **emulator's own tap queue** (held across keyboard scans, one at a time), so it isn't dropped under warp. The `{until}` form mashes the key until an async predicate is true (attract screens / sub-prompts). |
+| `t.type(text, opts?)` | Type a string reliably; `\n`/`\r` send Return. |
+| `t.warp(on)` | Fast-forward on/off (applied immediately, even while running). |
+| `t.module()` / `t.modules()` | Active OSDK overlay name / all module names. |
+| `t.waitModule(name)` / `t.waitModuleKnown()` / `t.waitModuleChange(from)` | Wait for a given overlay / for *any* to become active / to leave one. |
+| `t.waitSignal(id)` | Run until a logpoint/watchpoint tagged `[signal:<id>]` fires. |
+| `t.waitScreen(pred)` | Run until a predicate over the screen buffer is true. |
+| `t.read(target, n?)` / `t.eval(expr)` | Read memory at a symbol/address / evaluate a debugger expression. |
+| `t.assert(label, cond)` / `t.assertEq(...)` / `t.assertMem(label, target, expected)` | Checkpoints; `assertMem` resolves enum names for `expected`. |
+| `t.screenshot(name)` | Save a PNG of the screen. |
+| `t.log(msg)` | Log a line to the automation output. |
+| `t.KEY` / `t.key(name)` | The named key-id table / resolve a key name to its id. |
+
+**Reliability principle:** synchronise on *state*, never on fixed sleeps. `waitFor`/`waitModule`/`runTo` run at full speed and stop *exactly* at the checkpoint, so a script is immune to timing and warp.
+
+**Game-specific helpers** stay in their own module so the generic `t` API stays game-agnostic — e.g. Encounter's `automation/encounter.js` wraps the text-parser handshake into `enc.command(t, 'take bag')` (which types, *verifies* the input buffer landed, and retries). Overlay navigation is written out explicitly with plain `if` blocks per script (transparent and editable), not hidden in a black-box helper.
+
+---
+
+## AI-Driven Debugging (MCP)
+
+The extension ships an **MCP server** (`mcp/oric-mcp-server.cjs`) that lets an AI assistant (e.g. Claude) drive an Oricutron debug session with the same reliable primitives as the automation scripts above — it can *see* the screen (screenshots), *act* (reliable keys, warp, run-to-state), and use the full symbol-aware debugger (breakpoints, watchpoints, stepping, registers, backtrace, memory, evaluate).
+
+### One-click registration
+
+Run **Oric: Register MCP Server (for Claude)…**. It writes/merges a `.mcp.json` at your project root (pointing at the server shipped in this extension), **validates** it by performing the real MCP handshake, and reports how many tools are healthy. Then in your assistant run `/mcp` (or restart the session) to load it.
+
+### Tools
+
+Session (`oric_launch`/`oric_shutdown`/`oric_status`), execution (`oric_continue`/`oric_pause`/`oric_step_*`/`oric_step_back`/`oric_reverse`/`oric_run_to`/`oric_run_frames`/`oric_warp`), breakpoints & watchpoints (`oric_set_breakpoint` with native condition, `oric_watch_memory`, list/clear), inspection (`oric_read_memory`/`oric_evaluate`/`oric_registers`/`oric_backtrace`/`oric_get_output`), **sight** (`oric_screenshot`), **reliable input** (`oric_send_keys`/`oric_press`), and state waits (`oric_wait_for`/`oric_module`/`oric_wait_module`/`oric_wait_signal`).
+
+### Modes
+
+- **Standalone** *(available now)* — the MCP starts its **own** Oricutron (use `port` = your base gdb port **+ 1** so it never collides with a session you're running yourself). Great for headless/CI runs and for running several emulators at once. The assistant sees only through screenshots + the debugger — it is *not* the emulator window on your screen.
+- **Collaborative (shared GUI session)** *(planned — see below)* — the assistant attaches to the **same** live session you're driving in VS Code, so you both look at one screen, one set of breakpoints, one CPU state. This is the "I found something — take a look" workflow.
+
+---
+
 ## Commands
 
 All commands are available from the Command Palette (Ctrl+Shift+P):
@@ -236,6 +337,13 @@ All commands are available from the Command Palette (Ctrl+Shift+P):
 | **Oric: Toggle Warp Speed** | Toggle Oricutron's warp mode (run at maximum speed) | Debug |
 | **Oric: Reset Cycle Counter** | Reset the CPU cycle counter to zero | Debug (stopped) |
 | **Oric: Show Current Location** | Navigate the editor to the current PC location | Debug (stopped) |
+| **Oric: Save Snapshot** / **Restore Snapshot** | Save / restore full machine state (see *Snapshots*) | Debug |
+| **Oric: Restart to Most Recent Snapshot** | Jump back to the latest restore point | Debug |
+| **Oric: Delete Snapshot** / **Refresh Snapshots** | Manage the snapshot list | Debug |
+| **Oric: Run Automation Script…** / **Stop Automation Script** | Run / stop a `automation/*.js` script against the live session | Debug |
+| **Oric: Register MCP Server (for Claude)…** | Write/merge `.mcp.json` and validate the MCP server | Always |
+| **Oric: Add Watchpoint…** | Add a (conditional) data breakpoint on an address | Debug |
+| **Oric: Enable/Disable Warp Speed** | Turn warp on/off explicitly (vs. the toggle) | Debug |
 | **OSDK: XA Quick Reference** | Open the XA assembler directive reference | Always |
 | **OSDK: 6502 Opcode Reference** | Open the 6502 instruction set reference | Always |
 
@@ -261,6 +369,7 @@ Standard VS Code debug shortcuts also apply:
 | **F10** | Step Over |
 | **F11** | Step Into |
 | **Shift+F11** | Step Out |
+| **Shift+F10** | Step Back (reverse one step) |
 | **F9** | Toggle Breakpoint |
 | **F12** | Go to Definition (on symbol) |
 | **Ctrl+Click** | Go to Definition (on symbol) |
@@ -320,6 +429,7 @@ VS Code settings (User or Workspace) under **Oric Debug**:
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `oric-debug.showBinary` | boolean | `true` | Show the `%binary` column in decoded values (`$02\|2\|%00000010`). Turn off for a compact `$02\|2`. Applies live to a running session; also toggleable via **Oric: Toggle Binary Column in Values** or the `bin` console command. |
+| `oric-debug.breakpointsFollowActiveModule` | boolean | `true` | In the **Oric Breakpoints** panel, auto-focus the module that's currently executing (multi-module/overlay projects). |
 
 ---
 
