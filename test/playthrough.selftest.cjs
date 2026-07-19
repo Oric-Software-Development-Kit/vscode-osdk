@@ -16,6 +16,9 @@ class MockDap extends EventEmitter {
             if (cmd === 'dataBreakpointInfo') return res({ dataId: String(args.name || '').replace(/^\$/, ''), description: args.name });
             if (cmd === 'oricArmValueWatch') return res({ armed: true, error: null });
             if (cmd === 'oricClearValueWatch') return res({});
+            if (cmd === 'getModules') return res({ modules: [{ id: 0, name: 'Splash' }, { id: 2, name: 'Game' }], active: 2 });
+            if (cmd === 'setWarp') return res({ warp: !!args.on });
+            if (cmd === 'turboRun') { setTimeout(() => { this.stopped = true; this.emit('dap:stopped', { reason: 'step' }); }, 5); return res({}); }
             if (cmd === 'oricResolve') { const map = { _gCurrentLocation: { addr: 0x91 }, e_LOC_ENTRANCEHALL: { value: 23 }, e_LOC_LARGE_STAIRCASE: { value: 26 } }; const e = map[args.name]; return res(e ? Object.assign({ found: true, name: args.name, addr: null, value: null }, e) : { found: false }); }
             if (cmd === 'readMemory') { const a = parseInt(args.memoryReference, 16); return res({ data: Buffer.from([this.mem[a] || 0]).toString('base64') }); }
             if (cmd === 'evaluate') return res({ result: 'ok' });
@@ -28,7 +31,7 @@ class MockDap extends EventEmitter {
 }
 class MockViz {
     constructor() { this.latest = { frame: 1, vidMode: 0, vidAddr: 0xa000, scr: Buffer.alloc(240 * 224) }; this.connected = true; }
-    connect() {} disconnect() {} keyDown() {} keyUp() {} releaseAll() {}
+    connect() {} disconnect() {} keyDown() {} keyUp() {} releaseAll() {} tap() {}
     frame() { return this.latest.frame; }
 }
 const say = m => process.stderr.write(m + '\n');
@@ -43,6 +46,7 @@ const say = m => process.stderr.write(m + '\n');
     // The script sets the mock's memory to simulate the game advancing state.
     const script = async (t) => {
         await t.warp(true);
+        t.assert('active module resolves', (await t.module()) === 'Game');
         dap.mem[0x91] = 23;
         // Single boolean expression — the watched var is derived from the expression:
         await t.waitFor('_gCurrentLocation == e_LOC_ENTRANCEHALL', { timeoutMs: 3000 });
@@ -67,7 +71,7 @@ const say = m => process.stderr.write(m + '\n');
     const png2 = fs.existsSync(path.join(outDir, '02-staircase.png'));
     const report = fs.existsSync(path.join(outDir, 'report.json'));
     say('checks=' + sum.total + ' all-passed=' + sum.allPassed + '  png1=' + png1 + ' png2=' + png2 + ' report=' + report);
-    const pass = sum.allPassed && sum.total === 3 && png1 && png2 && report;
+    const pass = sum.allPassed && sum.total === 4 && png1 && png2 && report;
     say(pass ? 'SELFTEST: PASS' : 'SELFTEST: FAIL');
     try { fs.rmSync(outDir, { recursive: true, force: true }); } catch (_) {}
     process.exitCode = pass ? 0 : 1;

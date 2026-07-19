@@ -36,6 +36,7 @@ function standaloneOps(dap, viz) {
         async evaluate(expr) { const fid = await dap.topFrameId(); const r = await dap.request('evaluate', { expression: expr, frameId: fid, context: 'repl' }); return r ? r.result : undefined; },
         sendKey(id, down) { down ? viz.keyDown(id) : viz.keyUp(id); },
         releaseKeys() { viz.releaseAll(); },
+        tapKey(id, hold) { viz.tap(id, hold); },   // emulator-owned key tap (reliable, one at a time)
         vizFrame() { return viz.frame(); },
         vizScreen() { return viz.latest ? viz.latest.scr : null; },
         async setWatch(addr, access, cond) {
@@ -54,7 +55,17 @@ function standaloneOps(dap, viz) {
             if (r && r.error) throw new Error('value-watch: ' + r.error);
         },
         async clearValueWatch(addr) { await dap.request('oricClearValueWatch', { addr: addr & 0xffff }).catch(() => {}); },
-        async warp(on) { if (!!on === warpOn) return; try { const r = await dap.request('toggleWarp', {}); warpOn = r && typeof r.warp === 'boolean' ? r.warp : !warpOn; } catch (_) { warpOn = !!on; } },
+        async getModules() { try { return await dap.request('getModules'); } catch (_) { return null; } },
+        isUserPaused() { return false; },   // standalone/headless: no interactive user pauses
+        async runTo(target, opts = {}) {
+            const arg = (typeof target === 'number') ? { addr: target & 0xffff } : { symbol: String(target) };
+            arg.warp = opts.warp === true;
+            const stopP = dap.once_event('stopped', opts.timeoutMs || 60000);
+            stopP.catch(() => {});
+            await dap.request('turboRun', arg);
+            await stopP;
+        },
+        async warp(on) { on = !!on; try { const r = await dap.request('setWarp', { on }); warpOn = r && typeof r.warp === 'boolean' ? r.warp : on; } catch (_) { warpOn = on; } },
         // Resolve on the next oricSignal event whose id matches (DapClient re-emits any DAP
         // event as 'dap:<event>'). Fired by a logpoint/watchpoint tagged [signal:<id>].
         waitSignal(id, ms) {

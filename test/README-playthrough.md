@@ -40,7 +40,11 @@ emulator. Screenshots + `report.json` land in `test/playthrough-out/`.
 ## Harness API (`t`, from `mcp/playthrough-core.cjs makeApi(ops)`)
 - `launch(config)` · `warp(on)`
 - `waitSignal(id, {timeoutMs, keepRunning})` · `waitFor(expr | target, valueOrCond, {timeoutMs})` · `waitScreen(predFn)` · `runFrames(n)`
-- `press(key, holdFrames, gapFrames)` · `type(text, {hold, gap, settle})` · `KEY` (id table) ·
+- `press(key, holdFrames, gapFrames)` or `press(key, {until, timeoutFrames, hold, gap})` — the
+  `{until: async () => …}` form **mashes** the key until the predicate holds (attract modes /
+  sub-prompts sample the keyboard intermittently, so a single press can be missed). Reusable, e.g.
+  `press('ESC', {until: async () => (await t.read('gGameStarting',1))[0] === 1})`.
+- `type(text, {hold, gap, settle})` · `KEY` (id table) ·
   `key(name)` — `key` is a letter (`'u'`), a name (`'RETURN'`/`'KEY_RETURN'`/`'UP'`/`'CTRL'`/`'ESC'`…)
   or a numeric code; `type`'s `'\n'`/`'\r'` submits the line via RETURN. Key ids live in one shared
   table (`mcp/oric-keys.cjs`), used by the runner AND injected into the Oric Screen View webview, so
@@ -50,6 +54,15 @@ emulator. Screenshots + `report.json` land in `test/playthrough-out/`.
   short `settle` (nothing held) before the first key so any "wait until keys released" phase clears.
 - `read(target, n)` · `eval(expr)` · `sym(name)` · `assert(label, cond)` · `assertEq(label, a, b)` · `assertMem(label, target, expected)`
 - `screenshot(name)` · `log(m)` · `summary()`
+
+### Overlay modules & autonomous start
+- `module()` → the active OSDK overlay name (or null); `modules()` → all names; `waitModule(name)`
+  → wait until that overlay is active (polls; a switch is the `_osdk_dbg_module` byte changing).
+  Lets one script work from any entry point (splash/intro/game/credits) by branching on `module()`.
+- **Cold start:** running a script from VS Code with no active session **starts one** (the F5
+  equivalent — the project's `oric-debug` launch config) and waits until the adapter is live,
+  then runs. An already-open session is reused. One tested "launch it correctly, fully hooked"
+  path — the same one the MCP uses.
 
 ### Reusable, game-specific helpers
 Keep the `t` API game-agnostic; put game knowledge in a helper module next to your scripts and
