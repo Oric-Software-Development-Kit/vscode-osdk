@@ -55,6 +55,18 @@ function warnIfStaleExtension(session) {
 // decorations never render. Case folding is applied ONLY on case-insensitive
 // filesystems (Windows, macOS) so Linux — where case matters — stays correct.
 const nodePath = require('path');
+// The one shared Oric key-id table (also used by the automation runner). Injected into the
+// Oric Screen View webview so the page and the scripts speak identical key ids — one source.
+const { KEYS: ORIC_KEY_TABLE } = require('./mcp/oric-keys.cjs');
+// The one shared viz wire-protocol definition (framing, constants, palette, key uplink),
+// mirrored from the emulator's viz_stream.c and shared with the MCP/playthrough VizClient.
+const vizProto = require('./mcp/oric-viz-protocol.cjs');
+const { VIZ_PORT_OFFSET } = vizProto;   // viz port = gdb port + 1
+// Only the field sizes the frame DECODER below needs (framing itself lives in the module).
+const VIZ_SCR_SIZE = vizProto.SCR_SIZE;
+const VIZ_VIDBASES_SIZE = vizProto.VIZ_VIDBASES;
+const VIZ_VIDRAM_MAIN = vizProto.VIZ_VIDRAM_MAIN;
+const VIZ_VIDRAM_BOTTOM = vizProto.VIZ_VIDRAM_BOTTOM;
 const caseInsensitiveFS = process.platform === 'win32' || process.platform === 'darwin';
 const canonPath = p => {
     if (!p) return '';
@@ -499,6 +511,8 @@ function wireMemoryPanel(panel, initialEntries) {
     } else {
         postResults(panel, state);
     }
+    // If we're attaching mid-run, dim right away — the values are a snapshot, not live.
+    panel.webview.postMessage({ type: 'setStale', stale: !!(session && session.type === 'oric-debug' && !oricDebugStopped) });
 }
 
 async function evaluateOne(session, state, index) {
@@ -520,15 +534,26 @@ function postResults(panel, state) {
     panel.webview.postMessage({ type: 'update', results: state.results });
 }
 
+// Dim/undim the memory panels: bytes can only be read when the CPU is halted, so while
+// the emulator runs the panel shows a stale snapshot — dim it so that's obvious (same cue
+// as the Registers/Peripherals views), and undim when a stop re-reads fresh values.
+function setMemoryPanelsStale(stale) {
+    for (const { panel } of memoryPanels) panel.webview.postMessage({ type: 'setStale', stale: !!stale });
+}
+
 function refreshMemoryPanels(session) {
     for (const { panel, state } of memoryPanels) {
         if (!session || session.type !== 'oric-debug') {
             state.results = state.entries.map(e => ({ ...e, address: null, data: '', error: null }));
             postResults(panel, state);
+            panel.webview.postMessage({ type: 'setStale', stale: false });   // no session → blank, not a stale snapshot
             continue;
         }
         const promises = state.entries.map((_, i) => evaluateOne(session, state, i));
-        Promise.all(promises).then(() => postResults(panel, state)).catch(() => postResults(panel, state));
+        Promise.all(promises).then(() => {
+            postResults(panel, state);
+            panel.webview.postMessage({ type: 'setStale', stale: false });   // fresh read at this stop
+        }).catch(() => postResults(panel, state));
     }
 }
 
@@ -560,6 +585,10 @@ body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(
 .error { color: var(--vscode-errorForeground, #f44); font-style: italic; }
 .sep { border-top: 1px solid var(--vscode-widget-border, #444); margin: 8px 0; }
 .empty { color: var(--vscode-descriptionForeground, #888); font-style: italic; }
+/* Dimmed while the emulator is running: memory can only be read when the CPU is halted,
+   so these bytes are a snapshot from the last stop, not live. Undims on the next stop.
+   Same cue the Registers/Peripherals/Watch views use (STALE_CSS). */
+body.stale { opacity: 0.5; filter: grayscale(0.35); }
 </style></head><body>
 <div class="input-row">
     <input type="text" id="exprInput" placeholder="Expression: _Symbol, *_Ptr, $A000, _Buf+X" />
@@ -719,6 +748,7 @@ function renderResults(results) {
 
 window.addEventListener('message', e => {
     if (e.data.type === 'update') renderResults(e.data.results);
+    else if (e.data.type === 'setStale') document.body.classList.toggle('stale', !!e.data.stale);
 });
 </script>
 </body></html>`;
@@ -1142,6 +1172,13 @@ let screenPanel = null;
 let vizOutputChannel = null;
 let vizConnected = false;   // true while the viz stream socket is actually connected
 
+// --- Automation runner state (in-session playthrough scripts) ----------------
+let vizLastFrame = -1;              // latest viz frame counter (for runFrames/waitScreen)
+let vizLastScrB64 = null;           // latest 240x224 screen buffer, base64 (for screenshots)
+const automationEvents = new vscode.EventEmitter();   // fires {type:'stopped'|'continued'|'signal', id?}
+let automationRunning = null;       // the running script's `t` (for Stop), or null
+let automationChan = null;          // lazily-created Output channel
+
 // Tell the Screen View whether the Oric is connected — gates its keyboard control
 // (no controlling a disconnected Oric) and the "click to control" badge.
 function postScreenConn(connected) {
@@ -1166,17 +1203,9 @@ const vizConsumers = new Set();  // { postFrame(msg), postStatus(text), postErro
 let vizHost = null;
 let vizPort = null;
 
-const VIZ_FRAME_SIZE_V0 = 16 + 65536 * 3;          // 196624
-const VIZ_SCR_SIZE       = 240 * 224;                // 53760
-const VIZ_VIDBASES_SIZE  = 4 * 2;                    // 8
-const VIZ_VIDRAM_MAIN    = 8000;
-const VIZ_VIDRAM_BOTTOM  = 120;
-const VIZ_FRAME_SIZE_V1  = VIZ_FRAME_SIZE_V0 + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN + VIZ_VIDRAM_BOTTOM; // 258512
-const VIZ_MAGIC          = 0x4349564F;  // "OVIC" as uint32 LE
-// Viz server port = gdb port + this offset, so the two sit adjacent in a port
-// scanner. Auto-picked gdb ports verify gdb+offset is free too, so no collision.
-// MUST match viz_init() in Oricutron's viz_stream.c.
-const VIZ_PORT_OFFSET    = 1;
+// Viz protocol constants (VIZ_MAGIC, VIZ_PORT_OFFSET, screen/frame sizes) now come from the
+// shared mcp/oric-viz-protocol.cjs — imported near the top of this file — so there is one
+// definition of the wire format, mirrored from the emulator's viz_stream.c.
 
 function vizLog(msg) {
     if (vizOutputChannel) vizOutputChannel.appendLine('[VIZ] ' + msg);
@@ -1276,110 +1305,60 @@ function vizConnect(host, port) {
     sock.on('data', (chunk) => {
         vizRxBuf = Buffer.concat([vizRxBuf, chunk]);
 
-        // Determine frame size from version field once we have the header
-        while (vizRxBuf.length >= 16) {
-            const magic = vizRxBuf.readUInt32LE(0);
-            if (magic !== VIZ_MAGIC) {
-                syncErrors++;
-                let found = -1;
-                for (let i = 1; i <= vizRxBuf.length - 4; i++) {
-                    if (vizRxBuf.readUInt32LE(i) === VIZ_MAGIC) { found = i; break; }
-                }
-                if (found < 0) {
-                    const discarded = vizRxBuf.length - 3;
-                    vizRxBuf = vizRxBuf.slice(vizRxBuf.length - 3);
-                    vizLog('Frame sync error: bad magic, discarded ' + discarded + ' bytes (' + syncErrors + ' total sync errors)');
+        // Framing/sizing/resync is done once in the shared protocol module (nextFrame);
+        // here we only DECODE the fields the webview consumers need (base64 for postMessage).
+        while (true) {
+            const r = vizProto.nextFrame(vizRxBuf);
+            vizRxBuf = r.rest;
+            if (r.status === 'need') break;
+            if (r.status === 'resync') {
+                if (r.reason === 'nomagic') {
+                    syncErrors++;
+                    vizLog('Frame sync error: bad magic, discarded ' + r.skipped + ' bytes (' + syncErrors + ' total sync errors)');
                     for (const c of vizConsumers) c.postError('Frame sync error (resynchronizing...)');
-                    return;
+                    break;                               // wait for more data
                 }
-                vizLog('Frame sync: skipped ' + found + ' bytes to re-align');
-                vizRxBuf = vizRxBuf.slice(found);
-                if (vizRxBuf.length < 16) return;
+                if (r.reason === 'realign') { syncErrors++; vizLog('Frame sync: skipped ' + r.skipped + ' bytes to re-align'); }
+                continue;                                // realign / corrupt: retry on the realigned buffer
             }
 
-            const version = vizRxBuf.readUInt16LE(14);
-            let frame, msg;
-
+            // r.status === 'frame': decode header + heat + (v1/v2) screen block.
+            const frame = r.frame, version = r.version, s = r.scrOff;
+            const msg = {
+                version,
+                frameCounter: frame.readUInt32LE(4),
+                romdis: frame[8],
+                vidMode: frame[9],
+                vidAddr: frame.readUInt16LE(10),
+                charsetAddr: frame.readUInt16LE(12),
+            };
             if (version >= 2) {
-                // v2: variable length — three heat-delta run-lists, then the fixed
-                // screen block. Parse the run-lists to locate the screen block.
-                const SCREEN_BLOCK = VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN + VIZ_VIDRAM_BOTTOM;
-                let hoff = 16;
-                const ranges = [];
-                let haveAll = true, corrupt = false;
-                for (let a = 0; a < 3; a++) {
-                    if (vizRxBuf.length < hoff + 2) { haveAll = false; break; }
-                    const nRuns = vizRxBuf.readUInt16LE(hoff);
-                    if (nRuns > 32768) { corrupt = true; break; } // > producer max → desync, don't trust the length
-                    const bytes = 2 + nRuns * 4;
-                    if (vizRxBuf.length < hoff + bytes) { haveAll = false; break; }
-                    ranges.push([hoff, hoff + bytes]);
-                    hoff += bytes;
-                }
-                if (corrupt) { vizRxBuf = vizRxBuf.slice(1); continue; } // resync via magic scan
-                if (!haveAll) return;                       // wait for the rest of the heat delta
-                const frameSize = hoff + SCREEN_BLOCK;
-                if (vizRxBuf.length < frameSize) return;    // wait for the screen block
-                frame = vizRxBuf.slice(0, frameSize);
-                vizRxBuf = vizRxBuf.slice(frameSize);
-                const s = hoff; // screen block offset
-                msg = {
-                    version,
-                    frameCounter: frame.readUInt32LE(4),
-                    romdis: frame[8],
-                    vidMode: frame[9],
-                    vidAddr: frame.readUInt16LE(10),
-                    charsetAddr: frame.readUInt16LE(12),
-                    // heat deltas as raw count-prefixed run-list bytes; the webview
-                    // applies them onto its own arrays and does the decay.
-                    readRuns:  frame.slice(ranges[0][0], ranges[0][1]).toString('base64'),
-                    writeRuns: frame.slice(ranges[1][0], ranges[1][1]).toString('base64'),
-                    ulaRuns:   frame.slice(ranges[2][0], ranges[2][1]).toString('base64'),
-                    scrBuf: frame.slice(s, s + VIZ_SCR_SIZE).toString('base64'),
-                    vidbases: [
-                        frame.readUInt16LE(s + VIZ_SCR_SIZE),
-                        frame.readUInt16LE(s + VIZ_SCR_SIZE + 2),
-                        frame.readUInt16LE(s + VIZ_SCR_SIZE + 4),
-                        frame.readUInt16LE(s + VIZ_SCR_SIZE + 6)
-                    ],
-                    vidRamMain: frame.slice(s + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE,
-                                            s + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN).toString('base64'),
-                    vidRamBottom: frame.slice(s + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN,
-                                              s + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN + VIZ_VIDRAM_BOTTOM).toString('base64')
-                };
+                // heat deltas as raw count-prefixed run-list bytes; the webview applies
+                // them onto its own arrays and does the decay.
+                msg.readRuns  = frame.slice(r.ranges[0][0], r.ranges[0][1]).toString('base64');
+                msg.writeRuns = frame.slice(r.ranges[1][0], r.ranges[1][1]).toString('base64');
+                msg.ulaRuns   = frame.slice(r.ranges[2][0], r.ranges[2][1]).toString('base64');
             } else {
-                // Legacy v0/v1: full heat arrays, fixed frame size.
-                const frameSize = (version >= 1) ? VIZ_FRAME_SIZE_V1 : VIZ_FRAME_SIZE_V0;
-                if (vizRxBuf.length < frameSize) return;
-                frame = vizRxBuf.slice(0, frameSize);
-                vizRxBuf = vizRxBuf.slice(frameSize);
-                msg = {
-                    version,
-                    frameCounter: frame.readUInt32LE(4),
-                    romdis: frame[8],
-                    vidMode: frame[9],
-                    vidAddr: frame.readUInt16LE(10),
-                    charsetAddr: frame.readUInt16LE(12),
-                    readHeat: frame.slice(16, 16 + 65536).toString('base64'),
-                    writeHeat: frame.slice(16 + 65536, 16 + 65536 * 2).toString('base64'),
-                    ulaHeat: frame.slice(16 + 65536 * 2, 16 + 65536 * 3).toString('base64')
-                };
-                if (version >= 1) {
-                    const v1Off = VIZ_FRAME_SIZE_V0;
-                    msg.scrBuf = frame.slice(v1Off, v1Off + VIZ_SCR_SIZE).toString('base64');
-                    msg.vidbases = [
-                        frame.readUInt16LE(v1Off + VIZ_SCR_SIZE),
-                        frame.readUInt16LE(v1Off + VIZ_SCR_SIZE + 2),
-                        frame.readUInt16LE(v1Off + VIZ_SCR_SIZE + 4),
-                        frame.readUInt16LE(v1Off + VIZ_SCR_SIZE + 6)
-                    ];
-                    msg.vidRamMain = frame.slice(v1Off + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE,
-                                                 v1Off + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN).toString('base64');
-                    msg.vidRamBottom = frame.slice(v1Off + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN,
-                                                   v1Off + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN + VIZ_VIDRAM_BOTTOM).toString('base64');
-                }
+                msg.readHeat  = frame.slice(16, 16 + 65536).toString('base64');
+                msg.writeHeat = frame.slice(16 + 65536, 16 + 65536 * 2).toString('base64');
+                msg.ulaHeat   = frame.slice(16 + 65536 * 2, 16 + 65536 * 3).toString('base64');
+            }
+            if (s >= 0) {                                // screen block present (v1/v2)
+                msg.scrBuf = frame.slice(s, s + VIZ_SCR_SIZE).toString('base64');
+                msg.vidbases = [
+                    frame.readUInt16LE(s + VIZ_SCR_SIZE),
+                    frame.readUInt16LE(s + VIZ_SCR_SIZE + 2),
+                    frame.readUInt16LE(s + VIZ_SCR_SIZE + 4),
+                    frame.readUInt16LE(s + VIZ_SCR_SIZE + 6)
+                ];
+                msg.vidRamMain = frame.slice(s + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE,
+                                             s + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN).toString('base64');
+                msg.vidRamBottom = frame.slice(s + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN,
+                                               s + VIZ_SCR_SIZE + VIZ_VIDBASES_SIZE + VIZ_VIDRAM_MAIN + VIZ_VIDRAM_BOTTOM).toString('base64');
             }
 
+            vizLastFrame = msg.frameCounter;                 // tap for the automation runner
+            if (msg.scrBuf) vizLastScrB64 = msg.scrBuf;
             for (const c of vizConsumers) c.postFrame(msg);
         }
     });
@@ -1978,11 +1957,10 @@ function createScreenPanel() {
                 try { fs.unlinkSync(tmpFile); } catch (_) {}
             });
         } else if (msg.type === 'oricKey') {
-            // Keyboard input from the Screen View -> Oric keyboard matrix.
-            // Uplink frame: [0x01 KEY][len 2][keyid][down]
-            vizSendInput([0x01, 0x02, msg.id & 0xff, msg.down ? 1 : 0]);
+            // Keyboard input from the Screen View -> Oric keyboard matrix (shared uplink frame).
+            vizSendInput(vizProto.keyFrame(msg.id, msg.down));
         } else if (msg.type === 'oricKeyReleaseAll') {
-            vizSendInput([0x02, 0x00]); // RELEASE_ALL
+            vizSendInput(vizProto.releaseAllFrame());
         }
     });
 
@@ -2911,17 +2889,16 @@ osdToggle.addEventListener('change', () => { saveSettings(); updateOsd(); });
         const t = document.activeElement;
         return t && /^(BUTTON|SELECT|INPUT|TEXTAREA)$/.test(t.tagName);
     }
+    // Key ids come from the shared table injected by the extension (mcp/oric-keys.cjs) —
+    // NOT hardcoded here — so the Screen View and the automation runner can never drift.
+    // Only the browser-specific bit stays local: which physical DOM e.code is which key name.
+    const ORIC_KEYS = ${JSON.stringify(ORIC_KEY_TABLE)};
+    const DOM_KEY = { ArrowUp:'UP', ArrowDown:'DOWN', ArrowLeft:'LEFT', ArrowRight:'RIGHT',
+        Enter:'RETURN', NumpadEnter:'RETURN', Escape:'ESC', Space:'SPACE', Backspace:'BACKSPACE',
+        ShiftLeft:'SHIFT', ShiftRight:'SHIFT', ControlLeft:'CTRL', ControlRight:'CTRL', Tab:'TAB' };
     function mapKey(e){
-        switch(e.code){
-            case 'ArrowUp': return 0x80; case 'ArrowDown': return 0x81;
-            case 'ArrowLeft': return 0x82; case 'ArrowRight': return 0x83;
-            case 'Enter': case 'NumpadEnter': return 0x84;
-            case 'Escape': return 0x85; case 'Space': return 0x86;
-            case 'Backspace': return 0x87;
-            case 'ShiftLeft': case 'ShiftRight': return 0x88;
-            case 'ControlLeft': case 'ControlRight': return 0x89;
-            case 'Tab': return 0x8b;
-        }
+        const n = DOM_KEY[e.code];
+        if (n && ORIC_KEYS[n] != null) return ORIC_KEYS[n];
         if (e.key && e.key.length === 1){ const c = e.key.charCodeAt(0); if (c >= 0x20 && c < 0x7f) return c; }
         return null;
     }
@@ -2985,8 +2962,12 @@ let dimLiveViews = null;      // set in activate: greys the live-data views (reg
 // Central stopped-state switch: gates the source CodeLens AND the disasm
 // panel's line actions (the webview hides its buttons/menu while the program
 // runs or no session exists — run/jump/skip on a live PC would misfire).
-function setOricDebugStopped(v) {
+function setOricDebugStopped(v, reason) {
     oricDebugStopped = !!v;
+    // reason (from the DAP 'stopped' body) lets the automation runner tell a real
+    // value-watch hit ('data breakpoint') from a manual pause / step — a waitFor must
+    // NOT be satisfied by the user pausing to look around.
+    automationEvents.fire({ type: oricDebugStopped ? 'stopped' : 'continued', reason: reason });   // drive the automation runner's waits
     if (!oricDebugStopped) { currentStopLoc = null; updatePcLineContext(); }
     if (lineActionLens) lineActionLens.refresh();
     if (bpTreeEmitter) bpTreeEmitter.fire();   // clear/redraw the "stopped here" marker
@@ -2996,6 +2977,107 @@ function setOricDebugStopped(v) {
     // values are stale. When stopped, refreshAll() re-renders them live.
     if (!oricDebugStopped && dimLiveViews) dimLiveViews();
     postScreenRunState();   // update the Screen View turbo/paused OSD
+}
+
+// --- In-session automation runner --------------------------------------------
+// Runs an automation/*.js playthrough script against the ACTIVE debug session, so it plays
+// in the Oric Screen View and every debug view stays live. Reuses the shared step-algorithms
+// (makeApi) — this just binds `ops` to the session + the extension's viz.
+function automationChannel() { if (!automationChan) automationChan = vscode.window.createOutputChannel('Oric Automation'); return automationChan; }
+function waitSessionEvent(type, timeoutMs, filter) {
+    return new Promise((resolve, reject) => {
+        const to = setTimeout(() => { sub.dispose(); reject(new Error('timeout waiting for ' + type)); }, timeoutMs || 30000);
+        const sub = automationEvents.event(e => { if (e.type === type && (!filter || filter(e))) { clearTimeout(to); sub.dispose(); resolve(e); } });
+    });
+}
+function inSessionOps(session) {
+    // The GDB stub only services packets while the CPU is HALTED: a free-running 'c'
+    // holds the command channel, so an arm-watchpoint / memory-read / evaluate issued
+    // while running would queue behind it and never be sent (it only lands when the
+    // program next stops — which is exactly the "nothing happens until I pause" symptom).
+    // So every stub-dependent op halts first (pause = out-of-band \x03, always works).
+    const self = {
+        async continue() { if (oricDebugStopped) await session.customRequest('continue', { threadId: 1 }).catch(() => {}); },
+        async pause() { if (!oricDebugStopped) { const p = waitSessionEvent('stopped', 4000); await session.customRequest('pause', { threadId: 1 }).catch(() => {}); await p.catch(() => {}); } },
+        async ensureStopped() { if (!oricDebugStopped) await self.pause(); return oricDebugStopped; },
+        // Optional `reason` filters which stop resolves the wait (e.g. 'data breakpoint'
+        // for a value-watch hit) so a manual pause/step during a waitFor is ignored.
+        waitStopped(ms, reason) { return waitSessionEvent('stopped', ms || 30000, reason ? (e => e.reason === reason) : null); },
+        isStopped() { return oricDebugStopped; },
+        async readMem(addr, n) { await self.ensureStopped(); const r = await session.customRequest('readMemory', { memoryReference: (addr & 0xffff).toString(16), offset: 0, count: n || 1 }); return r && r.data ? Buffer.from(r.data, 'base64') : Buffer.alloc(0); },
+        async evaluate(expr) {
+            await self.ensureStopped();
+            let fid;
+            try { const st = await session.customRequest('stackTrace', { threadId: 1, startFrame: 0, levels: 1 }); fid = st && st.stackFrames && st.stackFrames[0] ? st.stackFrames[0].id : undefined; } catch (_) {}
+            const r = await session.customRequest('evaluate', { expression: expr, frameId: fid, context: 'repl' });
+            return r ? r.result : undefined;
+        },
+        sendKey(id, down) { vizSendInput(vizProto.keyFrame(id, down)); },
+        releaseKeys() { vizSendInput(vizProto.releaseAllFrame()); },
+        vizFrame() { return vizLastFrame; },
+        vizScreen() { return vizLastScrB64 ? Buffer.from(vizLastScrB64, 'base64') : null; },
+        async setWatch(addr, access, cond) {
+            await self.ensureStopped();   // must be halted to arm — else the Z-packet queues behind 'c'
+            const info = await session.customRequest('dataBreakpointInfo', { name: '$' + (addr & 0xffff).toString(16) });
+            if (!info || !info.dataId) throw new Error('cannot watch $' + (addr & 0xffff).toString(16));
+            const bp = { dataId: info.dataId, accessType: access || 'write' };
+            if (cond) bp.condition = cond;
+            await session.customRequest('setDataBreakpoints', { breakpoints: [bp] });
+        },
+        async clearWatch() { await session.customRequest('setDataBreakpoints', { breakpoints: [] }).catch(() => {}); },
+        // Value-watch used by waitFor: stop when the byte at addr changes to satisfy cond,
+        // tested against real committed memory (fires regardless of the write mechanism).
+        // Must be halted to arm (packet would queue behind a running 'c').
+        async armValueWatch(addr, cond) {
+            await self.ensureStopped();
+            const r = await session.customRequest('oricArmValueWatch', { addr: addr & 0xffff, condition: cond || null });
+            if (r && r.error) throw new Error('value-watch: ' + r.error);
+        },
+        async clearValueWatch(addr) { await session.customRequest('oricClearValueWatch', { addr: addr & 0xffff }).catch(() => {}); },
+        async warp(on) { if (!!on !== oricWarpOn) doToggleWarp(); },
+        waitSignal(id, ms) { return waitSessionEvent('signal', ms || 60000, e => !id || e.id === id); },
+        // Resolve a real name (_gCurrentLocation / e_LOC_LARGE_STAIRCASE) to { addr, value, ... }
+        // so scripts never hardcode addresses/enum values. Pure symbol-table lookup (no stub).
+        async resolve(name) { try { const r = await session.customRequest('oricResolve', { name: String(name) }); return r && r.found ? r : null; } catch (_) { return null; } },
+    };
+    return self;
+}
+async function runAutomationScript(scriptPath) {
+    const session = vscode.debug.activeDebugSession;
+    if (!session || session.type !== 'oric-debug') { vscode.window.showErrorMessage('Oric: start a debug session first, then run the automation script.'); return; }
+    if (automationRunning) { vscode.window.showWarningMessage('An Oric automation script is already running — Stop it first.'); return; }
+    let scriptFn;
+    // Fresh each run: bust the require cache for the script AND every sibling module in its
+    // folder (e.g. automation/encounter.js helpers), so editing a helper reloads without a
+    // window reload — same iterate-and-rerun loop as the script itself.
+    try {
+        const dir = canonPath(nodePath.dirname(scriptPath)) + nodePath.sep;
+        for (const k of Object.keys(require.cache)) { if (canonPath(k).startsWith(dir)) delete require.cache[k]; }
+        scriptFn = require(scriptPath);
+    }
+    catch (e) { vscode.window.showErrorMessage('Automation script load error: ' + (e && e.message ? e.message : e)); return; }
+    if (typeof scriptFn !== 'function' && scriptFn && typeof scriptFn.default === 'function') scriptFn = scriptFn.default;
+    if (typeof scriptFn !== 'function') { vscode.window.showErrorMessage('An automation script must be:  module.exports = async (t) => { ... }'); return; }
+    // Lazy: the shared step-core (+ its client deps) load only when a script is actually run,
+    // so any issue there can never break the extension's activation.
+    let makeApi;
+    try { ({ makeApi } = require('./mcp/playthrough-core.cjs')); }
+    catch (e) { vscode.window.showErrorMessage('Automation core failed to load: ' + (e && e.message ? e.message : e)); return; }
+    const chan = automationChannel(); chan.clear(); chan.show(true);
+    const outDir = nodePath.join(nodePath.dirname(scriptPath), 'out');
+    const t = makeApi(inSessionOps(session), { log: m => chan.appendLine(m), outDir });
+    automationRunning = t;
+    vscode.commands.executeCommand('setContext', 'oric-debug.automationRunning', true);
+    chan.appendLine('▶ ' + nodePath.basename(scriptPath) + '   (session: ' + session.name + ')');
+    const t0 = Date.now();
+    try { await scriptFn(t); }
+    catch (e) { t.assert('script completed', false, e && e.message ? e.message : String(e)); }
+    const sum = t.summary();
+    chan.appendLine('──────────────────────────────');
+    chan.appendLine((sum.allPassed ? '✓ ' : '✗ ') + sum.pass + '/' + sum.total + ' checks passed   (' + ((Date.now() - t0) / 1000).toFixed(1) + 's)');
+    automationRunning = null;
+    vscode.commands.executeCommand('setContext', 'oric-debug.automationRunning', false);
+    vscode.window.showInformationMessage('Oric automation: ' + sum.pass + '/' + sum.total + (sum.allPassed ? ' passed ✓' : ' — some FAILED ✗') + ' (see "Oric Automation" output)');
 }
 
 // Array-valued context key for the line-number gutter menu: the PC line when
@@ -5085,7 +5167,7 @@ function activate(context) {
         const sizeStr = await vscode.window.showInputBox({ title: 'Size (bytes)', value: '1', ignoreFocusOut: true, validateInput: v => (/^[1-9][0-9]*$/.test((v || '').trim()) ? null : 'positive integer') });
         if (sizeStr == null) return;
         const condition = ((await vscode.window.showInputBox({ title: 'Condition (optional)', prompt: 'e.g.  A == $10 && *$91 != 0   — blank = always', ignoreFocusOut: true })) || '').trim() || null;
-        const logMessage = ((await vscode.window.showInputBox({ title: 'Log message (optional)', prompt: 'Printed on hit; {expr} interpolates; add [save] to snapshot, [stop] to also break. Blank = stop only.', ignoreFocusOut: true })) || '').trim() || null;
+        const logMessage = ((await vscode.window.showInputBox({ title: 'Log message (optional)', prompt: 'Printed on hit; {expr} interpolates; [save] snapshot, [stop] break, [signal:id] fire a signal a script can await. Blank = stop only.', ignoreFocusOut: true })) || '').trim() || null;
         watchBpList.push({
             id: 'w' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36),
             address: tgt.address, size: parseInt(sizeStr, 10) || 1, access: acc.v,
@@ -5117,7 +5199,7 @@ function activate(context) {
             const v = await vscode.window.showInputBox({ title: 'Condition', value: w.condition || '', prompt: 'e.g.  A == $10 && *$91 != 0   — blank to clear', ignoreFocusOut: true });
             if (v === undefined) return; w.condition = v.trim() || null;
         } else if (prop === 'logMessage') {
-            const v = await vscode.window.showInputBox({ title: 'Log message', value: w.logMessage || '', prompt: '{expr} interpolates; add [save] to snapshot, [stop] to also break. Blank to clear.', ignoreFocusOut: true });
+            const v = await vscode.window.showInputBox({ title: 'Log message', value: w.logMessage || '', prompt: '{expr} interpolates; [save] snapshot, [stop] break, [signal:id] fire a signal a script can await. Blank to clear.', ignoreFocusOut: true });
             if (v === undefined) return; w.logMessage = v.trim() || null;
         } else return;
         pushWatchpoints();
@@ -5162,7 +5244,7 @@ function activate(context) {
     const PROP_META = {
         condition:    { label: 'Condition',   prompt: 'Break only when this holds — leave blank to clear', ph: 'e.g.  g_score > 100   ·   e->hp == 0   ·   g_entities[i].kind == KIND_DRAGON' },
         hitCondition: { label: 'Hit Count',    prompt: 'Break on/after the Nth hit — leave blank to clear',  ph: 'e.g.  5' },
-        logMessage:   { label: 'Log Message',  prompt: 'Print on hit and keep running; {expr} interpolates; add [stop] to also break — leave blank to clear', ph: 'e.g.  reached start, i={i}, hp={e->hp}  [stop]' }
+        logMessage:   { label: 'Log Message',  prompt: 'Print on hit and keep running; {expr} interpolates; [stop] break, [signal:id] fire a script signal — leave blank to clear', ph: 'e.g.  reached start, i={i}, hp={e->hp}  [stop]' }
     };
     const propVal = (bp, prop) => prop === 'condition' ? bp.condition : prop === 'hitCondition' ? bp.hitCondition : bp.logMessage;
     function updateBpProps(bps, changes) {
@@ -5193,6 +5275,15 @@ function activate(context) {
         const keys = new Set(L.bps.map(bpKey));
         const rem = vscode.debug.breakpoints.filter(b => b instanceof vscode.SourceBreakpoint && keys.has(bpKey(b)));
         if (rem.length) vscode.debug.removeBreakpoints(rem);
+    }
+    // Delete a set of breakpoints after a modal confirmation ("Delete all N in <what>?").
+    async function removeBpsConfirmed(bpList, what) {
+        if (!bpList || !bpList.length) { vscode.window.showInformationMessage('No breakpoints to delete' + (what ? ' in ' + what : '') + '.'); return; }
+        const keys = new Set(bpList.map(bpKey));
+        const rem = vscode.debug.breakpoints.filter(b => b instanceof vscode.SourceBreakpoint && keys.has(bpKey(b)));
+        if (!rem.length) return;
+        const pick = await vscode.window.showWarningMessage('Delete all ' + rem.length + ' breakpoint' + (rem.length === 1 ? '' : 's') + (what ? ' in ' + what : '') + '?', { modal: true }, 'Delete');
+        if (pick === 'Delete') vscode.debug.removeBreakpoints(rem);
     }
     async function editBpLine(node) {
         const L = node && node.ln;
@@ -5517,6 +5608,19 @@ function activate(context) {
             if (watchBpList.length)
                 setTimeout(() => s.customRequest('oricSetWatchpoints', { watchpoints: watchBpList.map(toAdapterWp) }).catch(() => {}), 450);
         }),
+        vscode.commands.registerCommand('oric-debug.runAutomationScript', async () => {
+            const files = await vscode.workspace.findFiles('**/automation/*.js', '**/node_modules/**', 100);
+            if (!files.length) { vscode.window.showInformationMessage('No automation scripts. Create <project>/automation/<name>.js  (module.exports = async (t) => { … }).'); return; }
+            files.sort((a, b) => a.fsPath.localeCompare(b.fsPath));
+            const pick = await vscode.window.showQuickPick(
+                files.map(f => ({ label: nodePath.basename(f.fsPath), description: vscode.workspace.asRelativePath(f), fsPath: f.fsPath })),
+                { title: 'Run Oric automation script', ignoreFocusOut: true });
+            if (pick) runAutomationScript(pick.fsPath);
+        }),
+        vscode.commands.registerCommand('oric-debug.stopAutomationScript', () => {
+            if (automationRunning) { automationRunning._cancel(); vscode.window.showInformationMessage('Oric automation: stopping…'); }
+            else vscode.window.showInformationMessage('No Oric automation script is running.');
+        }),
         vscode.commands.registerCommand('oric-debug.addWatchpoint', () => addWatchpointFlow()),
         vscode.commands.registerCommand('oric-debug.removeWatchpoint', node => removeWatchpoint(node)),
         vscode.commands.registerCommand('oric-debug.editWatchpoint', node => editWatchpoint(node)),
@@ -5528,6 +5632,10 @@ function activate(context) {
         vscode.commands.registerCommand('oric-debug.bpDisableFile', node => { if (node && node.file) setBpsEnabled(fileBps(node.file), false); }),
         vscode.commands.registerCommand('oric-debug.bpEnableAll', () => setBpsEnabled(allBps(), true)),
         vscode.commands.registerCommand('oric-debug.bpDisableAll', () => setBpsEnabled(allBps(), false)),
+        // Delete-all (with confirmation) — clean up a pile of test breakpoints in one go.
+        vscode.commands.registerCommand('oric-debug.bpRemoveFile', node => { if (node && node.file) removeBpsConfirmed(fileBps(node.file), node.file.name); }),
+        vscode.commands.registerCommand('oric-debug.bpRemoveModule', node => { if (node && node.mod) removeBpsConfirmed(modBps(node.mod), node.mod.name); }),
+        vscode.commands.registerCommand('oric-debug.bpRemoveAll', () => removeBpsConfirmed(allBps(), null)),
         // Edit from the panel: line row -> pick which property; detail row -> edit
         // that property directly; plus remove.
         vscode.commands.registerCommand('oric-debug.bpEdit', editBpLine),
@@ -5634,7 +5742,10 @@ function activate(context) {
     context.subscriptions.push(
         snapTree,
         vscode.window.registerFileDecorationProvider(snapDecoProvider),
-        vscode.debug.onDidReceiveDebugSessionCustomEvent(e => { if (e.event === 'oricSnapshotsChanged') refreshSnapshots(); }),
+        vscode.debug.onDidReceiveDebugSessionCustomEvent(e => {
+            if (e.event === 'oricSnapshotsChanged') refreshSnapshots();
+            else if (e.event === 'oricSignal') automationEvents.fire({ type: 'signal', id: e.body && e.body.id, pc: e.body && e.body.pc });
+        }),
         vscode.debug.onDidStartDebugSession(() => setTimeout(refreshSnapshots, 300)),
         vscode.debug.onDidTerminateDebugSession(() => refreshSnapshots()),
         vscode.commands.registerCommand('oric-debug.snapshotRefresh', () => refreshSnapshots()),
@@ -5854,7 +5965,7 @@ function activate(context) {
     const regsProvider = new RegistersWebviewProvider();
     const periphProvider = new PeripheralsWebviewProvider();
     // Grey the live-data views when the debugger isn't stopped (see setOricDebugStopped).
-    dimLiveViews = () => { regsProvider.markStale(); periphProvider.markStale(); markInstrStale(); refreshWatchValues(null); };
+    dimLiveViews = () => { regsProvider.markStale(); periphProvider.markStale(); markInstrStale(); refreshWatchValues(null); setMemoryPanelsStale(true); };
 
     debugControlsProvider = new DebugControlsWebviewProvider();
     context.subscriptions.push(
@@ -6109,9 +6220,9 @@ function activate(context) {
                         try { fs.unlinkSync(tmpFile); } catch (_) {}
                     });
                 } else if (msg.type === 'oricKey') {
-                    vizSendInput([0x01, 0x02, msg.id & 0xff, msg.down ? 1 : 0]);
+                    vizSendInput(vizProto.keyFrame(msg.id, msg.down));
                 } else if (msg.type === 'oricKeyReleaseAll') {
-                    vizSendInput([0x02, 0x00]);
+                    vizSendInput(vizProto.releaseAllFrame());
                 }
             });
 
@@ -6318,7 +6429,7 @@ function activate(context) {
                     onDidSendMessage(msg) {
                         // Running/stopped state for the line actions (CodeLens + disasm panel).
                         if (msg.type === 'event' && (msg.event === 'stopped' || msg.event === 'continued')) {
-                            setOricDebugStopped(msg.event === 'stopped');
+                            setOricDebugStopped(msg.event === 'stopped', msg.body && msg.body.reason);
                         }
                         if (msg.type === 'event' && msg.event === 'stopped') {
                             // Re-arm persisted ADDRESS breakpoints (ROM / no-source) on the

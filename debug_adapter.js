@@ -2019,6 +2019,9 @@ async function onStopReply(payload) {
                 if (/\[stop\]/i.test(raw)) { forceStop = true; raw = raw.replace(/\s*\[stop\]\s*/ig, ' ').trim(); }
                 const doSnap = /\[save\]/i.test(raw);
                 if (doSnap) raw = raw.replace(/\s*\[save\]\s*/ig, ' ').trim();
+                let sig = null;
+                const sm = raw.match(/\[signal:([^\]]+)\]/i);       // [signal:<id>] — fire a named event a script can await
+                if (sm) { sig = sm[1].trim(); raw = raw.replace(/\s*\[signal:[^\]]+\]\s*/ig, ' ').trim(); }
                 let line;
                 try { line = await interpolateLog(raw); }
                 catch (e) { line = '[watch log error: ' + (e && e.message ? e.message : e) + ']'; }
@@ -2029,6 +2032,7 @@ async function onStopReply(payload) {
                     const sv = await doSaveSnapshot(nm);
                     evt('output', { category: 'console', output: '\x1b[36m' + (sv.error ? '[save failed: ' + sv.error + ']' : '[snapshot saved: ' + sv.name + ']') + '\x1b[0m\n' });
                 }
+                if (sig) evt('oricSignal', { id: sig, addr: ev.addr & 0xFFFF, pc: regs ? regs.pc : undefined });
             }
             if (!forceStop) {
                 resumeMode = 'run';
@@ -2057,10 +2061,14 @@ async function onStopReply(payload) {
                 if (/\[stop\]/i.test(raw)) { forceStop = true; raw = raw.replace(/\s*\[stop\]\s*/ig, ' ').trim(); }
                 const doSnap = /\[save\]/i.test(raw);
                 if (doSnap) raw = raw.replace(/\s*\[save\]\s*/ig, ' ').trim();
+                let sig = null;
+                const sm = raw.match(/\[signal:([^\]]+)\]/i);       // [signal:<id>] — fire a named event a script can await
+                if (sm) { sig = sm[1].trim(); raw = raw.replace(/\s*\[signal:[^\]]+\]\s*/ig, ' ').trim(); }
                 let line;
                 try { line = await interpolateLog(raw); }
                 catch (e) { line = '[logpoint error: ' + (e && e.message ? e.message : e) + ']'; }
                 evt('output', { category: 'console', output: '\x1b[36m' + line + '\x1b[0m\n' });
+                if (sig) evt('oricSignal', { id: sig, pc: regs.pc });
                 if (doSnap) {
                     // Self-describing name: <file>-<func>-L<line>, so it's findable
                     // later (line alone isn't enough). NO sequence — a [save] point
@@ -3300,6 +3308,28 @@ async function sendWatchCond(addr, condExpr) {
     return null;
 }
 
+// Arm a VALUE watch (qOricWatchVal): stop when the byte at `addr` changes and `condExpr`
+// holds, tested against real committed memory — fires no matter HOW it changed (STA/STX/
+// STY/INC/DMA/…), unlike the pre-store Z2 write-watch. The condition is resolved the SAME
+// way as sendWatchCond (C names → memory reads, enum constants → values). This is the
+// "wait until a variable holds a value" primitive used by scripted automation (waitFor).
+async function sendWatchVal(addr, condExpr) {
+    let hex = '';
+    if (condExpr) {
+        const r = resolveCondSymbols(condExpr, null, symbols.get('fp'), symbols.get('ap'));
+        if (r.error) { log('value-watch condition "' + condExpr + '" rejected: ' + r.error); return r.error; }
+        hex = Buffer.from(r.expr, 'utf8').toString('hex');
+    }
+    const rr = await gdbCmd('qOricWatchVal,' + (addr & 0xFFFF).toString(16) + ',' + hex);
+    if (typeof rr === 'string' && rr.indexOf('E cond:') === 0) {
+        const msg = rr.slice(7).trim();
+        log('value-watch condition "' + condExpr + '" rejected: ' + msg);
+        return msg;
+    }
+    return null;
+}
+async function clearWatchVal(addr) { await gdbCmd('qOricWatchValClr,' + (addr & 0xFFFF).toString(16)); }
+
 // --- Watchpoint events (arm / disarm / scope / lookup) ------------------------
 function accessZType(access) { return access === 'read' ? '3' : access === 'readWrite' ? '4' : '2'; }
 // A watchpoint is live when enabled AND its module is active (resident 'R' / null = ANY,
@@ -3389,11 +3419,16 @@ function resolveRomSym(addr) {
     return { name: s.name, offset: addr - s.addr };
 }
 
+// Render a { name, offset } symbol hit as "name+$off" ("name" when offset 0). One place
+// so every label (disassembly, call stack, annotations) formats the offset identically.
+function fmtSymOff(sym) {
+    return sym.offset ? sym.name + '+$' + sym.offset.toString(16).toUpperCase() : sym.name;
+}
+
 // Render an address as a ROM "name+$off" label if a ROM symbol covers it, else null.
 function romLabelFor(addr) {
     const rs = resolveRomSym(addr);
-    if (!rs) return null;
-    return rs.offset ? rs.name + '+$' + rs.offset.toString(16).toUpperCase() : rs.name;
+    return rs ? fmtSymOff(rs) : null;
 }
 
 // ROM symbol name only when one sits EXACTLY at `addr` (a routine entry), for the
@@ -3445,7 +3480,7 @@ function labelFor(addr) {
     addr &= 0xFFFF;
     const r = resolverInstance ? resolverInstance.resolve(addr) : null;
     if (r && r.symbol)
-        return r.symbol.offset ? r.symbol.name + '+$' + r.symbol.offset.toString(16).toUpperCase() : r.symbol.name;
+        return fmtSymOff(r.symbol);
     return '$' + addr.toString(16).toUpperCase().padStart(4, '0');
 }
 
@@ -4228,7 +4263,7 @@ const handlers = {
             // so the call stack can't disagree with the disassembly view (DOGFOODING #1).
             const R = resolverInstance ? resolverInstance.resolve(addr) : null;
             const name = (R && R.symbol)
-                ? (R.symbol.offset ? R.symbol.name + '+$' + R.symbol.offset.toString(16).toUpperCase() : R.symbol.name)
+                ? fmtSymOff(R.symbol)
                 // No build symbol here — fall back to a ROM symbol (e.g. $F785 in a
                 // ROM routine) before showing a bare address.
                 : (romLabelFor(addr) || '$' + addr.toString(16).toUpperCase().padStart(4, '0'));
@@ -5974,6 +6009,50 @@ const handlers = {
       });
     },
 
+    // Transient VALUE watch for scripted automation (waitFor): stop when the byte at
+    // `addr` changes to satisfy `condition`, tested against real committed memory so it
+    // fires regardless of the write mechanism. Separate from the module-scoped, persisted
+    // watchpoint EVENTS above — this one is armed for the duration of a single wait and
+    // cleared after. The caller must have the CPU halted (the stub queues packets behind a
+    // running 'c'); the in-session/standalone ops ensureStopped() before calling.
+    async oricArmValueWatch(req) {
+      return withBpLock(async () => {
+        const addr = (req.arguments.addr | 0) & 0xFFFF;
+        const err = await sendWatchVal(addr, req.arguments.condition || null);
+        respond(req, { armed: !err, error: err || null });
+      });
+    },
+    async oricClearValueWatch(req) {
+      return withBpLock(async () => {
+        await clearWatchVal((req.arguments.addr | 0) & 0xFFFF);
+        respond(req, {});
+      });
+    },
+
+    // Resolve a C symbol / label / enum constant to its address and/or value from the
+    // loaded symbol + enum tables (pure lookup, no stub round-trip — works while the
+    // program is running). Lets automation scripts (and callers) use REAL names
+    // (_gCurrentLocation, e_LOC_LARGE_STAIRCASE) instead of hardcoded addresses/enum
+    // values that silently rot when the game changes. Tolerates the leading underscore
+    // the C compiler adds. Returns { found, addr, value, size, type, enumName }.
+    oricResolve(req) {
+        const name = ((req.arguments && req.arguments.name) || '').trim();
+        if (!name) { respond(req, { found: false }); return; }
+        const ev = enumMemberValue(name);
+        let addr = symbols.get(name);
+        if (addr === undefined && name[0] !== '_') addr = symbols.get('_' + name);
+        let size = null, type = null, enumName = null;
+        if (addr !== undefined) { const spec = renderSpec(name) || renderSpec('_' + name) || {}; size = spec.size || 1; type = spec.type || null; }
+        if (ev !== undefined) enumName = enumOfMember(name);
+        respond(req, {
+            found: ev !== undefined || addr !== undefined,
+            name,
+            addr: addr === undefined ? null : (addr & 0xFFFF),
+            value: ev === undefined ? null : ev,
+            size, type, enumName,
+        });
+    },
+
     // -- Resolve current instruction operands (custom request) --------
 
     async resolveInstruction(req) {
@@ -6477,7 +6556,7 @@ const handlers = {
                     }
                     const R = resolverInstance ? resolverInstance.resolve(paddr) : null;
                     const label = (R && R.symbol)
-                        ? (R.symbol.offset ? R.symbol.name + '+$' + R.symbol.offset.toString(16).toUpperCase() : R.symbol.name)
+                        ? fmtSymOff(R.symbol)
                         : (romLabelFor(paddr) || '');
                     history = { depth, address: paddr, text, label };
                 } else {

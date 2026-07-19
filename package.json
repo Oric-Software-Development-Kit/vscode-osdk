@@ -186,6 +186,31 @@
                 "icon": "$(trash)"
             },
             {
+                "command": "oric-debug.bpRemoveFile",
+                "title": "Oric: Delete All Breakpoints in File",
+                "icon": "$(trash)"
+            },
+            {
+                "command": "oric-debug.bpRemoveModule",
+                "title": "Oric: Delete All Breakpoints in Module",
+                "icon": "$(trash)"
+            },
+            {
+                "command": "oric-debug.bpRemoveAll",
+                "title": "Oric: Delete All Breakpoints",
+                "icon": "$(clear-all)"
+            },
+            {
+                "command": "oric-debug.runAutomationScript",
+                "title": "Oric: Run Automation Script…",
+                "icon": "$(run-all)"
+            },
+            {
+                "command": "oric-debug.stopAutomationScript",
+                "title": "Oric: Stop Automation Script",
+                "icon": "$(debug-stop)"
+            },
+            {
                 "command": "oric-debug.addWatchpoint",
                 "title": "Oric: Add Watchpoint…",
                 "icon": "$(eye)"
@@ -406,6 +431,7 @@
                 { "command": "oric-debug.addWatchpoint", "when": "view == oricBreakpoints", "group": "navigation@0" },
                 { "command": "oric-debug.bpEnableAll", "when": "view == oricBreakpoints", "group": "navigation@1" },
                 { "command": "oric-debug.bpDisableAll", "when": "view == oricBreakpoints", "group": "navigation@2" },
+                { "command": "oric-debug.bpRemoveAll", "when": "view == oricBreakpoints", "group": "navigation@3" },
                 { "command": "oric-debug.snapshotSave", "when": "view == oricSnapshots", "group": "navigation@1" },
                 { "command": "oric-debug.snapshotRefresh", "when": "view == oricSnapshots", "group": "navigation@2" }
             ],
@@ -420,10 +446,14 @@
                 { "command": "oric-debug.bpDisableModule", "when": "view == oricBreakpoints && viewItem == oricModule", "group": "inline@2" },
                 { "command": "oric-debug.bpEnableModule", "when": "view == oricBreakpoints && viewItem == oricModule", "group": "1_mod@1" },
                 { "command": "oric-debug.bpDisableModule", "when": "view == oricBreakpoints && viewItem == oricModule", "group": "1_mod@2" },
+                { "command": "oric-debug.bpRemoveModule", "when": "view == oricBreakpoints && viewItem == oricModule", "group": "inline@3" },
+                { "command": "oric-debug.bpRemoveModule", "when": "view == oricBreakpoints && viewItem == oricModule", "group": "1_mod@3" },
                 { "command": "oric-debug.bpEnableFile", "when": "view == oricBreakpoints && viewItem == oricFile", "group": "inline@1" },
                 { "command": "oric-debug.bpDisableFile", "when": "view == oricBreakpoints && viewItem == oricFile", "group": "inline@2" },
                 { "command": "oric-debug.bpEnableFile", "when": "view == oricBreakpoints && viewItem == oricFile", "group": "1_mod@1" },
                 { "command": "oric-debug.bpDisableFile", "when": "view == oricBreakpoints && viewItem == oricFile", "group": "1_mod@2" },
+                { "command": "oric-debug.bpRemoveFile", "when": "view == oricBreakpoints && viewItem == oricFile", "group": "inline@3" },
+                { "command": "oric-debug.bpRemoveFile", "when": "view == oricBreakpoints && viewItem == oricFile", "group": "1_mod@3" },
                 { "command": "oric-debug.bpEdit", "when": "view == oricBreakpoints && viewItem == oricBp", "group": "inline@1" },
                 { "command": "oric-debug.bpRemove", "when": "view == oricBreakpoints && viewItem == oricBp", "group": "inline@2" },
                 { "command": "oric-debug.bpEdit", "when": "view == oricBreakpoints && viewItem == oricBp", "group": "1_bp@1" },
