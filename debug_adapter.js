@@ -984,11 +984,11 @@ function hashFile(p) {
     catch (e) { return null; }
 }
 
-// --- Snapshots (SPEC-snapshots.md) --------------------------------------------
-// Snapshots live in a PROJECT subfolder (never the Oricutron folder), tracked by a
-// manifest that records the debugged binary's checksum. They're invalidated when
-// the binary hash changes — NOT the timestamp — so editing annotations to aid
-// debugging never throws them away.
+// --- Snapshots (SPEC-snapshot-lifecycle.md) -----------------------------------
+// Snapshots live in a PROJECT subfolder (never the Oricutron folder). The DIRECTORY is the
+// single source of truth: each *.snapshot file is a self-contained, restorable machine state
+// (RAM + disk). There is NO manifest and NO auto-invalidation — a build/disk change never
+// removes them, copying a file in makes it appear, and the save time is the file's mtime.
 function snapshotDir() {
     const base = config.cwd || (config.build && config.build.cwd) || process.cwd();
     return path.join(base, '.oric-snapshots');
@@ -996,31 +996,16 @@ function snapshotDir() {
 function snapshotFile(name) { return path.join(snapshotDir(), name + '.snapshot'); }
 // Tell the extension's snapshot panel to refresh (a DAP custom event).
 function snapshotsChanged() { try { evt('oricSnapshotsChanged', {}); } catch (e) { /* ignore */ } }
-// Save a snapshot to the project folder AND record it in the manifest (so it's
-// listed). Shared by the saveSnapshot request and the [save] logpoint token.
-// Returns { name } or { error }. (captureBaseline stays separate — the baseline is
-// hidden and not manifested.)
+// Save a snapshot to the project folder. The FILE is the record — there is no manifest.
+// Shared by the saveSnapshot request and the [save] logpoint token. Returns { name } or { error }.
 async function doSaveSnapshot(rawName) {
     const name = String(rawName || 'snap').replace(/[^\w.-]/g, '_').slice(0, 64) || 'snap';
     try { fs.mkdirSync(snapshotDir(), { recursive: true }); } catch (e) { /* ignore */ }
     const r = await gdbCmd('qOricSaveSnapshot,' + Buffer.from(snapshotFile(name), 'utf8').toString('hex'));
     if (typeof r === 'string' && r.indexOf('E snapshot') === 0) return { error: r.slice(2).trim() };
-    const m = readSnapshotManifest();
-    m.hash = launchArtifactHash || m.hash;
-    m.snaps = m.snaps || {};
-    m.snaps[name] = { pc: regs ? regs.pc : null, at: Date.now() };
-    writeSnapshotManifest(m);
     log('Snapshot saved: ' + name);
     snapshotsChanged();
     return { name };
-}
-function readSnapshotManifest() {
-    try { return JSON.parse(fs.readFileSync(path.join(snapshotDir(), 'manifest.json'), 'utf8')); }
-    catch (e) { return { hash: null, snaps: {} }; }
-}
-function writeSnapshotManifest(m) {
-    try { fs.mkdirSync(snapshotDir(), { recursive: true }); fs.writeFileSync(path.join(snapshotDir(), 'manifest.json'), JSON.stringify(m, null, 2)); }
-    catch (e) { log('snapshot manifest write failed: ' + e.message); }
 }
 // The reserved baseline snapshot: captured once at the program entry (loaded, before
 // the first continue) so Restart can reload it instantly instead of rebooting +
@@ -1034,29 +1019,16 @@ async function captureBaseline() {
     log('Captured restart baseline snapshot at the entry');
 }
 
-// Delete EVERY snapshot (incl. the restart baseline) and reset the manifest to
-// `newHash`. Snapshots hold the OLD program's RAM, so a binary change makes them
-// all unusable. Returns how many user snapshots were removed.
-function discardAllSnapshots(newHash) {
-    const m = readSnapshotManifest();
-    const names = Object.keys(m.snaps || {});
-    for (const n of names) { try { fs.unlinkSync(snapshotFile(n)); } catch (e) { /* ignore */ } }
-    try { fs.unlinkSync(snapshotFile(BASELINE)); } catch (e) { /* ignore */ }
-    writeSnapshotManifest({ hash: newHash || null, snaps: {} });
-    baselineReady = false;   // the baseline is gone too — no instant restart until re-captured
-    snapshotsChanged();
-    return names.length;
-}
+// NOTE: there is deliberately NO "discard all snapshots" primitive. User snapshots are
+// self-contained and must never be bulk-deleted by an automatic path (staleness, rebuild,
+// launch). The only snapshot removals are: invalidateBaseline (the internal baseline only)
+// and the single, explicit user "delete this snapshot" command. See SPEC-snapshot-lifecycle.md.
 
-// Drop snapshots taken against a DIFFERENT binary (by checksum). Called at launch.
-function pruneStaleSnapshots() {
-    if (!launchArtifactHash) return;
-    const m = readSnapshotManifest();
-    if (m.hash && m.hash !== launchArtifactHash) {
-        log('Snapshots invalidated (binary changed) — cleared ' + discardAllSnapshots(launchArtifactHash));
-    } else if (m.hash !== launchArtifactHash) {
-        writeSnapshotManifest({ hash: launchArtifactHash, snaps: m.snaps || {} });
-    }
+// Invalidate ONLY the restart baseline (the build-specific entry state). User snapshots are
+// self-contained files and are NEVER auto-deleted. The next launch re-captures the baseline.
+function invalidateBaseline() {
+    try { fs.unlinkSync(snapshotFile(BASELINE)); } catch (e) { /* already gone */ }
+    baselineReady = false;
 }
 
 // Re-parse the symbol FILE in place (new enum members / types / symbols from a
@@ -3891,8 +3863,7 @@ const handlers = {
         // projects have no diskImage). Without this the hash is null and snapshot
         // invalidation is inert.
         launchArtifactPath = config.diskImage || (config.build && config.build.output) || null;
-        launchArtifactHash = launchArtifactPath ? hashFile(launchArtifactPath) : null;
-        pruneStaleSnapshots();   // drop snapshots taken against a different binary (checksum, not timestamp)
+        launchArtifactHash = launchArtifactPath ? hashFile(launchArtifactPath) : null;   // reloadsymbols uses this; NOT for snapshots
 
         // --- Step 1: Build if stale ---
         if (config.build) {
@@ -4154,8 +4125,11 @@ const handlers = {
             if (nowHash && nowHash !== launchArtifactHash) { binaryChanged = true; launchArtifactHash = nowHash; }
         }
         if (binaryChanged) {
-            const n = discardAllSnapshots(launchArtifactHash);
-            log('Binary changed on restart — discarded all snapshots' + (n ? ' (' + n + ' user)' : '') + '; relaunching to load the new build');
+            // The entry baseline is the OLD build's state — invalidate just that (re-captured on
+            // relaunch). User snapshots are self-contained files, so they are KEPT (never
+            // discarded on a rebuild).
+            invalidateBaseline();
+            log('Binary changed on restart — kept saved snapshots (self-contained); relaunching to load the new build');
             // A hard reset can't reload a tape program (and doesn't reliably
             // re-autoload one), so it would reboot to ROM/BASIC without the new
             // build. Do an explicit relaunch — kill this emulator and re-spawn +
@@ -5741,9 +5715,6 @@ const handlers = {
         if (!to) { respond(req, {}, false, 'invalid new name'); return; }
         try { fs.renameSync(snapshotFile(from), snapshotFile(to)); }
         catch (e) { respond(req, {}, false, 'rename failed: ' + e.message); return; }
-        const m = readSnapshotManifest();
-        if (m.snaps && m.snaps[from]) { m.snaps[to] = m.snaps[from]; delete m.snaps[from]; }
-        writeSnapshotManifest(m);
         snapshotsChanged();
         respond(req, { name: to });
     },
@@ -5762,20 +5733,21 @@ const handlers = {
         evt('stopped', { reason: 'restore', threadId: 1, allThreadsStopped: true });
     },
     listSnapshots(req) {
-        const m = readSnapshotManifest();
-        const snaps = Object.keys(m.snaps || {})
-            .filter(n => n.indexOf('__') !== 0)   // hide reserved snapshots (the restart baseline)
-            .map(n => ({ name: n, pc: m.snaps[n].pc, at: m.snaps[n].at }))
-            .sort((a, b) => (b.at || 0) - (a.at || 0));
-        respond(req, { hash: m.hash, snapshots: snaps });
+        // The directory IS the source of truth (no manifest): each *.snapshot file is a snapshot,
+        // its mtime is when it was saved. Reserved names (__baseline) are hidden.
+        let snaps = [];
+        try {
+            snaps = fs.readdirSync(snapshotDir())
+                .filter(f => f.endsWith('.snapshot') && f.indexOf('__') !== 0)
+                .map(f => { let at = 0; try { at = Math.round(fs.statSync(path.join(snapshotDir(), f)).mtimeMs); } catch (e) { /* keep 0 */ } return { name: f.slice(0, -('.snapshot'.length)), at }; })
+                .sort((a, b) => (b.at || 0) - (a.at || 0));
+        } catch (e) { /* no snapshot dir yet */ }
+        respond(req, { snapshots: snaps });
     },
     async deleteSnapshot(req) {
         const name = req.arguments && req.arguments.name;
         if (!name) { respond(req, {}, false, 'No snapshot name'); return; }
         try { fs.unlinkSync(snapshotFile(name)); } catch (e) { /* already gone */ }
-        const m = readSnapshotManifest();
-        if (m.snaps) delete m.snaps[name];
-        writeSnapshotManifest(m);
         snapshotsChanged();
         respond(req, { name });
     },

@@ -6168,7 +6168,6 @@ function activate(context) {
     // Lists the project's snapshots (from the adapter). Restore on click, inline
     // restore/delete/rename; refreshes on the adapter's oricSnapshotsChanged event
     // (covers the [save] logpoint token) and on session start/stop.
-    let snapItems = [];
     const snapEmitter = new vscode.EventEmitter();
     // Gray the snapshot rows when there's no session (a TreeView can't be CSS-dimmed like a
     // webview, but a FileDecorationProvider can tint the labels with a themed disabled color).
@@ -6180,35 +6179,56 @@ function activate(context) {
             return { color: new vscode.ThemeColor('disabledForeground') };
         }
     };
-    async function refreshSnapshots() {
+    // The .oric-snapshots directory is the source of truth — read it directly so snapshots show
+    // even with NO active session (you can then start one FROM a snapshot). mtime = save time.
+    function snapshotsFolder() {
+        const fsx = require('fs');
         const s = vscode.debug.activeDebugSession;
-        // No session: KEEP the last listed snapshots visible (they're files on disk) rather
-        // than clearing to a placeholder — you can still see what you had; restore just needs
-        // a session (its command is gated). Only a live session re-lists them.
-        if (!s || s.type !== 'oric-debug') { snapEmitter.fire(); return; }
-        try { const r = await s.customRequest('listSnapshots'); snapItems = (r && r.snapshots) || []; }
-        catch (e) { /* session dying (query threw) → keep the last list, don't clear */ }
-        snapEmitter.fire();
+        const cfg = s && s.configuration;
+        const bases = [];
+        const cwd = cfg && (cfg.cwd || (cfg.build && cfg.build.cwd));
+        if (cwd) bases.push(cwd);
+        for (const f of (vscode.workspace.workspaceFolders || [])) bases.push(f.uri.fsPath);
+        for (const b of bases) { const d = nodePath.join(b, '.oric-snapshots'); try { if (fsx.existsSync(d)) return d; } catch (_) {} }
+        return null;
     }
+    function listSnapshotsOnDisk() {
+        const fsx = require('fs');
+        const dir = snapshotsFolder();
+        if (!dir) return [];
+        let files = []; try { files = fsx.readdirSync(dir); } catch (_) { return []; }
+        return files.filter(f => f.endsWith('.snapshot') && f.indexOf('__') !== 0)
+            .map(f => { let at = 0; try { at = Math.round(fsx.statSync(nodePath.join(dir, f)).mtimeMs); } catch (_) { /* keep 0 */ } return { name: f.slice(0, -('.snapshot'.length)), at }; })
+            .sort((a, b) => (b.at || 0) - (a.at || 0));
+    }
+    function formatSnapWhen(at) {
+        if (!at) return '';
+        try { return new Date(at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }); }
+        catch (_) { return ''; }
+    }
+    // Just trigger a re-render — getChildren re-reads the folder. (Fired on save/session events.)
+    function refreshSnapshots() { snapEmitter.fire(); }
     const snapTreeProvider = {
         onDidChangeTreeData: snapEmitter.event,
         getChildren() {
-            if (snapItems.length) return snapItems.map(x => ({ kind: 'snap', snap: x }));
-            if (!vscode.debug.activeDebugSession) return [{ kind: 'hint', label: '(start a debug session to see snapshots)' }];
-            return [{ kind: 'hint', label: '(no snapshots — use Save Snapshot)' }];
+            // Read the folder every time (no cache) so the panel is correct on the FIRST render —
+            // initial load / Reload Window with no session — and always matches the actual files.
+            const items = listSnapshotsOnDisk();
+            if (items.length) return items.map(x => ({ kind: 'snap', snap: x }));
+            return [{ kind: 'hint', label: '(no snapshots yet — Save Snapshot during a session)' }];
         },
         getTreeItem(el) {
             if (el.kind === 'hint') { const it = new vscode.TreeItem(el.label); it.contextValue = 'oricSnapHint'; return it; }
             const x = el.snap;
+            const active = !!(vscode.debug.activeDebugSession && vscode.debug.activeDebugSession.type === 'oric-debug');
             const it = new vscode.TreeItem(x.name);
-            const when = x.at ? new Date(x.at).toLocaleTimeString() : '';
-            const pc = x.pc != null ? 'PC $' + (x.pc & 0xFFFF).toString(16).toUpperCase().padStart(4, '0') : '';
-            it.description = [pc, when].filter(Boolean).join('  ·  ');
+            it.description = formatSnapWhen(x.at);   // when it was saved (the file's mtime)
+            it.tooltip = x.name + (x.at ? '\nSaved ' + new Date(x.at).toLocaleString() : '') +
+                (active ? '\nClick to restore into the running session.' : '\nClick to start a session from this snapshot.');
             it.contextValue = 'oricSnap';
-            it.resourceUri = vscode.Uri.from({ scheme: 'oric-snapshot', path: '/' + x.name });  // enables the dim decoration
             it.iconPath = new vscode.ThemeIcon('history');
             it.id = 'snap:' + x.name;
-            // Click restores (the panel's whole point is quick revert).
+            // Click restores into the live session — or STARTS one from this snapshot if none.
             it.command = { command: 'oric-debug.snapshotRestoreItem', title: 'Restore', arguments: [el] };
             return it;
         }
@@ -6226,9 +6246,19 @@ function activate(context) {
         vscode.debug.onDidTerminateDebugSession(() => refreshSnapshots()),
         vscode.commands.registerCommand('oric-debug.snapshotRefresh', () => refreshSnapshots()),
         vscode.commands.registerCommand('oric-debug.snapshotRestoreItem', async node => {
-            const s = snapSession(); if (!s || !node || !node.snap) return;
-            try { await s.customRequest('restoreSnapshot', { name: node.snap.name }); vscode.window.setStatusBarMessage('Oric: restored "' + node.snap.name + '"', 3000); }
-            catch (e) { vscode.window.showErrorMessage('Restore failed: ' + (e && e.message ? e.message : e)); }
+            if (!node || !node.snap) return;
+            const name = node.snap.name;
+            let s = snapSession();
+            const starting = !s;
+            if (!s) {   // no session → start one (F5-equivalent), then load the snapshot into it
+                s = await startOricDebugSession(() => {});
+                if (!s) return;   // startOricDebugSession already reported why
+                await new Promise(r => setTimeout(r, 400));   // let the entry stop settle before loading
+            }
+            try {
+                await s.customRequest('restoreSnapshot', { name });
+                vscode.window.setStatusBarMessage('Oric: ' + (starting ? 'started from' : 'restored') + ' "' + name + '"', 3000);
+            } catch (e) { vscode.window.showErrorMessage((starting ? 'Start from snapshot' : 'Restore') + ' failed: ' + (e && e.message ? e.message : e)); }
         }),
         vscode.commands.registerCommand('oric-debug.snapshotDeleteItem', async node => {
             const s = snapSession(); if (!s || !node || !node.snap) return;
