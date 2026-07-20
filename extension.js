@@ -3258,22 +3258,27 @@ async function runAutomationScript(scriptPath) {
     // prompt for a launch config it doesn't need). Fresh each run: bust the require cache for the
     // script AND every sibling module in its folder (helpers in automation/lib/), so editing a
     // helper reloads without a window reload.
-    let scriptFn;
+    let mod;
     try {
         const dir = canonPath(nodePath.dirname(scriptPath)) + nodePath.sep;
         for (const k of Object.keys(require.cache)) { if (canonPath(k).startsWith(dir)) delete require.cache[k]; }
-        scriptFn = require(scriptPath);
+        mod = require(scriptPath);
     }
     catch (e) { vscode.window.showErrorMessage('Automation script load error: ' + (e && e.message ? e.message : e)); return; }
-    if (typeof scriptFn !== 'function' && scriptFn && typeof scriptFn.default === 'function') scriptFn = scriptFn.default;
-    if (typeof scriptFn !== 'function') { vscode.window.showErrorMessage('An automation script must be:  module.exports = async (t) => { ... }'); return; }
-    // Optional metadata on the exported function:
-    //   .session = 'existing' → run in the CURRENT debug session (a utility — never launches);
-    //            | 'fresh'    → needs a freshly-launched emulator (confirms a restart if one runs);
-    //            | 'any'      → (default) reuse the running session, else launch one.
-    //   .config  = name of the launch.json oric-debug config to launch (skips the picker).
-    const need = scriptFn.session || 'any';
-    const wantConfig = scriptFn.config || null;
+    // A script exports EITHER a function directly, OR an object `{ run, session, config }` — the
+    // object form lets the metadata sit at the TOP of the file (a bare `module.exports = fn`
+    // assignment can't, since it would overwrite any properties set before it).
+    const scriptFn = (typeof mod === 'function') ? mod
+        : (mod && typeof mod.default === 'function') ? mod.default
+        : (mod && typeof mod.run === 'function') ? mod.run : null;
+    if (typeof scriptFn !== 'function') { vscode.window.showErrorMessage('An automation script must export a function:  module.exports = async (t) => { … }   — or an object  module.exports = { run: async (t) => { … }, session, config }.'); return; }
+    // Optional metadata, read from the object OR the function:
+    //   session = 'existing' → run in the CURRENT debug session (a utility — never launches);
+    //           | 'fresh'    → needs a freshly-launched emulator (confirms a restart if one runs);
+    //           | 'any'      → (default) reuse the running session, else launch one.
+    //   config  = name of the launch.json oric-debug config to launch (skips the picker).
+    const need = (mod && mod.session) || scriptFn.session || 'any';
+    const wantConfig = (mod && mod.config) || scriptFn.config || null;
     const chan = automationChannel(); chan.clear(); chan.show(true);
     let session = vscode.debug.activeDebugSession;
     const haveSession = !!(session && session.type === 'oric-debug');

@@ -282,18 +282,20 @@ Automation Script…** from the palette. Running one **starts a debug session if
 re-run — the whole `automation/` folder is reloaded each time, so scripts *and* their `lib/`
 helpers iterate live. Stopping the debug session also stops the script.
 
-**How ▶ Run gets a session** — a script can declare its need with optional metadata, so Run doesn't prompt for a launch config it doesn't require:
+**How ▶ Run gets a session** — a script declares its need as metadata, so Run doesn't prompt for a launch config it doesn't require. Put it at the **top** with the object form (metadata can't sit above a bare `module.exports = fn`, which would overwrite it):
 
 ```js
-module.exports = async (t) => { … };
-module.exports.session = 'existing';   // run in the CURRENT session — a utility, never launches
-                                       //   (e.g. "screenshot + snapshot + dump some vars" while debugging)
-module.exports.session = 'fresh';      // needs a freshly-launched emulator; confirms a restart if one is running
-module.exports.session = 'any';        // (default) reuse the running session, else launch one
-module.exports.config  = 'Build & Debug';  // which launch.json config to launch (skips the picker)
+module.exports = {
+    session: 'any',          // reuse the running session, else launch one   (default)
+    config: 'Build & Run',   // when launching, use this config — skips the picker
+    run: async (t) => { … }, // the script
+};
 ```
 
-If a launch *is* needed and no `config` is named, Run uses the only config, else the one you last picked (remembered) — it prompts at most once. A `session:'existing'` utility that finds no active session tells you to start one rather than launching.
+- **`session`**: `'existing'` (run in the CURRENT session — a **utility**, never launches; e.g. "screenshot + snapshot + dump some vars" while debugging) · `'fresh'` (needs a freshly-launched emulator; confirms a restart if one is running) · `'any'` (default: reuse the running session, else launch).
+- **`config`**: the launch.json config to launch, skipping the picker. Prefer a **run** (not debug/paused) config for playthroughs — starting paused just makes the script continue past the stop. If `config` is omitted and a launch is needed, Run uses the only config, else the one you last picked (remembered) — prompting at most once.
+
+A plain `module.exports = async (t) => { … }` also works (attach metadata *after* it: `module.exports.session = …`); the object form is just how you get the metadata to the top.
 
 ### The `t` API
 
