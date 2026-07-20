@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <!-- Oric mark: the "O" (theme-tinted, so it also reads when VS Code renders the icon
+       monochrome) with the logo's two red strokes — a diagonal through the O and an
+       underline. On webview tabs (color) the red shows; on native view headers it tints. -->
+  <circle cx="10" cy="9.5" r="6" stroke="currentColor" stroke-width="2.4"/>
+  <line x1="4.6" y1="14.9" x2="15.4" y2="4.1" stroke="#e4002b" stroke-width="2.4" stroke-linecap="round"/>
+  <line x1="3" y1="20.2" x2="21" y2="20.2" stroke="#e4002b" stroke-width="2.4" stroke-linecap="round"/>
+</svg>

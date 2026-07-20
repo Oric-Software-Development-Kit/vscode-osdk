@@ -75,9 +75,36 @@
                     "type": "boolean",
                     "default": true,
                     "description": "In the Oric Breakpoints panel, expand the active overlay module's section and collapse the others as the active module changes. The active module is always highlighted regardless of this setting."
+                },
+                "oric-debug.colorSourceFilesByType": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Tint file-name labels (editor tabs and Explorer) by type: C source (.c) green, headers (.h) teal, assembler (.s/.asm) blue, automation scripts (.js) violet. Colors are the oric.* theme colors (override them in workbench.colorCustomizations)."
                 }
             }
         },
+        "colors": [
+            {
+                "id": "oric.cFileColor",
+                "description": "Label tint for C source files (.c) in tabs/Explorer.",
+                "defaults": { "dark": "#73c990", "light": "#2ea043", "highContrast": "#73c990", "highContrastLight": "#2ea043" }
+            },
+            {
+                "id": "oric.headerFileColor",
+                "description": "Label tint for header files (.h — shared by C and assembler) in tabs/Explorer. Muted gray: headers are just declarations.",
+                "defaults": { "dark": "#9d9d9d", "light": "#6e6e6e", "highContrast": "#9d9d9d", "highContrastLight": "#6e6e6e" }
+            },
+            {
+                "id": "oric.asmFileColor",
+                "description": "Label tint for assembler files (.s/.asm) in tabs/Explorer.",
+                "defaults": { "dark": "#6cb6ff", "light": "#0969da", "highContrast": "#6cb6ff", "highContrastLight": "#0969da" }
+            },
+            {
+                "id": "oric.scriptFileColor",
+                "description": "Label tint for automation scripts (.js) in tabs/Explorer. Violet, kept clear of git-modified orange.",
+                "defaults": { "dark": "#c586c0", "light": "#8250df", "highContrast": "#c586c0", "highContrastLight": "#8250df" }
+            }
+        ],
         "languages": [
             {
                 "id": "osdk",
@@ -110,36 +137,43 @@
                 {
                     "id": "oricDebugControls",
                     "name": "Oric Debug Controls",
-                    "type": "webview"
+                    "type": "webview",
+                    "icon": "images/oric.svg"
                 },
                 {
                     "id": "oricCpuRegs",
                     "name": "Oric Registers",
-                    "type": "webview"
+                    "type": "webview",
+                    "icon": "images/oric.svg"
                 },
                 {
                     "id": "oricPeripherals",
                     "name": "Oric Peripherals",
-                    "type": "webview"
+                    "type": "webview",
+                    "icon": "images/oric.svg"
                 },
                 {
                     "id": "oricBreakpoints",
-                    "name": "Oric Breakpoints"
+                    "name": "Oric Breakpoints",
+                    "icon": "images/oric.svg"
                 },
                 {
                     "id": "oricSnapshots",
-                    "name": "Oric Snapshots"
+                    "name": "Oric Snapshots",
+                    "icon": "images/oric.svg"
                 },
                 {
                     "id": "oricAutomation",
-                    "name": "Oric Automation"
+                    "name": "Oric Automation",
+                    "icon": "images/oric.svg"
                 }
             ],
             "oricDebugPanel": [
                 {
                     "id": "oricCurrentInstr",
                     "name": "Current Instruction",
-                    "type": "webview"
+                    "type": "webview",
+                    "icon": "images/oric.svg"
                 }
             ]
         },

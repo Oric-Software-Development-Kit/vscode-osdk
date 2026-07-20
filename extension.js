@@ -64,6 +64,12 @@ const vizProto = require('./mcp/oric-viz-protocol.cjs');
 const { createBridgeServer } = require('./mcp/bridge-server.cjs');
 const { CONTROL: BRIDGE_CONTROL, DISCOVERY_FILE } = require('./mcp/oric-bridge-protocol.cjs');
 const { VIZ_PORT_OFFSET } = vizProto;   // viz port = gdb port + 1
+// Per-panel editor-tab icons (SVGs in images/). Webview iconPath needs a Uri, not a built-in
+// codicon, so each panel gets a small purpose glyph (screen / memory grid / heat grid / disasm
+// listing / search / book). Note: webview tab icons do NOT resolve `currentColor` to the theme
+// (it falls back to black), so the SVGs are drawn white to stay visible on the dark theme. VS Code
+// caches these icons by PATH, so the files are versioned (-v2) — bump the suffix if a glyph changes.
+const panelIcon = name => vscode.Uri.file(nodePath.join(nodePath.dirname(__filename), 'images', name + '.svg'));
 // Only the field sizes the frame DECODER below needs (framing itself lives in the module).
 const VIZ_SCR_SIZE = vizProto.SCR_SIZE;
 const VIZ_VIDBASES_SIZE = vizProto.VIZ_VIDBASES;
@@ -439,6 +445,7 @@ function createMemoryPanel(context) {
 // any restored entries. Shared by createMemoryPanel and the reload serializer so
 // both behave identically (DRY).
 function wireMemoryPanel(panel, initialEntries) {
+    panel.iconPath = panelIcon('panel-memory-v2');   // tab glyph (create + reload both call this)
     const state = { entries: [], results: [] };
     for (const e of (initialEntries || [])) {
         if (!e || !e.expression) continue;
@@ -765,6 +772,7 @@ function createXaReferencePanel() {
         'xaReference', 'XA Quick Reference',
         vscode.ViewColumn.One, { enableScripts: true }
     );
+    panel.iconPath = panelIcon('panel-reference-v2');
     panel.webview.html = xaReferenceHtml();
     return panel;
 }
@@ -907,6 +915,7 @@ function create6502ReferencePanel() {
         'opcodeReference', '6502 Opcode Reference',
         vscode.ViewColumn.One, { enableScripts: true }
     );
+    panel.iconPath = panelIcon('panel-reference-v2');
     panel.webview.html = opcodeReferenceHtml();
     return panel;
 }
@@ -1537,7 +1546,7 @@ function createHeatmapPanel() {
         vizUnregisterConsumer(heatmapConsumer);
     });
 
-    heatmapPanel = panel;
+    heatmapPanel = panel; panel.iconPath = panelIcon('panel-heatmap-v2');
     panel.webview.html = heatmapPanelHtml();
     vizRegisterConsumer(heatmapConsumer);
 
@@ -1923,7 +1932,7 @@ function createScreenPanel() {
         vizUnregisterConsumer(screenConsumer);
     });
 
-    screenPanel = panel;
+    screenPanel = panel; panel.iconPath = panelIcon('panel-screen-v2');
     panel.webview.html = screenPanelHtml();
 
     const fs = require('fs');
@@ -3746,6 +3755,7 @@ function createSymbolsPanel(context) {
 // and refresh-on-reveal. Data changed while the panel was hidden reaches only
 // the symbolCache; a panel becoming visible must refetch or it shows stale rows.
 function setupSymbolsPanel(panel) {
+    panel.iconPath = panelIcon('panel-symbols-v2');   // tab glyph (search)
     panel.onDidDispose(() => { symbolsPanel = null; });
     panel.onDidChangeViewState(e => {
         if (e.webviewPanel.visible) {
@@ -3862,6 +3872,7 @@ function refreshSymbolsPanel(session) {
 // its lifecycle + message handler. Shared by createDisasmPanel and the serializer so
 // restored panels are first-class (and receive updates) instead of orphaned.
 function adoptDisasmPanel(panel) {
+    panel.iconPath = panelIcon('panel-disasm-v2');   // tab glyph (code listing)
     disasmPanels.add(panel);
     panel.webview.options = { enableScripts: true, retainContextWhenHidden: true };
     panel.webview.html = disasmPanelHtml();
@@ -6375,6 +6386,33 @@ function activate(context) {
         vscode.commands.registerCommand('oric-debug.automationRefresh', () => autoEmitter.fire())
     );
 
+    // Tint source-file name labels (editor tabs + Explorer) by type — .c green, .h gray, .s/.asm
+    // blue, .js violet — via a FileDecorationProvider (theme colors only; label text, not
+    // background). No type badge: the extension already names the type, and the badge slot is left
+    // for git's M/A/U marks. Toggle with the
+    // oric-debug.colorSourceFilesByType setting; colors are the oric.* theme colors (user-overridable).
+    const fileColorEmitter = new vscode.EventEmitter();
+    const fileColorProvider = {
+        onDidChangeFileDecorations: fileColorEmitter.event,
+        provideFileDecoration(uri) {
+            if (uri.scheme !== 'file') return undefined;
+            if (!vscode.workspace.getConfiguration('oric-debug').get('colorSourceFilesByType', true)) return undefined;
+            const ext = nodePath.extname(uri.fsPath).toLowerCase();
+            // Tint only — no type badge. The extension is already in the name, so
+            // a "JS"/"C" badge would just duplicate it; the badge slot is left for
+            // git's own M/A/U marks, which have no other indicator.
+            if (ext === '.c') return { color: new vscode.ThemeColor('oric.cFileColor'), tooltip: 'C source' };
+            if (ext === '.h') return { color: new vscode.ThemeColor('oric.headerFileColor'), tooltip: 'C / assembler header' };
+            if (ext === '.s' || ext === '.asm') return { color: new vscode.ThemeColor('oric.asmFileColor'), tooltip: '6502 assembler' };
+            if (ext === '.js') return { color: new vscode.ThemeColor('oric.scriptFileColor'), tooltip: 'Automation script' };
+            return undefined;
+        }
+    };
+    context.subscriptions.push(
+        vscode.window.registerFileDecorationProvider(fileColorProvider),
+        vscode.workspace.onDidChangeConfiguration(e => { if (e.affectsConfiguration('oric-debug.colorSourceFilesByType')) fileColorEmitter.fire(undefined); })
+    );
+
     // Re-read source @annotations into the running adapter — no rebuild, no lost
     // debugger state. Panels/watch refresh via the adapter's oricSymbolsChanged
     // event; refreshAll() also updates registers + the inline instruction hint.
@@ -6772,7 +6810,7 @@ function activate(context) {
     // --- Webview serializers: restore panels after VS Code reload ---
     vscode.window.registerWebviewPanelSerializer('oricHeatmap', {
         async deserializeWebviewPanel(panel) {
-            heatmapPanel = panel;
+            heatmapPanel = panel; panel.iconPath = panelIcon('panel-heatmap-v2');
             panel.webview.options = { enableScripts: true, retainContextWhenHidden: true };
             panel.webview.html = heatmapPanelHtml();
             panel.onDidDispose(() => { heatmapPanel = null; vizUnregisterConsumer(heatmapConsumer); });
@@ -6787,7 +6825,7 @@ function activate(context) {
     });
     vscode.window.registerWebviewPanelSerializer('oricScreenView', {
         async deserializeWebviewPanel(panel) {
-            screenPanel = panel;
+            screenPanel = panel; panel.iconPath = panelIcon('panel-screen-v2');
             panel.webview.options = { enableScripts: true, retainContextWhenHidden: true };
             panel.webview.html = screenPanelHtml();
             panel.onDidDispose(() => { screenPanel = null; vizUnregisterConsumer(screenConsumer); });
