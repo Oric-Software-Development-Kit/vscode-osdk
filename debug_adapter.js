@@ -5537,9 +5537,19 @@ const handlers = {
             return;
         }
         const addr = parseInt(evalReply.substring(1), 16);
-        // Read memory
-        const memReply = await gdbCmd('m' + addr.toString(16) + ',' + count.toString(16));
-        respond(req, { address: addr, data: memReply || '', expression: rawExpr });
+        // Read memory in chunks: the stub clamps a single `m` reply to ~4093 bytes, so a
+        // large region (e.g. a 240x128 HIRES buffer = 5120 bytes for the graphic view) would
+        // come back truncated. Read <=2048-byte pieces and concatenate the hex.
+        const CHUNK = 2048;
+        let data = '';
+        for (let off = 0; off < count; off += CHUNK) {
+            const n = Math.min(CHUNK, count - off);
+            const r = await gdbCmd('m' + ((addr + off) & 0xffff).toString(16) + ',' + n.toString(16));
+            if (!r || r[0] === 'E') break;
+            data += r;
+            if (r.length < n * 2) break;   // short read — stop rather than pad with stale hex
+        }
+        respond(req, { address: addr, data, expression: rawExpr });
     },
 
     logToConsole(req) {

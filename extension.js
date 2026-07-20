@@ -426,6 +426,10 @@ const memoryPanels = [];
 let memoryPanelCounter = 0;
 
 function bytesForEntry(entry) {
+    if (entry.format === 'graphic') {
+        const wbytes = entry.w || 40, h = entry.h || 128;   // w = bytes/row (6 px each in HIRES)
+        return wbytes * h;
+    }
     return entry.rows * (entry.format === 'binary' ? 8 : 16);
 }
 
@@ -449,7 +453,8 @@ function wireMemoryPanel(panel, initialEntries) {
     const state = { entries: [], results: [] };
     for (const e of (initialEntries || [])) {
         if (!e || !e.expression) continue;
-        const entry = { expression: e.expression, rows: e.rows || 8, format: e.format || 'hex' };
+        const entry = { expression: e.expression, rows: e.rows || 8, format: e.format || 'hex',
+            w: e.w || 40, h: e.h || 128, grid: !!e.grid, zoom: e.zoom || 2 };   // w = bytes/row
         state.entries.push(entry);
         state.results.push({ ...entry, address: null, data: '', error: null });
     }
@@ -458,7 +463,7 @@ function wireMemoryPanel(panel, initialEntries) {
         if (msg.type === 'add' && msg.expression) {
             const expr = msg.expression.trim();
             if (expr && !state.entries.some(e => e.expression === expr)) {
-                const entry = { expression: expr, rows: 8, format: 'hex' };
+                const entry = { expression: expr, rows: 8, format: 'hex', w: 40, h: 128, grid: false, zoom: 2 };   // w = bytes/row
                 state.entries.push(entry);
                 state.results.push({ ...entry, address: null, data: '', error: null });
                 const session = vscode.debug.activeDebugSession;
@@ -494,6 +499,10 @@ function wireMemoryPanel(panel, initialEntries) {
                 const entry = state.entries[msg.index];
                 if (msg.rows !== undefined) entry.rows = Math.max(1, Math.min(128, msg.rows));
                 if (msg.format !== undefined) entry.format = msg.format;
+                if (msg.w !== undefined) entry.w = Math.max(1, Math.min(512, msg.w | 0));   // bytes/row
+                if (msg.h !== undefined) entry.h = Math.max(1, Math.min(2048, msg.h | 0));  // scanlines
+                if (msg.grid !== undefined) entry.grid = !!msg.grid;
+                if (msg.zoom !== undefined) entry.zoom = Math.max(1, Math.min(16, msg.zoom | 0));
                 const session = vscode.debug.activeDebugSession;
                 if (session && session.type === 'oric-debug') {
                     evaluateOne(session, state, msg.index).then(() => postResults(panel, state));
@@ -585,7 +594,7 @@ body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(
 .entry-hdr .controls { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 .rows-input { width: 38px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #444); padding: 1px 3px; font-family: inherit; font-size: 0.9em; text-align: center; }
 .rows-label { color: var(--vscode-descriptionForeground, #888); font-size: 0.9em; }
-.fmt-select { background: var(--vscode-dropdown-background, var(--vscode-input-background)); color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground)); border: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, #444)); padding: 1px 3px; font-family: inherit; font-size: 0.9em; }
+.fmt-select, .gfx-zoom { background: var(--vscode-dropdown-background, var(--vscode-input-background)); color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground)); border: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, #444)); padding: 1px 3px; font-family: inherit; font-size: 0.9em; }
 .remove { cursor: pointer; color: var(--vscode-descriptionForeground, #888); padding: 0 2px; font-size: 1.2em; }
 .remove:hover { color: var(--vscode-errorForeground, #f44); }
 .dump { white-space: pre; line-height: 1.4; color: var(--vscode-editor-foreground); }
@@ -594,6 +603,12 @@ body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(
 .error { color: var(--vscode-errorForeground, #f44); font-style: italic; }
 .sep { border-top: 1px solid var(--vscode-widget-border, #444); margin: 8px 0; }
 .empty { color: var(--vscode-descriptionForeground, #888); font-style: italic; }
+/* Graphic view controls + canvas */
+.gfx-input { width: 44px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #444); padding: 1px 3px; font-family: inherit; font-size: 0.9em; text-align: center; }
+.gfx-lbl { color: var(--vscode-descriptionForeground, #888); font-size: 0.9em; display: inline-flex; align-items: center; gap: 2px; }
+.gfx-unit { color: var(--vscode-descriptionForeground, #888); font-size: 0.8em; }
+.gfx-wrap { overflow: auto; background: #000; padding: 4px; border: 1px solid var(--vscode-widget-border, #444); display: inline-block; max-width: 100%; }
+.gfx-canvas { display: block; image-rendering: pixelated; }
 /* Dimmed while the emulator is running: memory can only be read when the CPU is halted,
    so these bytes are a snapshot from the last stop, not live. Undims on the next stop.
    Same cue the Registers/Peripherals/Watch views use (STALE_CSS). */
@@ -609,6 +624,57 @@ const vscode = acquireVsCodeApi();
 const input = document.getElementById('exprInput');
 const addBtn = document.getElementById('addBtn');
 const entriesDiv = document.getElementById('entries');
+
+// --- Graphic view: decode Oric HIRES bytes -> pixels (matches Oricutron ula.c) ---
+const PALETTE = [[0,0,0],[255,0,0],[0,255,0],[255,255,0],[0,0,255],[255,0,255],[0,255,255],[255,255,255]];
+// (c & 0x60)==0 => serial attribute: 0x00 ink=c&7, 0x10 paper=c&7 (0x08 text/flash + 0x18
+// mode ignored for a still image). Else 6 pixels from c & 0x3f (bit 5 = leftmost), inverse
+// = c & 0x80 (swap ink/paper). ink/paper reset per row — a future pass adds an override for
+// pixel-only buffers copied in attribute-preserve mode.
+function hiresDecode(hex, w, h, stride) {
+    const out = new Uint8Array(w * h);
+    for (let row = 0; row < h; row++) {
+        let fg = 7, bg = 0, x = 0;
+        for (let col = 0; col < stride && x < w; col++) {
+            const idx = (row * stride + col) * 2;
+            if (idx + 1 >= hex.length) break;
+            const c = parseInt(hex.substring(idx, idx + 2), 16);
+            if ((c & 0x60) === 0) {
+                const a = c & 0x18;
+                if (a === 0x00) fg = c & 7; else if (a === 0x10) bg = c & 7;
+                const blank = (c & 0x80) ? fg : bg;
+                for (let p = 0; p < 6 && x < w; p++) out[row * w + x++] = blank;
+            } else {
+                const inv = (c & 0x80) !== 0, data = c & 0x3f;
+                for (let p = 0; p < 6 && x < w; p++) {
+                    const bit = (data >> (5 - p)) & 1;
+                    out[row * w + x++] = (inv ? !bit : bit) ? fg : bg;
+                }
+            }
+        }
+    }
+    return out;
+}
+function drawGfx(i, r) {
+    const canvas = document.querySelector('.gfx-canvas[data-idx="' + i + '"]');
+    if (!canvas) return;
+    const stride = r.w || 40, h = r.h || 128, zoom = r.zoom || 2;   // stride = bytes/row
+    const w = stride * 6;                                           // pixel width (6 px/byte)
+    const px = hiresDecode(r.data || '', w, h, stride);
+    const off = document.createElement('canvas'); off.width = w; off.height = h;
+    const octx = off.getContext('2d'), img = octx.createImageData(w, h);
+    for (let j = 0; j < w * h; j++) { const c = PALETTE[px[j]] || PALETTE[0], o = j * 4; img.data[o] = c[0]; img.data[o+1] = c[1]; img.data[o+2] = c[2]; img.data[o+3] = 255; }
+    octx.putImageData(img, 0, 0);
+    canvas.width = w * zoom; canvas.height = h * zoom;
+    const ctx = canvas.getContext('2d'); ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(off, 0, 0, w * zoom, h * zoom);
+    if (r.grid) {
+        ctx.strokeStyle = 'rgba(128,128,128,0.4)'; ctx.lineWidth = 1; ctx.beginPath();
+        for (let gx = 0; gx <= w; gx += 6) { const X = gx * zoom + 0.5; ctx.moveTo(X, 0); ctx.lineTo(X, h * zoom); }
+        for (let gy = 0; gy <= h; gy += 8) { const Y = gy * zoom + 0.5; ctx.moveTo(0, Y); ctx.lineTo(w * zoom, Y); }
+        ctx.stroke();
+    }
+}
 
 function addExpr() {
     const expr = input.value.trim();
@@ -688,7 +754,7 @@ function formatDump(address, hexData, rows, format) {
 function renderResults(results) {
     // Persist the entry list so the panel's expressions survive a window reload
     // (the WebviewPanelSerializer receives this state).
-    vscode.setState({ entries: (results || []).map(r => ({ expression: r.expression, rows: r.rows, format: r.format })) });
+    vscode.setState({ entries: (results || []).map(r => ({ expression: r.expression, rows: r.rows, format: r.format, w: r.w, h: r.h, grid: r.grid, zoom: r.zoom })) });
     if (!results || results.length === 0) {
         entriesDiv.innerHTML = '<div class="empty">Add an expression to view memory</div>';
         return;
@@ -697,8 +763,8 @@ function renderResults(results) {
     results.forEach((r, i) => {
         if (i > 0) html += '<div class="sep"></div>';
         const addrStr = r.address !== null ? ' \\u2192 $' + r.address.toString(16).toUpperCase().padStart(4, '0') : '';
-        const fmtOpts = ['hex','words','decimal','binary'];
-        const fmtLabels = ['Hex','Words','Decimal','Binary'];
+        const fmtOpts = ['hex','words','decimal','binary','graphic'];
+        const fmtLabels = ['Hex','Words','Decimal','Binary','Graphic'];
         let selHtml = '<select class="fmt-select" data-idx="' + i + '" title="Display format">';
         for (let f = 0; f < fmtOpts.length; f++) {
             selHtml += '<option value="' + fmtOpts[f] + '"' + (r.format === fmtOpts[f] ? ' selected' : '') + '>' + fmtLabels[f] + '</option>';
@@ -708,14 +774,26 @@ function renderResults(results) {
         html += '<div class="entry">';
         html += '<div class="entry-hdr">';
         html += '<span class="left"><input class="expr-input" data-idx="' + i + '" data-orig="' + escapeHtml(r.expression) + '" value="' + escapeHtml(r.expression) + '" spellcheck="false" title="Edit expression, Enter to apply (e.g. messagePtr \\u2192 *messagePtr)"><span class="addr">' + addrStr + '</span></span>';
+        const isGfx = r.format === 'graphic';
         html += '<span class="controls">';
-        html += '<input type="number" class="rows-input" data-idx="' + i + '" value="' + r.rows + '" min="1" max="128" title="Number of rows">';
-        html += '<span class="rows-label">rows</span>';
+        if (isGfx) {
+            html += '<span class="gfx-lbl" title="Width in bytes (6 pixels each)">W<input type="number" class="gfx-input gfx-w" data-idx="' + i + '" value="' + (r.w || 40) + '" min="1" max="512"><span class="gfx-unit">B</span></span>';
+            html += '<span class="gfx-lbl" title="Height in scanlines">H<input type="number" class="gfx-input gfx-h" data-idx="' + i + '" value="' + (r.h || 128) + '" min="1" max="2048"></span>';
+            html += '<label class="gfx-lbl"><input type="checkbox" class="gfx-grid" data-idx="' + i + '"' + (r.grid ? ' checked' : '') + '> grid</label>';
+            html += '<select class="gfx-zoom" data-idx="' + i + '" title="Zoom">';
+            [1,2,3,4].forEach(z => { html += '<option value="' + z + '"' + ((r.zoom || 2) === z ? ' selected' : '') + '>' + z + 'x</option>'; });
+            html += '</select>';
+        } else {
+            html += '<input type="number" class="rows-input" data-idx="' + i + '" value="' + r.rows + '" min="1" max="128" title="Number of rows">';
+            html += '<span class="rows-label">rows</span>';
+        }
         html += selHtml;
         html += '<span class="remove" data-idx="' + i + '" title="Remove">\\u00d7</span>';
         html += '</span></div>';
         if (r.error) {
             html += '<div class="error">' + escapeHtml(r.error) + '</div>';
+        } else if (isGfx) {
+            html += '<div class="gfx-wrap"><canvas class="gfx-canvas" data-idx="' + i + '"></canvas></div>';
         } else {
             html += '<div class="dump">' + formatDump(r.address, r.data, r.rows, r.format) + '</div>';
         }
@@ -753,6 +831,16 @@ function renderResults(results) {
         });
         el.addEventListener('blur', commit);
     });
+    // Graphic entries: draw the canvas, and wire the W/H/grid/zoom controls.
+    results.forEach((r, i) => { if (r.format === 'graphic' && !r.error) drawGfx(i, r); });
+    document.querySelectorAll('.gfx-w').forEach(el => el.addEventListener('change', () =>
+        vscode.postMessage({ type: 'configure', index: parseInt(el.dataset.idx), w: parseInt(el.value) || 40 })));
+    document.querySelectorAll('.gfx-h').forEach(el => el.addEventListener('change', () =>
+        vscode.postMessage({ type: 'configure', index: parseInt(el.dataset.idx), h: parseInt(el.value) || 128 })));
+    document.querySelectorAll('.gfx-grid').forEach(el => el.addEventListener('change', () =>
+        vscode.postMessage({ type: 'configure', index: parseInt(el.dataset.idx), grid: el.checked })));
+    document.querySelectorAll('.gfx-zoom').forEach(el => el.addEventListener('change', () =>
+        vscode.postMessage({ type: 'configure', index: parseInt(el.dataset.idx), zoom: parseInt(el.value) || 2 })));
 }
 
 window.addEventListener('message', e => {
