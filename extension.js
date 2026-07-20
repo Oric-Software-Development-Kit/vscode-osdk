@@ -5076,17 +5076,20 @@ function stopMcpBridge() {
 // "registered AND proven healthy — N tools", not just a file written. We can't force Claude Code
 // to ingest it (it reads .mcp.json at session start), so we tell the user to run /mcp / restart.
 // Pre-approve the Oric MCP server's tools in the project's Claude settings so the assistant
-// isn't prompted ("Do you want to proceed?") on every call. The ONLY allow-rule form that
-// auto-approves a whole server is the anchored wildcard `mcp__<name>__*` — a bare `mcp__<name>`
-// is an UNANCHORED allow glob that Claude Code silently ignores (which is why per-tool prompts
-// kept coming back). We drop that ineffective bare rule + any now-redundant per-tool rules a
-// prior "don't ask again" left behind, and write the single wildcard. Written to
-// .claude/settings.json. Non-fatal — returns {ok,error} for the caller.
-function addMcpAllowRule(folderFsPath, serverName) {
+// isn't prompted ("Do you want to proceed?") on every call. Belt-and-braces, because behaviour
+// has varied across Claude Code builds: we write BOTH documented server-wide forms — the bare
+// `mcp__<name>` and the anchored wildcard `mcp__<name>__*` (each documented to match all of a
+// server's tools) — AND an exact `mcp__<name>__<tool>` for every current tool. Exact entries are
+// the one form that has worked on every build; the server-wide forms also cover tools added
+// later. Any prior per-tool "don't ask again" rules for this server are collapsed into this set.
+// IMPORTANT: Claude Code loads permissions at SESSION START — a FRESH session is required for
+// this to take effect. Written to .claude/settings.json. Non-fatal — returns {ok,error}.
+function addMcpAllowRule(folderFsPath, serverName, toolNames) {
     const fs = require('fs'); const path = require('path');
     const prefix = 'mcp__' + serverName + '__';   // e.g. mcp__oric__
-    const wildcard = prefix + '*';                 // mcp__oric__*  — the correct, future-proof rule
-    const bare = 'mcp__' + serverName;             // mcp__oric  — unanchored glob, silently ignored (remove)
+    const wildcard = prefix + '*';                 // mcp__oric__*  (anchored wildcard)
+    const bare = 'mcp__' + serverName;             // mcp__oric     (bare server)
+    const tools = Array.isArray(toolNames) ? toolNames : [];
     const dir = path.join(folderFsPath, '.claude');
     const file = path.join(dir, 'settings.json');
     let s = {};
@@ -5096,15 +5099,13 @@ function addMcpAllowRule(folderFsPath, serverName) {
     }
     if (!s.permissions || typeof s.permissions !== 'object') s.permissions = {};
     const allow = Array.isArray(s.permissions.allow) ? s.permissions.allow : [];
-    // Anything for this server (bare, per-tool, or an existing wildcard) is superseded by the one wildcard.
-    const isOurs = r => typeof r === 'string' && (r === bare || r.indexOf(prefix) === 0);
-    const cleaned = allow.filter(r => isOurs(r) && r !== wildcard).length;
+    const isOurs = r => typeof r === 'string' && (r === bare || r.indexOf(prefix) === 0);   // any oric rule
     const kept = allow.filter(r => !isOurs(r));
-    kept.push(wildcard);
-    s.permissions.allow = kept;
+    const rules = [bare, wildcard, ...tools.map(t => prefix + t)];   // both server-wide + every exact tool
+    s.permissions.allow = [...kept, ...rules];
     try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(file, JSON.stringify(s, null, 2) + '\n', 'utf8'); }
     catch (e) { return { ok: false, error: (e.message || String(e)) }; }
-    return { ok: true, rule: wildcard, file, cleaned };
+    return { ok: true, file, summary: '2 server-wide + ' + tools.length + ' exact tool rule' + (tools.length === 1 ? '' : 's') };
 }
 
 async function registerMcpServerFlow(context) {
@@ -5149,23 +5150,24 @@ async function registerMcpServerFlow(context) {
     try { fs.writeFileSync(mcpPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8'); }
     catch (e) { vscode.window.showErrorMessage('Oric MCP: could not write ' + mcpPath + ' — ' + (e.message || e)); return; }
 
-    // Pre-approve the server's tools so the assistant isn't prompted per call (one mcp__oric rule).
-    const allowRes = addMcpAllowRule(folder.uri.fsPath, 'oric');
-    const allowMsg = allowRes.ok
-        ? ' Tools pre-approved (' + allowRes.rule + ' in .claude/settings.json' + (allowRes.cleaned ? ', ' + allowRes.cleaned + ' old rule' + (allowRes.cleaned > 1 ? 's' : '') + ' cleaned up' : '') + ') — no per-tool prompts.'
-        : ' (Could not pre-approve tools: ' + allowRes.error + ' — you may be prompted per tool.)';
-
-    // Health-check it the way an MCP client would (spawn + initialize + tools/list).
+    // Health-check it the way an MCP client would (spawn + initialize + tools/list). This also
+    // yields the tool list so the allowlist can enumerate every tool.
     let result;
     await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: 'Oric MCP: validating server…' },
         async () => { try { result = await require('./mcp/validate.cjs').validateServer(serverPath); } catch (e) { result = { ok: false, error: e.message || String(e) }; } });
 
+    // Pre-approve the server's tools (both server-wide forms + every exact tool — see addMcpAllowRule).
+    const allowRes = addMcpAllowRule(folder.uri.fsPath, 'oric', (result && result.tools) || []);
+    const allowMsg = allowRes.ok
+        ? ' Tools pre-approved in .claude/settings.json (' + allowRes.summary + ').'
+        : ' (Could not pre-approve tools: ' + allowRes.error + ' — you may be prompted per tool.)';
+
     const rel = vscode.workspace.asRelativePath(mcpPath);
     if (result && result.ok) {
         const action = await vscode.window.showInformationMessage(
-            'Oric MCP registered in ' + rel + ' and validated — ' + result.count + ' tools healthy.' + allowMsg + ' ' +
-            'In your Claude session, run /mcp (or restart it) to load it.',
+            'Oric MCP registered in ' + rel + ' and validated — ' + result.count + ' tools healthy.' + allowMsg +
+            ' IMPORTANT: start a FRESH Claude session (permissions load at session start) — then it never prompts.',
             'Show .mcp.json');
         if (action === 'Show .mcp.json') vscode.window.showTextDocument(vscode.Uri.file(mcpPath));
     } else {
