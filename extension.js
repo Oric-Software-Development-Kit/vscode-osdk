@@ -2116,7 +2116,8 @@ body {
     pointer-events: none;
 }
 /* Run-state OSD badge (top-right of the screen). Purely informational — pointer-events
-   none so it never steals a hover or a click-to-control. Hidden unless warp or halted. */
+   none so it never steals a hover or a click-to-control. Shows ⏹ NOT RUNNING when there's
+   no session, ‖ when halted, ▶▶ under warp; hidden while running normally or on hover. */
 .osd {
     position: absolute;
     top: 6px;
@@ -2132,6 +2133,9 @@ body {
 }
 .osd.turbo  { color: #7ee787; }   /* ▶▶ warp/turbo */
 .osd.paused { color: #e2a03f; }   /* ‖ halted at a breakpoint */
+/* No debug session (stopped / disconnected / not running). Smaller text badge, muted
+   red so it reads as "not live" — distinct from the amber pause and green turbo. */
+.osd.offline { color: #f0776c; font-size: 15px; letter-spacing: 0; }
 /* Scripted-automation badge — OPPOSITE (top-left) corner so it coexists with the turbo/pause
    OSD, showing that a script is driving. Same non-interactive, hover-hiding behaviour. */
 .osd-script {
@@ -2898,8 +2902,9 @@ document.getElementById('btnCopy').addEventListener('click', () => {
     vscode.postMessage({ type: 'copyImage', dataUrl: screenCanvas.toDataURL('image/png') });
 });
 
-// Run-state OSD: ▶▶ when warp/turbo is on, ‖ when halted at a breakpoint, nothing while
-// running normally or with no session. Purely a status indicator (see the "State" toggle).
+// Run-state OSD: ⏹ NOT RUNNING when there's no debug session, ‖ when halted at a breakpoint,
+// ▶▶ when warp/turbo is on, nothing while running normally. Purely a status indicator (see
+// the "State" toggle). All variants hide under the crosshair on hover.
 let runState = { active: false, stopped: false, warp: false, scripted: false, aiPiloting: false };
 const osdScript = document.getElementById('osdScript');
 const osdAi = document.getElementById('osdAi');
@@ -2907,8 +2912,9 @@ function updateOsd() {
     let html = '', cls = 'osd';
     // Hidden while the mouse is over the screen (hoverPx >= 0) so it never sits under the
     // inspection crosshair; shown again on mouse-leave.
-    if (osdToggle.checked && runState.active && hoverPx < 0) {
-        if (runState.stopped) { cls = 'osd paused'; html = '<span class="pausebar"></span><span class="pausebar"></span>'; }
+    if (osdToggle.checked && hoverPx < 0) {
+        if (!runState.active) { cls = 'osd offline'; html = '&#9209; NOT RUNNING'; }   // ⏹ no debug session
+        else if (runState.stopped) { cls = 'osd paused'; html = '<span class="pausebar"></span><span class="pausebar"></span>'; }
         else if (runState.warp) { cls = 'osd turbo'; html = '▶▶'; }
     }
     osd.className = cls;
