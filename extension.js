@@ -3222,6 +3222,7 @@ function inSessionOps(session) {
             }
             vscode.commands.executeCommand('setContext', 'oric-debug.warp', oricWarpOn);
             postScreenRunState();
+            if (debugControlsProvider) debugControlsProvider.pushState();   // reflect on the Warp button
         },
         waitSignal(id, ms) { return waitSessionEvent('signal', ms || 60000, e => !id || e.id === id); },
         // Resolve a real name (_gCurrentLocation / e_LOC_LARGE_STAIRCASE) to { addr, value, ... }
@@ -3429,8 +3430,9 @@ function pushDebugStateToDisasm() {
 // present, next to Registers/Variables/Call Stack). Unlike a toolbar inside the
 // disassembly panel, focusing this doesn't flip VS Code into instruction stepping,
 // so its buttons drive C-statement stepping AND assembler stepping. Buttons carry
-// PRINTED labels (no tooltip reliance) and just fire VS Code's built-in debug
-// commands, which dispatch to our adapter.
+// PRINTED labels (no tooltip reliance) and fire either VS Code's built-in debug
+// commands or our own (replay navigation, warp), which dispatch to our adapter.
+// Hovering a button shows its purpose + shortcut in the status bar (showHoverHelp).
 function debugControlsHtml() {
     return `<!DOCTYPE html>
 <html><head><style>
@@ -3452,11 +3454,19 @@ body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size
 .dbg-btn.go .ic   { color: var(--vscode-debugIcon-continueForeground, #89d185); }
 .dbg-btn.stop .ic { color: var(--vscode-debugIcon-stopForeground, #f48771); }
 .dbg-btn.rev .ic  { color: var(--vscode-debugIcon-stepBackForeground, #75beff); }
+/* Warp toggle: muted while off, filled + green icon while on (matches the ▶▶ turbo OSD). */
+.dbg-btn.warp .ic { color: #7ee787; }
+.dbg-btn.warp.warpon {
+    background: var(--vscode-button-background, #0e639c);
+    color: var(--vscode-button-foreground, #fff);
+    border-color: var(--vscode-button-background, #0e639c);
+}
 </style></head><body>
 <div class="grp">
     <button class="dbg-btn go" id="playpause" data-act="playpause"><span class="ic" id="ppIcon">&#9654;</span><span id="ppLbl">Continue</span></button>
     <button class="dbg-btn stop" data-act="stop"><span class="ic">&#9632;</span>Stop</button>
     <button class="dbg-btn" data-act="restart"><span class="ic">&#8635;</span>Restart</button>
+    <button class="dbg-btn warp" id="warpBtn" data-act="warp"><span class="ic">&#187;&#187;</span><span id="warpLbl">Warp: Off</span></button>
 </div>
 <div class="grp">
     <button class="dbg-btn" data-act="stepOver"><span class="ic">&#8631;</span>Step Over</button>
@@ -3470,7 +3480,7 @@ body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size
 </div>
 <script>
 const vscode = acquireVsCodeApi();
-let stopped = true, active = false, canRewind = false, canForward = false;
+let stopped = true, active = false, canRewind = false, canForward = false, warp = false;
 document.body.addEventListener('click', e => {
     const b = e.target.closest('button.dbg-btn');
     if (!b || b.disabled) return;
@@ -3490,7 +3500,8 @@ const HELP = {
     stepOut: 'Step Out — run to the caller  (Shift+F11)',
     replayRewind: 'Replay Rewind — load the previous snapshot (non-destructive)  (Shift+F10)',
     replayForward: 'Replay Forward — load the next snapshot, undoing a rewind  (Shift+F12)',
-    replayToHead: 'Replay to Head — jump to the most recent snapshot (recover from over-rewinding)'
+    replayToHead: 'Replay to Head — jump to the most recent snapshot (recover from over-rewinding)',
+    warp: 'Warp — toggle fast-forward (run the emulator at maximum speed)  (Ctrl+Shift+F6)'
 };
 document.querySelectorAll('button.dbg-btn').forEach(b => {
     const help = HELP[b.dataset.act];
@@ -3515,8 +3526,15 @@ function apply() {
     }
     set('restart', active);
     set('stop', active);
+    // Warp works whenever a session is live (running or halted); reflect the current state.
+    set('warp', active);
+    const wb = document.getElementById('warpBtn');
+    if (wb) {
+        wb.classList.toggle('warpon', warp);
+        document.getElementById('warpLbl').textContent = warp ? 'Warp: On' : 'Warp: Off';
+    }
 }
-window.addEventListener('message', e => { if (e.data && e.data.type === 'state') { active = !!e.data.active; stopped = !!e.data.stopped; canRewind = !!e.data.canRewind; canForward = !!e.data.canForward; apply(); } });
+window.addEventListener('message', e => { if (e.data && e.data.type === 'state') { active = !!e.data.active; stopped = !!e.data.stopped; canRewind = !!e.data.canRewind; canForward = !!e.data.canForward; warp = !!e.data.warp; apply(); } });
 apply();
 </script>
 </body></html>`;
@@ -3550,6 +3568,7 @@ class DebugControlsWebviewProvider {
                 replayRewind: 'oric-debug.replayRewind',
                 replayForward: 'oric-debug.replayForward',
                 replayToHead: 'oric-debug.replayToHead',
+                warp: 'oric-debug.toggleWarp',
                 pause: 'workbench.action.debug.pause',
                 restart: 'workbench.action.debug.restart',
                 stop: 'workbench.action.debug.stop'
@@ -3563,7 +3582,7 @@ class DebugControlsWebviewProvider {
         if (!this._view) return;
         // Use the tracked flag, not activeDebugSession — the latter can still be set
         // during onDidTerminateDebugSession, leaving Stop looking enabled after the end.
-        this._view.webview.postMessage({ type: 'state', active: oricSessionActive, stopped: oricDebugStopped, canRewind: replayCanRewind, canForward: replayCanForward });
+        this._view.webview.postMessage({ type: 'state', active: oricSessionActive, stopped: oricDebugStopped, canRewind: replayCanRewind, canForward: replayCanForward, warp: oricWarpOn });
     }
 }
 function setInstrStepMode(on) {
@@ -4101,6 +4120,7 @@ function doToggleWarp() {
         vscode.commands.executeCommand('setContext', 'oric-debug.warp', oricWarpOn);
         vscode.window.setStatusBarMessage(oricWarpOn ? 'Warp: ON' : 'Warp: OFF', 3000);
         postScreenRunState();
+        if (debugControlsProvider) debugControlsProvider.pushState();   // reflect on the Warp button
         return;
     }
     // No viz stream (e.g. no Screen View open) — fall back to the GDB-stub toggle.
@@ -4110,6 +4130,7 @@ function doToggleWarp() {
             vscode.commands.executeCommand('setContext', 'oric-debug.warp', oricWarpOn);
             vscode.window.setStatusBarMessage(oricWarpOn ? 'Warp: ON' : 'Warp: OFF', 3000);
             postScreenRunState();   // reflect warp in the Screen View OSD
+            if (debugControlsProvider) debugControlsProvider.pushState();   // and on the Warp button
         }
     }).catch(e => {
         vscode.window.showErrorMessage('Warp toggle failed: ' + e.message);
