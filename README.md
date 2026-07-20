@@ -282,6 +282,19 @@ Automation Script…** from the palette. Running one **starts a debug session if
 re-run — the whole `automation/` folder is reloaded each time, so scripts *and* their `lib/`
 helpers iterate live. Stopping the debug session also stops the script.
 
+**How ▶ Run gets a session** — a script can declare its need with optional metadata, so Run doesn't prompt for a launch config it doesn't require:
+
+```js
+module.exports = async (t) => { … };
+module.exports.session = 'existing';   // run in the CURRENT session — a utility, never launches
+                                       //   (e.g. "screenshot + snapshot + dump some vars" while debugging)
+module.exports.session = 'fresh';      // needs a freshly-launched emulator; confirms a restart if one is running
+module.exports.session = 'any';        // (default) reuse the running session, else launch one
+module.exports.config  = 'Build & Debug';  // which launch.json config to launch (skips the picker)
+```
+
+If a launch *is* needed and no `config` is named, Run uses the only config, else the one you last picked (remembered) — it prompts at most once. A `session:'existing'` utility that finds no active session tells you to start one rather than launching.
+
 ### The `t` API
 
 Everything is `async` unless noted. Values that take a "name" (`waitFor`, `assertMem`, key names) resolve **real symbols and enums** (`_gCurrentLocation`, `e_LOC_MARKETPLACE`) — never hard-code magic numbers.

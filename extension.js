@@ -1182,6 +1182,8 @@ let vizLastVidAddr = 0;             // latest video base address
 const automationEvents = new vscode.EventEmitter();   // fires {type:'stopped'|'continued'|'signal', id?}
 let automationRunning = null;       // the running script's `t` (for Stop), or null
 let automationRunningPath = null;   // fsPath of the script currently running (for the Automation panel), or null
+let automationConfigMemento = null; // = context.workspaceState (set in activate); remembers the last-chosen launch config
+const AUTO_CFG_KEY = 'oric-debug.lastAutomationConfig';
 let refreshAutomationView = null;   // set in activate → refreshes the Oric Automation panel (module-level so the runner can call it)
 let automationChan = null;          // lazily-created Output channel
 
@@ -3186,7 +3188,7 @@ function inSessionOps(session) {
 // LIVE — so a script can run with nothing already open, and the MCP has one tested path to a
 // fully-hooked session (right emulator args, symbols, viz). Resolves to the session, or null
 // (with a reported reason). Picks the oric-debug config from launch.json (quick-picks if >1).
-async function startOricDebugSession(log) {
+async function startOricDebugSession(log, preferConfigName) {
     log = log || (() => {});
     const folders = vscode.workspace.workspaceFolders;
     if (!folders || !folders.length) { vscode.window.showErrorMessage('Oric: open the project folder first (need its launch.json).'); return null; }
@@ -3196,14 +3198,23 @@ async function startOricDebugSession(log) {
         for (const c of cfgs) if (c && c.type === 'oric-debug') candidates.push({ folder: f, config: c });
     }
     if (!candidates.length) { vscode.window.showErrorMessage('Oric: no "oric-debug" configuration found in launch.json.'); return null; }
-    let chosen = candidates[0];
-    if (candidates.length > 1) {
+    // Pick a config WITHOUT prompting when we can: the script's declared config, else the only one,
+    // else the last one used (remembered) — only prompt when genuinely ambiguous, and remember it.
+    let chosen = null;
+    if (preferConfigName) chosen = candidates.find(c => (c.config.name || '') === preferConfigName) || null;
+    if (!chosen && candidates.length === 1) chosen = candidates[0];
+    if (!chosen && automationConfigMemento) {
+        const last = automationConfigMemento.get(AUTO_CFG_KEY);
+        if (last) chosen = candidates.find(c => (c.config.name || '') === last) || null;
+    }
+    if (!chosen) {
         const pick = await vscode.window.showQuickPick(
             candidates.map((c, i) => ({ label: c.config.name || ('configuration ' + i), description: c.folder.name, i })),
-            { placeHolder: 'Which Oric debug configuration should the script start?' });
+            { placeHolder: 'Which Oric debug configuration should the script launch? (remembered for next time)' });
         if (!pick) return null;
         chosen = candidates[pick.i];
     }
+    if (automationConfigMemento && chosen && chosen.config.name) automationConfigMemento.update(AUTO_CFG_KEY, chosen.config.name).then(() => {}, () => {});
     // Capture the session the moment it starts (startDebugging only returns a bool).
     const startedP = new Promise(resolve => {
         const sub = vscode.debug.onDidStartDebugSession(s => { if (s && s.type === 'oric-debug') { sub.dispose(); resolve(s); } });
@@ -3242,20 +3253,12 @@ function waitVizConnected(ms) {
 
 async function runAutomationScript(scriptPath) {
     if (automationRunning) { vscode.window.showWarningMessage('An Oric automation script is already running — Stop it first.'); return; }
-    // No active session? Start one (the equivalent of F5) and wait until the adapter is live,
-    // so you can "just run the script" from cold — the same reliable, fully-hooked launch the
-    // MCP will use. An already-running oric-debug session is reused as-is.
-    let session = vscode.debug.activeDebugSession;
-    if (!session || session.type !== 'oric-debug') {
-        const chan = automationChannel(); chan.show(true);
-        chan.appendLine('No debug session — starting one (F5)…');
-        session = await startOricDebugSession(m => chan.appendLine(m));
-        if (!session) return;   // startOricDebugSession reported why
-    }
+    const scriptName = nodePath.basename(scriptPath);
+    // Load the script FIRST — its optional metadata decides how we get a session (so ▶ Run doesn't
+    // prompt for a launch config it doesn't need). Fresh each run: bust the require cache for the
+    // script AND every sibling module in its folder (helpers in automation/lib/), so editing a
+    // helper reloads without a window reload.
     let scriptFn;
-    // Fresh each run: bust the require cache for the script AND every sibling module in its
-    // folder (e.g. automation/encounter.js helpers), so editing a helper reloads without a
-    // window reload — same iterate-and-rerun loop as the script itself.
     try {
         const dir = canonPath(nodePath.dirname(scriptPath)) + nodePath.sep;
         for (const k of Object.keys(require.cache)) { if (canonPath(k).startsWith(dir)) delete require.cache[k]; }
@@ -3264,12 +3267,40 @@ async function runAutomationScript(scriptPath) {
     catch (e) { vscode.window.showErrorMessage('Automation script load error: ' + (e && e.message ? e.message : e)); return; }
     if (typeof scriptFn !== 'function' && scriptFn && typeof scriptFn.default === 'function') scriptFn = scriptFn.default;
     if (typeof scriptFn !== 'function') { vscode.window.showErrorMessage('An automation script must be:  module.exports = async (t) => { ... }'); return; }
+    // Optional metadata on the exported function:
+    //   .session = 'existing' → run in the CURRENT debug session (a utility — never launches);
+    //            | 'fresh'    → needs a freshly-launched emulator (confirms a restart if one runs);
+    //            | 'any'      → (default) reuse the running session, else launch one.
+    //   .config  = name of the launch.json oric-debug config to launch (skips the picker).
+    const need = scriptFn.session || 'any';
+    const wantConfig = scriptFn.config || null;
+    const chan = automationChannel(); chan.clear(); chan.show(true);
+    let session = vscode.debug.activeDebugSession;
+    const haveSession = !!(session && session.type === 'oric-debug');
+    if (need === 'existing') {
+        if (!haveSession) { vscode.window.showWarningMessage('Automation "' + scriptName + '" runs in the CURRENT debug session, but none is active — start one (F5) first. (Set  module.exports.session = "any"  to auto-launch.)'); return; }
+        chan.appendLine('Using the active debug session (' + session.name + ').');
+    } else if (need === 'fresh') {
+        if (haveSession) {
+            const go = await vscode.window.showWarningMessage('Automation "' + scriptName + '" needs a freshly-launched emulator. Restart the current debug session?', { modal: true }, 'Restart');
+            if (go !== 'Restart') return;
+            chan.appendLine('Restarting the debug session for a fresh run…');
+            try { await vscode.debug.stopDebugging(session); } catch (_) {}
+            await new Promise(r => setTimeout(r, 800));
+        } else {
+            chan.appendLine('Launching a fresh debug session…');
+        }
+        session = await startOricDebugSession(m => chan.appendLine(m), wantConfig);
+        if (!session) return;
+    } else {   // 'any' (default)
+        if (haveSession) chan.appendLine('Using the active debug session (' + session.name + ').');
+        else { chan.appendLine('No debug session — launching one…'); session = await startOricDebugSession(m => chan.appendLine(m), wantConfig); if (!session) return; }
+    }
     // Lazy: the shared step-core (+ its client deps) load only when a script is actually run,
     // so any issue there can never break the extension's activation.
     let makeApi;
     try { ({ makeApi } = require('./mcp/playthrough-core.cjs')); }
     catch (e) { vscode.window.showErrorMessage('Automation core failed to load: ' + (e && e.message ? e.message : e)); return; }
-    const chan = automationChannel(); chan.clear(); chan.show(true);
     // Own the viz stream for the run (frame timing + screenshots) — independent of any panel.
     vizRegisterConsumer(automationVizConsumer);
     if (!vizConnected) {
@@ -6301,6 +6332,7 @@ function activate(context) {
     // disk so scripts show with no session; ▶ Run starts a session if needed (runAutomationScript).
     const autoEmitter = new vscode.EventEmitter();
     refreshAutomationView = () => autoEmitter.fire();
+    automationConfigMemento = context.workspaceState;   // remember the last-chosen launch config (skip the picker next time)
     async function listAutomationScriptFiles() {
         const files = await vscode.workspace.findFiles('**/automation/*.js', '**/node_modules/**', 200);
         return files.map(f => ({ name: nodePath.basename(f.fsPath), fsPath: f.fsPath }))
