@@ -302,7 +302,7 @@ The extension ships an **MCP server** (`mcp/oric-mcp-server.cjs`) that lets an A
 
 ### One-click registration
 
-Run **Oric: Register MCP Server (for Claude)…**. It writes/merges a `.mcp.json` at your project root (pointing at the server shipped in this extension), **validates** it by performing the real MCP handshake, and **pre-approves its tools** (adds a single `mcp__oric` rule to `.claude/settings.json`, cleaning up any redundant per-tool rules) so the assistant isn't prompted "Do you want to proceed?" on every call. It reports how many tools are healthy; then in your assistant run `/mcp` (or restart the session) to load it.
+Run **Oric: Register MCP Server (for Claude)…**. It writes/merges a `.mcp.json` at your project root (pointing at the server shipped in this extension), **validates** it by performing the real MCP handshake, and **pre-approves its tools** (adds the anchored-wildcard rule `mcp__oric__*` to `.claude/settings.json`, cleaning up any redundant per-tool or ineffective bare-`mcp__oric` rules) so the assistant isn't prompted "Do you want to proceed?" on every call — now or for tools added later. It reports how many tools are healthy; then in your assistant run `/mcp` (or restart the session) to load it.
 
 ### Tools
 

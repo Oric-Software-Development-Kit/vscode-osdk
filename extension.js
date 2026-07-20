@@ -5076,13 +5076,17 @@ function stopMcpBridge() {
 // "registered AND proven healthy — N tools", not just a file written. We can't force Claude Code
 // to ingest it (it reads .mcp.json at session start), so we tell the user to run /mcp / restart.
 // Pre-approve the Oric MCP server's tools in the project's Claude settings so the assistant
-// isn't prompted ("Do you want to proceed?") on every call. ONE server-level rule ("mcp__<name>")
-// covers every current AND future tool; we also drop any now-redundant per-tool rules that a
-// prior "don't ask again" left behind. Written to .claude/settings.json (committed, consistent
-// with the .mcp.json the register step writes). Non-fatal — returns {ok,error} for the caller.
+// isn't prompted ("Do you want to proceed?") on every call. The ONLY allow-rule form that
+// auto-approves a whole server is the anchored wildcard `mcp__<name>__*` — a bare `mcp__<name>`
+// is an UNANCHORED allow glob that Claude Code silently ignores (which is why per-tool prompts
+// kept coming back). We drop that ineffective bare rule + any now-redundant per-tool rules a
+// prior "don't ask again" left behind, and write the single wildcard. Written to
+// .claude/settings.json. Non-fatal — returns {ok,error} for the caller.
 function addMcpAllowRule(folderFsPath, serverName) {
     const fs = require('fs'); const path = require('path');
-    const rule = 'mcp__' + serverName;
+    const prefix = 'mcp__' + serverName + '__';   // e.g. mcp__oric__
+    const wildcard = prefix + '*';                 // mcp__oric__*  — the correct, future-proof rule
+    const bare = 'mcp__' + serverName;             // mcp__oric  — unanchored glob, silently ignored (remove)
     const dir = path.join(folderFsPath, '.claude');
     const file = path.join(dir, 'settings.json');
     let s = {};
@@ -5092,14 +5096,15 @@ function addMcpAllowRule(folderFsPath, serverName) {
     }
     if (!s.permissions || typeof s.permissions !== 'object') s.permissions = {};
     const allow = Array.isArray(s.permissions.allow) ? s.permissions.allow : [];
-    const perTool = allow.filter(r => typeof r === 'string' && r.indexOf(rule + '__') === 0).length;   // mcp__oric__* superseded
-    const already = allow.includes(rule);
-    const kept = allow.filter(r => r !== rule && !(typeof r === 'string' && r.indexOf(rule + '__') === 0));
-    kept.push(rule);
+    // Anything for this server (bare, per-tool, or an existing wildcard) is superseded by the one wildcard.
+    const isOurs = r => typeof r === 'string' && (r === bare || r.indexOf(prefix) === 0);
+    const cleaned = allow.filter(r => isOurs(r) && r !== wildcard).length;
+    const kept = allow.filter(r => !isOurs(r));
+    kept.push(wildcard);
     s.permissions.allow = kept;
     try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(file, JSON.stringify(s, null, 2) + '\n', 'utf8'); }
     catch (e) { return { ok: false, error: (e.message || String(e)) }; }
-    return { ok: true, rule, file, cleaned: perTool, already };
+    return { ok: true, rule: wildcard, file, cleaned };
 }
 
 async function registerMcpServerFlow(context) {
@@ -5147,7 +5152,7 @@ async function registerMcpServerFlow(context) {
     // Pre-approve the server's tools so the assistant isn't prompted per call (one mcp__oric rule).
     const allowRes = addMcpAllowRule(folder.uri.fsPath, 'oric');
     const allowMsg = allowRes.ok
-        ? ' Tools pre-approved (mcp__oric in .claude/settings.json' + (allowRes.cleaned ? ', ' + allowRes.cleaned + ' redundant per-tool rule' + (allowRes.cleaned > 1 ? 's' : '') + ' cleaned up' : '') + ') — no per-tool prompts.'
+        ? ' Tools pre-approved (' + allowRes.rule + ' in .claude/settings.json' + (allowRes.cleaned ? ', ' + allowRes.cleaned + ' old rule' + (allowRes.cleaned > 1 ? 's' : '') + ' cleaned up' : '') + ') — no per-tool prompts.'
         : ' (Could not pre-approve tools: ' + allowRes.error + ' — you may be prompted per tool.)';
 
     // Health-check it the way an MCP client would (spawn + initialize + tools/list).
