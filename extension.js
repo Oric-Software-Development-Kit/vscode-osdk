@@ -6320,7 +6320,7 @@ function activate(context) {
             it.description = running ? '● running' : '';
             it.tooltip = el.fsPath + (running ? '\nRunning — use ■ Stop to cancel.' : '\nClick ▶ to run (starts a debug session if none); click the row to open the script.');
             it.contextValue = 'oricAutoScript';
-            it.iconPath = new vscode.ThemeIcon(running ? 'loading~spin' : 'run');
+            it.iconPath = new vscode.ThemeIcon(running ? 'loading~spin' : 'file-code');   // row = script glyph; the ▶ Run action is the inline button
             it.id = 'auto:' + el.fsPath;
             it.command = { command: 'oric-debug.automationOpenItem', title: 'Open', arguments: [el] };   // row-click opens; ▶ runs
             return it;
