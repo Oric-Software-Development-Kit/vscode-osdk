@@ -1181,6 +1181,8 @@ let vizLastVidMode = 0;             // latest video mode byte (bit2 = HIRES) —
 let vizLastVidAddr = 0;             // latest video base address
 const automationEvents = new vscode.EventEmitter();   // fires {type:'stopped'|'continued'|'signal', id?}
 let automationRunning = null;       // the running script's `t` (for Stop), or null
+let automationRunningPath = null;   // fsPath of the script currently running (for the Automation panel), or null
+let refreshAutomationView = null;   // set in activate → refreshes the Oric Automation panel (module-level so the runner can call it)
 let automationChan = null;          // lazily-created Output channel
 
 // Tell the Screen View whether the Oric is connected — gates its keyboard control
@@ -3278,7 +3280,9 @@ async function runAutomationScript(scriptPath) {
     const outDir = nodePath.join(nodePath.dirname(scriptPath), 'out');
     const t = makeApi(inSessionOps(session), { log: m => chan.appendLine(m), outDir });
     automationRunning = t;
+    automationRunningPath = scriptPath;
     vscode.commands.executeCommand('setContext', 'oric-debug.automationRunning', true);
+    if (refreshAutomationView) refreshAutomationView();   // mark the running script in the panel
     postScreenRunState();   // show the "SCRIPT" badge on the Screen View OSD right away
     chan.appendLine('▶ ' + nodePath.basename(scriptPath) + '   (session: ' + session.name + ')');
     const t0 = Date.now();
@@ -3292,9 +3296,11 @@ async function runAutomationScript(scriptPath) {
     if (automationRunning === t) {
         vizUnregisterConsumer(automationVizConsumer);   // leaves it up if a panel still uses it
         automationRunning = null;
+        automationRunningPath = null;
         oricUserPaused = false;
         if (automationUiTimer) { clearTimeout(automationUiTimer); automationUiTimer = null; }
         vscode.commands.executeCommand('setContext', 'oric-debug.automationRunning', false);
+        if (refreshAutomationView) refreshAutomationView();
         // Repaint once now that the rapid-cycling suppression is off (buttons/dim/panels live again).
         applyDebugStateVisuals();
         if (refreshAllViews) refreshAllViews();
@@ -3311,10 +3317,12 @@ function stopAutomation(reason) {
     if (!automationRunning) return false;
     try { automationRunning._cancel(); } catch (_) {}
     automationRunning = null;
+    automationRunningPath = null;
     oricUserPaused = false;
     if (automationUiTimer) { clearTimeout(automationUiTimer); automationUiTimer = null; }
     try { vizUnregisterConsumer(automationVizConsumer); } catch (_) {}
     vscode.commands.executeCommand('setContext', 'oric-debug.automationRunning', false);
+    if (refreshAutomationView) refreshAutomationView();
     if (automationChan) automationChan.appendLine('■ automation ' + (reason || 'stopped'));
     return true;
 }
@@ -6286,6 +6294,49 @@ function activate(context) {
         })
     );
     if (snapSession()) refreshSnapshots();
+
+    // --- Oric Automation panel — list runnable automation scripts with a ▶ Run button.
+    // Folder-split convention: standalone scripts are automation/<name>.js (the glob lists only
+    // the top level); utility modules go in automation/lib/ and are NOT listed. getChildren reads
+    // disk so scripts show with no session; ▶ Run starts a session if needed (runAutomationScript).
+    const autoEmitter = new vscode.EventEmitter();
+    refreshAutomationView = () => autoEmitter.fire();
+    async function listAutomationScriptFiles() {
+        const files = await vscode.workspace.findFiles('**/automation/*.js', '**/node_modules/**', 200);
+        return files.map(f => ({ name: nodePath.basename(f.fsPath), fsPath: f.fsPath }))
+            .sort((a, b) => a.name.localeCompare(b.name));
+    }
+    const autoTreeProvider = {
+        onDidChangeTreeData: autoEmitter.event,
+        async getChildren() {
+            const items = await listAutomationScriptFiles();
+            if (!items.length) return [{ kind: 'hint', label: '(no scripts — add automation/<name>.js; utilities go in automation/lib/)' }];
+            return items.map(x => ({ kind: 'script', name: x.name, fsPath: x.fsPath }));
+        },
+        getTreeItem(el) {
+            if (el.kind === 'hint') { const it = new vscode.TreeItem(el.label); it.contextValue = 'oricAutoHint'; return it; }
+            const running = automationRunningPath && canonPath(automationRunningPath) === canonPath(el.fsPath);
+            const it = new vscode.TreeItem(el.name.replace(/\.js$/, ''));
+            it.description = running ? '● running' : '';
+            it.tooltip = el.fsPath + (running ? '\nRunning — use ■ Stop to cancel.' : '\nClick ▶ to run (starts a debug session if none); click the row to open the script.');
+            it.contextValue = 'oricAutoScript';
+            it.iconPath = new vscode.ThemeIcon(running ? 'loading~spin' : 'run');
+            it.id = 'auto:' + el.fsPath;
+            it.command = { command: 'oric-debug.automationOpenItem', title: 'Open', arguments: [el] };   // row-click opens; ▶ runs
+            return it;
+        }
+    };
+    const autoTree = vscode.window.createTreeView('oricAutomation', { treeDataProvider: autoTreeProvider });
+    const autoWatcher = vscode.workspace.createFileSystemWatcher('**/automation/*.js');
+    autoWatcher.onDidCreate(() => autoEmitter.fire());
+    autoWatcher.onDidDelete(() => autoEmitter.fire());
+    autoWatcher.onDidChange(() => autoEmitter.fire());
+    context.subscriptions.push(
+        autoTree, autoWatcher,
+        vscode.commands.registerCommand('oric-debug.automationRunItem', node => { if (node && node.fsPath) runAutomationScript(node.fsPath); }),
+        vscode.commands.registerCommand('oric-debug.automationOpenItem', node => { if (node && node.fsPath) vscode.window.showTextDocument(vscode.Uri.file(node.fsPath)); }),
+        vscode.commands.registerCommand('oric-debug.automationRefresh', () => autoEmitter.fire())
+    );
 
     // Re-read source @annotations into the running adapter — no rebuild, no lost
     // debugger state. Panels/watch refresh via the adapter's oricSymbolsChanged

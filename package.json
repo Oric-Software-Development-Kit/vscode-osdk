@@ -129,6 +129,10 @@
                 {
                     "id": "oricSnapshots",
                     "name": "Oric Snapshots"
+                },
+                {
+                    "id": "oricAutomation",
+                    "name": "Oric Automation"
                 }
             ],
             "oricDebugPanel": [
@@ -209,6 +213,21 @@
                 "command": "oric-debug.stopAutomationScript",
                 "title": "Oric: Stop Automation Script",
                 "icon": "$(debug-stop)"
+            },
+            {
+                "command": "oric-debug.automationRunItem",
+                "title": "Run Script",
+                "icon": "$(run)"
+            },
+            {
+                "command": "oric-debug.automationOpenItem",
+                "title": "Open Script",
+                "icon": "$(go-to-file)"
+            },
+            {
+                "command": "oric-debug.automationRefresh",
+                "title": "Refresh Automation Scripts",
+                "icon": "$(refresh)"
             },
             {
                 "command": "oric-debug.registerMcpServer",
@@ -448,7 +467,9 @@
                 { "command": "oric-debug.bpDisableAll", "when": "view == oricBreakpoints", "group": "navigation@2" },
                 { "command": "oric-debug.bpRemoveAll", "when": "view == oricBreakpoints", "group": "navigation@3" },
                 { "command": "oric-debug.snapshotSave", "when": "view == oricSnapshots", "group": "navigation@1" },
-                { "command": "oric-debug.snapshotRefresh", "when": "view == oricSnapshots", "group": "navigation@2" }
+                { "command": "oric-debug.snapshotRefresh", "when": "view == oricSnapshots", "group": "navigation@2" },
+                { "command": "oric-debug.stopAutomationScript", "when": "view == oricAutomation && oric-debug.automationRunning", "group": "navigation@1" },
+                { "command": "oric-debug.automationRefresh", "when": "view == oricAutomation", "group": "navigation@2" }
             ],
             "view/item/context": [
                 { "command": "oric-debug.snapshotRestoreItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "inline@1" },
@@ -457,6 +478,10 @@
                 { "command": "oric-debug.snapshotRestoreItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "1_snap@1" },
                 { "command": "oric-debug.snapshotRenameItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "1_snap@2" },
                 { "command": "oric-debug.snapshotDeleteItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "1_snap@3" },
+                { "command": "oric-debug.automationRunItem", "when": "view == oricAutomation && viewItem == oricAutoScript", "group": "inline@1" },
+                { "command": "oric-debug.automationOpenItem", "when": "view == oricAutomation && viewItem == oricAutoScript", "group": "inline@2" },
+                { "command": "oric-debug.automationRunItem", "when": "view == oricAutomation && viewItem == oricAutoScript", "group": "1_auto@1" },
+                { "command": "oric-debug.automationOpenItem", "when": "view == oricAutomation && viewItem == oricAutoScript", "group": "1_auto@2" },
                 { "command": "oric-debug.bpEnableModule", "when": "view == oricBreakpoints && viewItem == oricModule", "group": "inline@1" },
                 { "command": "oric-debug.bpDisableModule", "when": "view == oricBreakpoints && viewItem == oricModule", "group": "inline@2" },
                 { "command": "oric-debug.bpEnableModule", "when": "view == oricBreakpoints && viewItem == oricModule", "group": "1_mod@1" },

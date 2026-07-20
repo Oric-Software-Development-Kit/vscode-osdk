@@ -49,6 +49,7 @@ Dedicated panels appear in the Debug sidebar when a session is active:
 | **Oric Registers** | CPU registers (A, X, Y, SP, PC), processor flags (N, V, B, D, I, Z, C), last PC, cycle counter, frame count, raster line, and interrupt vectors (NMI, RST, IRQ). A/X/Y show their decoded value when the register carries a type tag. |
 | **Oric Breakpoints** | All breakpoints as a tree: **module → file → line**, with a child row per condition / hit-count / watchpoint property. Enable/disable or delete at any level (all / module / file / line), and optionally *follow the active module*. |
 | **Oric Snapshots** | Saved machine-state snapshots for this project — restore, rename, or delete (see *Snapshots*). |
+| **Oric Automation** | Runnable automation scripts (`automation/*.js`) with a **▶ Run** button each (see *Automation Scripting*). |
 | **Oric Peripherals** | Live state of the VIA 6522, AY-3-8912 (PSG), WD1793 floppy disk controller, Microdisc interface, and ACIA 6551 serial controller. |
 
 (Zero-page variables are no longer a separate panel — view them in the **Symbol Browser** with the group filter set to *Zero Page*.)
@@ -253,7 +254,14 @@ Requires either a V2 symbol file (with source location info) or a `#define` dire
 
 Drive the emulator from a JavaScript script that runs **against your live debug session** — the program plays in the **Screen View**, and you can pause, inspect, and resume it like any debug session. Scripts are for reproducible playthroughs, regression checks, "get me to the interesting state" setup, and hunting timing/state bugs.
 
-Put scripts in your project under `automation/*.js`:
+**Folder layout** — a *standalone, runnable* script is a file directly under `automation/` that exports a function; shared *utility modules* go in **`automation/lib/`** (they're never run on their own):
+
+```
+automation/
+  example.js        ← a runnable script (module.exports = async (t) => { … })
+  lib/
+    encounter.js    ← utility helpers, imported by scripts (require('./lib/encounter'))
+```
 
 ```js
 // automation/example.js
@@ -266,7 +274,13 @@ module.exports = async (t) => {
 };
 ```
 
-Run it with **Oric: Run Automation Script…** (pick from a list), stop it with **Oric: Stop Automation Script**. Edit the file and re-run — the whole `automation/` folder is reloaded each time, so scripts *and* your helper modules iterate live. Stopping the debug session also stops the script.
+Run a script from the **Oric Automation** panel (in the Run & Debug sidebar) — it lists the
+runnable scripts (top-level `automation/*.js`, *not* `lib/`), each with a **▶ Run** button;
+clicking a row opens the script, and the running one shows a spinner. Or use **Oric: Run
+Automation Script…** from the palette. Running one **starts a debug session if none is active**
+(F5-equivalent). Stop it with the panel's **■** (or **Oric: Stop Automation Script**). Edit and
+re-run — the whole `automation/` folder is reloaded each time, so scripts *and* their `lib/`
+helpers iterate live. Stopping the debug session also stops the script.
 
 ### The `t` API
 
@@ -292,7 +306,7 @@ Everything is `async` unless noted. Values that take a "name" (`waitFor`, `asser
 
 **Reliability principle:** synchronise on *state*, never on fixed sleeps. `waitFor`/`waitModule`/`runTo` run at full speed and stop *exactly* at the checkpoint, so a script is immune to timing and warp.
 
-**Game-specific helpers** stay in their own module so the generic `t` API stays game-agnostic — e.g. Encounter's `automation/encounter.js` wraps the text-parser handshake into `enc.command(t, 'take bag')` (which types, *verifies* the input buffer landed, and retries). Overlay navigation is written out explicitly with plain `if` blocks per script (transparent and editable), not hidden in a black-box helper.
+**Game-specific helpers** stay in a `lib/` module so the generic `t` API stays game-agnostic — e.g. Encounter's `automation/lib/encounter.js` wraps the text-parser handshake into `enc.command(t, 'take bag')` (which types, *verifies* the input buffer landed, and retries). Overlay navigation is written out explicitly with plain `if` blocks per script (transparent and editable), not hidden in a black-box helper.
 
 ---
 
