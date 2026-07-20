@@ -5075,37 +5075,34 @@ function stopMcpBridge() {
 // extension). We then run the REAL MCP handshake against it (mcp/validate.cjs) so the user gets
 // "registered AND proven healthy — N tools", not just a file written. We can't force Claude Code
 // to ingest it (it reads .mcp.json at session start), so we tell the user to run /mcp / restart.
-// Pre-approve the Oric MCP server's tools in the project's Claude settings so the assistant
-// isn't prompted ("Do you want to proceed?") on every call. Belt-and-braces, because behaviour
-// has varied across Claude Code builds: we write BOTH documented server-wide forms — the bare
-// `mcp__<name>` and the anchored wildcard `mcp__<name>__*` (each documented to match all of a
-// server's tools) — AND an exact `mcp__<name>__<tool>` for every current tool. Exact entries are
-// the one form that has worked on every build; the server-wide forms also cover tools added
-// later. Any prior per-tool "don't ask again" rules for this server are collapsed into this set.
-// IMPORTANT: Claude Code loads permissions at SESSION START — a FRESH session is required for
-// this to take effect. Written to .claude/settings.json. Non-fatal — returns {ok,error}.
-function addMcpAllowRule(folderFsPath, serverName, toolNames) {
+// Add the Oric MCP server's allow rules to a Claude Code settings FILE so the assistant isn't
+// prompted ("Do you want to proceed?") per tool call. Writes BOTH documented server-wide forms —
+// the bare `mcp__<name>` and the anchored wildcard `mcp__<name>__*` (each matches ALL of that
+// server's tools per the docs; only an unanchored `mcp__*` is ignored — and note the prompt
+// DISPLAYS single underscores but the real format is double) — and removes any prior per-tool /
+// duplicate rules for this server. Two things the caller must know: (1) Claude Code loads
+// permissions at SESSION START, so a FRESH session is required; (2) PROJECT `.claude/settings.json`
+// is only honored for a TRUSTED workspace, whereas USER `~/.claude/settings.json` is ALWAYS loaded
+// — so the caller writes both. Non-fatal — returns {ok,error}.
+function addMcpAllowRule(settingsFile, serverName) {
     const fs = require('fs'); const path = require('path');
     const prefix = 'mcp__' + serverName + '__';   // e.g. mcp__oric__
     const wildcard = prefix + '*';                 // mcp__oric__*  (anchored wildcard)
-    const bare = 'mcp__' + serverName;             // mcp__oric     (bare server)
-    const tools = Array.isArray(toolNames) ? toolNames : [];
-    const dir = path.join(folderFsPath, '.claude');
-    const file = path.join(dir, 'settings.json');
+    const bare = 'mcp__' + serverName;             // mcp__oric     (bare server name)
     let s = {};
-    if (fs.existsSync(file)) {
-        try { s = JSON.parse(fs.readFileSync(file, 'utf8')) || {}; }
-        catch (e) { return { ok: false, error: '.claude/settings.json is not valid JSON (' + (e.message || e) + ')' }; }
+    if (fs.existsSync(settingsFile)) {
+        try { s = JSON.parse(fs.readFileSync(settingsFile, 'utf8')) || {}; }
+        catch (e) { return { ok: false, error: path.basename(settingsFile) + ' is not valid JSON (' + (e.message || e) + ')' }; }
     }
     if (!s.permissions || typeof s.permissions !== 'object') s.permissions = {};
     const allow = Array.isArray(s.permissions.allow) ? s.permissions.allow : [];
-    const isOurs = r => typeof r === 'string' && (r === bare || r.indexOf(prefix) === 0);   // any oric rule
+    const isOurs = r => typeof r === 'string' && (r === bare || r.indexOf(prefix) === 0);   // any rule for this server
     const kept = allow.filter(r => !isOurs(r));
-    const rules = [bare, wildcard, ...tools.map(t => prefix + t)];   // both server-wide + every exact tool
-    s.permissions.allow = [...kept, ...rules];
-    try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(file, JSON.stringify(s, null, 2) + '\n', 'utf8'); }
+    kept.push(bare, wildcard);
+    s.permissions.allow = kept;
+    try { fs.mkdirSync(path.dirname(settingsFile), { recursive: true }); fs.writeFileSync(settingsFile, JSON.stringify(s, null, 2) + '\n', 'utf8'); }
     catch (e) { return { ok: false, error: (e.message || String(e)) }; }
-    return { ok: true, file, summary: '2 server-wide + ' + tools.length + ' exact tool rule' + (tools.length === 1 ? '' : 's') };
+    return { ok: true };
 }
 
 async function registerMcpServerFlow(context) {
@@ -5157,17 +5154,25 @@ async function registerMcpServerFlow(context) {
         { location: vscode.ProgressLocation.Notification, title: 'Oric MCP: validating server…' },
         async () => { try { result = await require('./mcp/validate.cjs').validateServer(serverPath); } catch (e) { result = { ok: false, error: e.message || String(e) }; } });
 
-    // Pre-approve the server's tools (both server-wide forms + every exact tool — see addMcpAllowRule).
-    const allowRes = addMcpAllowRule(folder.uri.fsPath, 'oric', (result && result.tools) || []);
-    const allowMsg = allowRes.ok
-        ? ' Tools pre-approved in .claude/settings.json (' + allowRes.summary + ').'
-        : ' (Could not pre-approve tools: ' + allowRes.error + ' — you may be prompted per tool.)';
+    // Pre-approve the server's tools so the assistant isn't prompted per call. Write to BOTH:
+    //  - USER settings (~/.claude/settings.json): ALWAYS loaded, so it works even when the folder
+    //    isn't "trusted" in Claude Code (an untrusted folder's PROJECT settings are IGNORED — that
+    //    trap cost a long debugging detour);
+    //  - PROJECT settings (.claude/settings.json): applies once the folder is trusted / for teammates.
+    const userSettings = path.join(require('os').homedir(), '.claude', 'settings.json');
+    const projectSettings = path.join(folder.uri.fsPath, '.claude', 'settings.json');
+    const rUser = addMcpAllowRule(userSettings, 'oric');
+    const rProj = addMcpAllowRule(projectSettings, 'oric');
+    const allowMsg = rUser.ok
+        ? ' Pre-approved mcp__oric__* in your user settings (always loaded)' + (rProj.ok ? ' + the project settings' : '') + ' — start a FRESH Claude session to load it (no per-tool prompts).'
+        : (rProj.ok
+            ? ' Pre-approved mcp__oric__* in the project settings (NOTE: applies only to a trusted workspace) — start a fresh session.'
+            : ' (Could not pre-approve tools: ' + (rUser.error || rProj.error) + ' — you may be prompted per tool.)');
 
     const rel = vscode.workspace.asRelativePath(mcpPath);
     if (result && result.ok) {
         const action = await vscode.window.showInformationMessage(
-            'Oric MCP registered in ' + rel + ' and validated — ' + result.count + ' tools healthy.' + allowMsg +
-            ' IMPORTANT: start a FRESH Claude session (permissions load at session start) — then it never prompts.',
+            'Oric MCP registered in ' + rel + ' and validated — ' + result.count + ' tools healthy.' + allowMsg,
             'Show .mcp.json');
         if (action === 'Show .mcp.json') vscode.window.showTextDocument(vscode.Uri.file(mcpPath));
     } else {

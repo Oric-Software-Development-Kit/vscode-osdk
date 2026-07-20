@@ -41,6 +41,35 @@ and a minimal PNG encoder are all inline).
 The server logs to **stderr** (stdout is the MCP channel), so client logs will show
 `[oric-mcp] ready …` and `[adapter] …` lines.
 
+## Stopping the "Do you want to proceed?" prompts
+
+MCP clients ask for approval before each tool call by default. To make the Oric tools run without
+prompting, allowlist the server. The easiest path is the VS Code command **"Oric: Register MCP
+Server"**, which does this for you; the manual details differ per client.
+
+**Claude Code** (verified — and full of traps we hit the hard way):
+- Add the server to `permissions.allow`. The rule is **double-underscore**: `mcp__oric__*`
+  (anchored wildcard — matches all of the server's tools) or the bare `mcp__oric` (also matches
+  all). Both are valid per the [docs](https://code.claude.com/docs/en/permissions); only an
+  *unanchored* `mcp__*` is ignored. ⚠️ The approval **prompt displays single underscores**
+  (`mcp_oric_…`) — that's a rendering artifact; **use double underscores** in the file.
+- ⚠️ **Location matters more than the rule.** **User** settings `~/.claude/settings.json` are
+  **always loaded**. **Project** settings `.claude/settings.json` are honored **only for a
+  *trusted* workspace** (`projects["<path>"].hasTrustDialogAccepted` in `~/.claude.json`). If a
+  correct rule in the project file is still prompting, the folder is **untrusted** — put the rule
+  in **user** settings (or accept Claude Code's trust prompt for the folder). The Register command
+  writes to **both** for this reason.
+- ⚠️ Permissions load at **session start** — editing settings mid-session does nothing; start a
+  **fresh** session. Verify the loaded rules with **`/permissions`**.
+
+**Claude Desktop** — approve via its UI; it has no `permissions.allow` file.
+
+**Other MCP clients** (Gemini CLI, Codex, GLM, Cline, …) — the *same* `oric` server works with any
+MCP client, but each has its **own** approval/allowlist mechanism and config location. The concept
+is identical (allowlist the server or its tools; some support a per-server "always allow" toggle),
+but the exact key/syntax/file differ — consult that client's docs. The Register command's
+auto-allowlist is **Claude Code-specific**; for other clients, use their trust/approval UI.
+
 ## Launching a session
 
 Call **`oric_launch`** with a `config` that mirrors a VS Code `oric-debug` launch config:
