@@ -4670,11 +4670,13 @@ tr:nth-child(even) td {
 .wv.idle { color: var(--vscode-descriptionForeground, #888); font-style: italic; }
 #watchSec details { margin-top: 2px; }
 #watchSec summary { cursor: pointer; color: var(--vscode-descriptionForeground, #888); user-select: none; }
-/* Watch toggle dot column (like the breakpoint gutter) */
+/* Watch PIN column. Deliberately a pushpin, NOT the round red breakpoint dot, so
+   pinning a symbol to the Watch list is never mistaken for setting a breakpoint.
+   Grayed + faded when unpinned, full colour when pinned. */
 col.col-watch { width: 22px; }
-.wdot { cursor: pointer; color: var(--vscode-descriptionForeground, #888); text-align: center; padding: 2px 0 2px 6px; }
-.wdot:hover { color: var(--vscode-foreground); }
-.wdot.on { color: var(--vscode-debugIcon-breakpointForeground, #e51400); }
+.wdot { cursor: pointer; text-align: center; padding: 2px 0 2px 6px; font-size: 12px; line-height: 1; filter: grayscale(1); opacity: 0.4; }
+.wdot:hover { opacity: 0.85; }
+.wdot.on { filter: none; opacity: 1; }
 </style></head><body>
 <div class="toolbar">
     <div class="search-wrap">
@@ -4854,8 +4856,9 @@ function render() {
         }
         // Watch toggle dot (defines are constants — nothing to watch)
         const wdot = s.defineValue !== undefined ? '<td class="wdot"></td>'
-            : '<td class="wdot' + (watchedSet.has(s.name) ? ' on' : '') + '" data-wname="' + s.name + '">'
-              + (watchedSet.has(s.name) ? '\\u25CF' : '\\u25CB') + '</td>';
+            : '<td class="wdot' + (watchedSet.has(s.name) ? ' on' : '') + '" data-wname="' + s.name
+              + '" title="' + (watchedSet.has(s.name) ? 'Pinned to Watch — click to unpin' : 'Pin to Watch')
+              + '">\\uD83D\\uDCCC</td>';   // 📌 pushpin (not a breakpoint dot)
         html += '<tr' + attrs + ' title="' + s.name + (s.aliases && s.aliases.length ? ' / ' + s.aliases.join(' / ') : '') + '">'
             + wdot
             + '<td class="name" draggable="true" data-drag="' + s.name + '">' + nameHtml + '</td>'
