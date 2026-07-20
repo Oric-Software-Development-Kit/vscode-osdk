@@ -5725,6 +5725,11 @@ const handlers = {
         running = false;
         clearGdbReadCache();
         await resyncStubBreakpoints();   // realign the emulator's bp table with the debugger's set
+        // A restored snapshot is a real running state (like attach), so the _osdk_dbg_module
+        // byte in RAM is meaningful — trust it and re-detect the active overlay, otherwise a
+        // multi-module project shows "(none)" and hides that module's symbols after a restore.
+        moduleByteTrusted = true;
+        if (moduleNames.size > 0) await checkModuleSwitch(true);
         log('Snapshot restored: ' + name + ' (PC=$' + (regs && regs.pc !== undefined ? regs.pc.toString(16).toUpperCase().padStart(4, '0') : '??') + ')');
         respond(req, { name });
         evt('stopped', { reason: 'restore', threadId: 1, allThreadsStopped: true });
