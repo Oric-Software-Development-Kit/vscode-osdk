@@ -351,6 +351,24 @@
                 "icon": "$(debug-step-over)"
             },
             {
+                "command": "oric-debug.replayRewind",
+                "title": "Oric: Replay Rewind (load previous snapshot)",
+                "icon": "$(chevron-left)",
+                "enablement": "oric-debug.canRewind"
+            },
+            {
+                "command": "oric-debug.replayForward",
+                "title": "Oric: Replay Forward (load next snapshot)",
+                "icon": "$(chevron-right)",
+                "enablement": "oric-debug.canReplayForward"
+            },
+            {
+                "command": "oric-debug.replayToHead",
+                "title": "Oric: Replay to Head (jump to most recent)",
+                "icon": "$(arrow-right)",
+                "enablement": "oric-debug.canReplayForward"
+            },
+            {
                 "command": "oric-debug.toggleWarp",
                 "title": "Oric: Toggle Warp Speed",
                 "icon": "$(rocket)"
@@ -489,9 +507,14 @@
                 "when": "oricInstructionStepMode && debugType == 'oric-debug' && debugState == 'stopped'"
             },
             {
-                "command": "workbench.action.debug.stepBack",
+                "command": "oric-debug.replayRewind",
                 "key": "shift+f10",
-                "when": "debugType == 'oric-debug' && debugState == 'stopped'"
+                "when": "debugType == 'oric-debug' && debugState == 'stopped' && oric-debug.canRewind"
+            },
+            {
+                "command": "oric-debug.replayForward",
+                "key": "shift+f12",
+                "when": "debugType == 'oric-debug' && debugState == 'stopped' && oric-debug.canReplayForward"
             }
         ],
         "menus": {
@@ -542,6 +565,18 @@
                 { "command": "oric-debug.editWatchProp", "when": "view == oricBreakpoints && viewItem == oricWatchDetail", "group": "1_wd@1" }
             ],
             "debug/toolBar": [
+                {
+                    "command": "oric-debug.replayRewind",
+                    "when": "debugType == 'oric-debug' && debugState == 'stopped'"
+                },
+                {
+                    "command": "oric-debug.replayForward",
+                    "when": "debugType == 'oric-debug' && debugState == 'stopped'"
+                },
+                {
+                    "command": "oric-debug.replayToHead",
+                    "when": "debugType == 'oric-debug' && debugState == 'stopped'"
+                },
                 {
                     "command": "oric-debug.skipInstruction",
                     "when": "debugType == 'oric-debug' && debugState == 'stopped'"
@@ -626,6 +661,18 @@
                 {
                     "command": "oric-debug.skipLine",
                     "when": "false"
+                },
+                {
+                    "command": "oric-debug.replayRewind",
+                    "when": "debugType == 'oric-debug' && debugState == 'stopped'"
+                },
+                {
+                    "command": "oric-debug.replayForward",
+                    "when": "debugType == 'oric-debug' && debugState == 'stopped'"
+                },
+                {
+                    "command": "oric-debug.replayToHead",
+                    "when": "debugType == 'oric-debug' && debugState == 'stopped'"
                 }
             ]
         },

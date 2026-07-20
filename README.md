@@ -44,7 +44,7 @@ Dedicated panels appear in the Debug sidebar when a session is active:
 
 | Panel | Description |
 |---|---|
-| **Oric Debug Controls** | A compact toolbar of the Oric-specific actions (warp, reverse-step, skip, reset cycles, show current location, snapshot) so they're one click away without hunting the Command Palette. |
+| **Oric Debug Controls** | A compact toolbar of the Oric-specific actions (warp, replay rewind/forward/to-head, skip, reset cycles, show current location, snapshot) so they're one click away without hunting the Command Palette. |
 | **Current Instruction** | The instruction about to execute, decoded with its operand values and the symbols/types they resolve to — the same annotation shown inline, in a persistent panel (globals/locals/members/subscripts/enums). |
 | **Oric Registers** | CPU registers (A, X, Y, SP, PC), processor flags (N, V, B, D, I, Z, C), last PC, cycle counter, frame count, raster line, and interrupt vectors (NMI, RST, IRQ). A/X/Y show their decoded value when the register carries a type tag. |
 | **Oric Breakpoints** | All breakpoints as a tree: **module → file → line**, with a child row per condition / hit-count / watchpoint property. Enable/disable or delete at any level (all / module / file / line), and optionally *follow the active module*. |
@@ -131,12 +131,15 @@ The Symbol Browser doubles as a **watch panel**, kept above the symbol table and
 
 ## Time-Travel Debugging
 
-The emulator keeps an in-memory **history ring** of recent machine states, so when you're stopped you can move *backwards*, not just forwards:
+The emulator keeps an in-memory **history ring** of recent machine states, so when you're stopped you can move *backwards* — and then *forwards again* toward where you were. Rewinding is **non-destructive** (a redo stack, not a consuming pop): it just moves a cursor over the recorded snapshots and reloads them, so you can freely scrub back and forth. Three toolbar buttons in *Oric Debug Controls* (and the floating debug toolbar) drive it:
 
-- **Step Back** — **Shift+F10** (or the reverse button in *Oric Debug Controls*) steps one step into the past.
-- **Reverse continue** — run backwards to the previous breakpoint/stop.
+- **⏪ Replay Rewind** — **Shift+F10** — load the previous snapshot (one step into the past).
+- **⏩ Replay Forward** — **Shift+F12** — load the next snapshot (undo a rewind, toward the present).
+- **⏭ Replay to Head** — jump straight to the most recent state. Use this to recover if you rewound too far (e.g. all the way back to program start) and want to get back to where you were in one click.
 
-History is bounded to the recent past (it's a ring buffer, not a full recording), which is exactly what you want for "how did I *get* into this bad state?" — stop on the symptom, step back to the cause. For a durable point you can return to at any time, use a **Snapshot** instead.
+The recorded "future" is only discarded when you actually **execute forward** (step/continue) while parked in the past — that timeline has genuinely diverged, so replaying forward from that point is no longer possible. Until then, rewind and forward are fully reversible.
+
+History is bounded to the recent past (it's a ring buffer, not a full recording), which is exactly what you want for "how did I *get* into this bad state?" — stop on the symptom, rewind to the cause, replay forward to watch it unfold again. For a durable point you can return to at any time, use a **Snapshot** instead.
 
 ---
 
@@ -416,7 +419,8 @@ Standard VS Code debug shortcuts also apply:
 | **F10** | Step Over |
 | **F11** | Step Into |
 | **Shift+F11** | Step Out |
-| **Shift+F10** | Step Back (reverse one step) |
+| **Shift+F10** | Replay Rewind (load previous snapshot) |
+| **Shift+F12** | Replay Forward (load next snapshot) |
 | **F9** | Toggle Breakpoint |
 | **F12** | Go to Definition (on symbol) |
 | **Ctrl+Click** | Go to Definition (on symbol) |

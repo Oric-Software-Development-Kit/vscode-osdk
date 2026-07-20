@@ -3015,7 +3015,10 @@ const REVEAL_ON_STOP_MS = 500; // focus changes within this window after a stop 
 let instrStepMode = false;
 let lastStopMs = 0;
 let stepModeStatusBar = null; // created in activate(); reflects/toggles the mode
+let hoverHelpStatusBar = null; // created in activate(); shows Debug Controls button help on hover (tooltips get covered by a large cursor — see no-tooltip-dependent-ui)
 let oricDebugStopped = false; // true between 'stopped' and 'continued' events — gates all line actions
+let replayCanRewind = false;  // history cursor can rewind (older entries exist) — gates Replay Rewind
+let replayCanForward = false; // history cursor can replay forward (a rewind to undo) — gates Forward/to-Head
 let lineActionLens = null;    // created in activate(); refreshed on stop/continue/selection change
 let currentStopLoc = null;    // {path, line} of the top stack frame while stopped (null = no source)
 let bpTreeEmitter = null;     // Oric Breakpoints tree refresh signal (created in activate)
@@ -3069,6 +3072,35 @@ function applyDebugStateVisuals() {
     // values are stale. When stopped, refreshAll() re-renders them live.
     if (!oricDebugStopped && dimLiveViews) dimLiveViews();
     postScreenRunState();   // update the Screen View turbo/paused OSD
+    updateReplayContext();  // enable/disable the Replay Rewind/Forward/to-Head buttons
+}
+
+// Drive a Replay toolbar button: ask the adapter to move the history cursor
+// (non-destructive) via a custom request. The resulting 'stopped' event refreshes
+// every view (incl. the button enablement, via applyDebugStateVisuals). No-op with
+// no active Oric session.
+async function replayNav(customReq) {
+    const session = vscode.debug.activeDebugSession;
+    if (!session || session.type !== 'oric-debug') return;
+    try { await session.customRequest(customReq); }
+    catch (e) { /* nothing to do / stub too old — silent */ }
+}
+
+// Set the context keys the Replay buttons enable on: canRewind (entries older than
+// the cursor) and canReplayForward (entries newer — i.e. a rewind we can undo).
+// Cleared whenever the program isn't stopped in an Oric session.
+async function updateReplayContext() {
+    const session = vscode.debug.activeDebugSession;
+    let back = 0, fwd = 0;
+    if (oricDebugStopped && session && session.type === 'oric-debug') {
+        try { const r = await session.customRequest('histStatus'); if (r) { back = r.back | 0; fwd = r.fwd | 0; } }
+        catch (e) { /* old stub / history disabled */ }
+    }
+    vscode.commands.executeCommand('setContext', 'oric-debug.canRewind', back > 0);
+    vscode.commands.executeCommand('setContext', 'oric-debug.canReplayForward', fwd > 0);
+    replayCanRewind = back > 0;
+    replayCanForward = fwd > 0;
+    if (debugControlsProvider) debugControlsProvider.pushState();   // refresh the toolbar buttons
 }
 
 // Debounced repaint for while an automation script runs: only fires after ~350 ms with no
@@ -3426,12 +3458,13 @@ body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size
     <button class="dbg-btn" data-act="stepOut"><span class="ic">&#8630;</span>Step Out</button>
 </div>
 <div class="grp">
-    <button class="dbg-btn rev" data-act="stepBack"><span class="ic">&#9664;</span>Step Back</button>
-    <button class="dbg-btn rev" data-act="reverse"><span class="ic">&#9194;</span>Reverse</button>
+    <button class="dbg-btn rev" data-act="replayRewind"><span class="ic">&#9194;</span>Rewind</button>
+    <button class="dbg-btn rev" data-act="replayForward"><span class="ic">&#9193;</span>Forward</button>
+    <button class="dbg-btn rev" data-act="replayToHead"><span class="ic">&#9197;</span>To Head</button>
 </div>
 <script>
 const vscode = acquireVsCodeApi();
-let stopped = true, active = false;
+let stopped = true, active = false, canRewind = false, canForward = false;
 document.body.addEventListener('click', e => {
     const b = e.target.closest('button.dbg-btn');
     if (!b || b.disabled) return;
@@ -3440,10 +3473,33 @@ document.body.addEventListener('click', e => {
     if (act === 'playpause') act = stopped ? 'continue' : 'pause';
     vscode.postMessage({ type: 'debugAction', action: act });
 });
+// Hover help: show each button's purpose + shortcut in the status bar (a visible
+// alternative to tooltips, which a large cursor tends to cover).
+const HELP = {
+    playpause: 'Continue (F5) / Pause (F6) execution',
+    stop: 'Stop the debug session  (Shift+F5)',
+    restart: 'Restart the debug session  (Ctrl+Shift+F5)',
+    stepOver: 'Step Over — execute one statement  (F10)',
+    stepInto: 'Step Into — enter the call  (F11)',
+    stepOut: 'Step Out — run to the caller  (Shift+F11)',
+    replayRewind: 'Replay Rewind — load the previous snapshot (non-destructive)  (Shift+F10)',
+    replayForward: 'Replay Forward — load the next snapshot, undoing a rewind  (Shift+F12)',
+    replayToHead: 'Replay to Head — jump to the most recent snapshot (recover from over-rewinding)'
+};
+document.querySelectorAll('button.dbg-btn').forEach(b => {
+    const help = HELP[b.dataset.act];
+    if (!help) return;
+    b.addEventListener('mouseenter', () => vscode.postMessage({ type: 'hover', text: help }));
+    b.addEventListener('mouseleave', () => vscode.postMessage({ type: 'hoverEnd' }));
+});
 function apply() {
     const set = (act, on) => { const b = document.querySelector('[data-act="' + act + '"]'); if (b) b.disabled = !on; };
-    // Stepping (forward + reverse) only makes sense while halted.
-    ['stepOver','stepInto','stepOut','stepBack','reverse'].forEach(a => set(a, active && stopped));
+    // Forward stepping only makes sense while halted.
+    ['stepOver','stepInto','stepOut'].forEach(a => set(a, active && stopped));
+    // Replay: rewind when there's older history; forward/to-head when a rewind can be undone.
+    set('replayRewind',  active && stopped && canRewind);
+    set('replayForward', active && stopped && canForward);
+    set('replayToHead',  active && stopped && canForward);
     // One button: Continue (green ▶) when halted, Pause (‖) when running; live whenever a session is.
     const pp = document.getElementById('playpause');
     if (pp) {
@@ -3454,10 +3510,19 @@ function apply() {
     set('restart', active);
     set('stop', active);
 }
-window.addEventListener('message', e => { if (e.data && e.data.type === 'state') { active = !!e.data.active; stopped = !!e.data.stopped; apply(); } });
+window.addEventListener('message', e => { if (e.data && e.data.type === 'state') { active = !!e.data.active; stopped = !!e.data.stopped; canRewind = !!e.data.canRewind; canForward = !!e.data.canForward; apply(); } });
 apply();
 </script>
 </body></html>`;
+}
+
+// Show (or clear, with null) a one-line help string in the hover-help status bar.
+// Driven by the Debug Controls webview's button mouse-over so the description +
+// shortcut are visible without relying on a tooltip.
+function showHoverHelp(text) {
+    if (!hoverHelpStatusBar) return;
+    if (text) { hoverHelpStatusBar.text = text; hoverHelpStatusBar.show(); }
+    else hoverHelpStatusBar.hide();
 }
 
 class DebugControlsWebviewProvider {
@@ -3467,14 +3532,18 @@ class DebugControlsWebviewProvider {
         view.webview.options = { enableScripts: true };
         view.webview.html = debugControlsHtml();
         view.webview.onDidReceiveMessage(msg => {
-            if (!msg || msg.type !== 'debugAction') return;
+            if (!msg) return;
+            if (msg.type === 'hover') { showHoverHelp(msg.text); return; }
+            if (msg.type === 'hoverEnd') { showHoverHelp(null); return; }
+            if (msg.type !== 'debugAction') return;
             const CMD = {
                 continue: 'workbench.action.debug.continue',
                 stepOver: 'workbench.action.debug.stepOver',
                 stepInto: 'workbench.action.debug.stepInto',
                 stepOut: 'workbench.action.debug.stepOut',
-                stepBack: 'workbench.action.debug.stepBack',
-                reverse: 'workbench.action.debug.reverseContinue',
+                replayRewind: 'oric-debug.replayRewind',
+                replayForward: 'oric-debug.replayForward',
+                replayToHead: 'oric-debug.replayToHead',
                 pause: 'workbench.action.debug.pause',
                 restart: 'workbench.action.debug.restart',
                 stop: 'workbench.action.debug.stop'
@@ -3488,7 +3557,7 @@ class DebugControlsWebviewProvider {
         if (!this._view) return;
         // Use the tracked flag, not activeDebugSession — the latter can still be set
         // during onDidTerminateDebugSession, leaving Stop looking enabled after the end.
-        this._view.webview.postMessage({ type: 'state', active: oricSessionActive, stopped: oricDebugStopped });
+        this._view.webview.postMessage({ type: 'state', active: oricSessionActive, stopped: oricDebugStopped, canRewind: replayCanRewind, canForward: replayCanForward });
     }
 }
 function setInstrStepMode(on) {
@@ -6630,6 +6699,11 @@ function activate(context) {
                 });
             }
         }),
+        // Replay navigation (redo-capable history ring): rewind / forward / to-head.
+        // Non-destructive — rewinding keeps the future so Forward/to-Head can return.
+        vscode.commands.registerCommand('oric-debug.replayRewind', () => replayNav('oricReplayRewind')),
+        vscode.commands.registerCommand('oric-debug.replayForward', () => replayNav('oricReplayForward')),
+        vscode.commands.registerCommand('oric-debug.replayToHead', () => replayNav('oricReplayToHead')),
         vscode.commands.registerCommand('oric-debug.toggleWarp', () => doToggleWarp()),
         vscode.commands.registerCommand('oric-debug.warpOn', () => doToggleWarp()),
         vscode.commands.registerCommand('oric-debug.warpOff', () => doToggleWarp()),
@@ -7002,13 +7076,23 @@ function activate(context) {
 
     // Step granularity (Statement vs Instruction). Reflects the mode set by clicking a
     // source editor vs the Oric Disassembly; also clickable to toggle directly.
+    // Hover help for the Debug Controls buttons: their descriptions + shortcuts appear
+    // here on mouse-over (a visible alternative to tooltips, which a large cursor covers).
+    // LEFT-aligned with a very LOW priority so it's the LAST (right-most) item of the left
+    // group — to the right of Build & Debug and our other items. For left-aligned items a
+    // lower priority sits further right, so with nothing to its right and the middle gap to
+    // its left of the right group, it shows/hides on mouse-move WITHOUT shifting anything.
+    hoverHelpStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, -100000);
+    hoverHelpStatusBar.color = '#e3b341';   // amber accent so the help reads as a hint, not a plain white line
+    context.subscriptions.push(hoverHelpStatusBar);
+
     stepModeStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 88);
     stepModeStatusBar.command = 'oric-debug.toggleStepMode';
     stepModeStatusBar.tooltip = 'F10/F11 step granularity — click to toggle (or select a source / the Oric Disassembly)';
     stepModeStatusBar.text = '$(debug-step-over) Step: Statement';
     context.subscriptions.push(stepModeStatusBar);
     context.subscriptions.push(vscode.commands.registerCommand('oric-debug.toggleStepMode', () => setInstrStepMode(!instrStepMode)));
-    context.subscriptions.push(vscode.debug.onDidTerminateDebugSession(() => { stepModeStatusBar.hide(); setInstrStepMode(false); }));
+    context.subscriptions.push(vscode.debug.onDidTerminateDebugSession(() => { stepModeStatusBar.hide(); if (hoverHelpStatusBar) hoverHelpStatusBar.hide(); setInstrStepMode(false); }));
     context.subscriptions.push(vscode.debug.onDidStartDebugSession(s => { if (s.type === 'oric-debug') stepModeStatusBar.show(); }));
 
     // Clicking a source editor returns to statement stepping — but ignore the automatic

@@ -245,7 +245,8 @@ let pendingCmd = null;       // full pending GDB command (some commands reply wi
 function stopReplyIsResponse() {
     return pendingCmdType === '?' || pendingCmd === 'qOricHardReset' ||
            (pendingCmd !== null && pendingCmd.indexOf('qOricLoadSnapshot,') === 0) ||
-           (pendingCmd !== null && pendingCmd.indexOf('qOricHistBack,') === 0);
+           (pendingCmd !== null && pendingCmd.indexOf('qOricHistBack,') === 0) ||
+           (pendingCmd !== null && pendingCmd.indexOf('qOricHistForward,') === 0);
 }
 let gdbQueue = [];           // queued commands: [{cmd, resolve}]
 let disconnecting = false;
@@ -3695,10 +3696,12 @@ async function connectAndHandshake(req) {
             try { await gdbCmd('qOricHistConfig,' + histBudgetKB); } catch (e) { /* old stub: no history */ }
             respond(req);
             evt('initialized');
-            // supportsStepBack depends on the (config-driven) history budget, unknown at
-            // initialize time — announce it now via a CapabilitiesEvent so VS Code shows
-            // the Step Back / Reverse buttons.
-            if (histEnabled) evt('capabilities', { capabilities: { supportsStepBack: true } });
+            // NOTE: we deliberately do NOT advertise supportsStepBack. VS Code's native
+            // Step Back / Reverse buttons are "step"-flavoured and can't be relabeled;
+            // instead the extension contributes custom Replay Rewind / Forward / to-Head
+            // toolbar buttons (custom requests oricReplayRewind/Forward/ToHead below),
+            // gated on the oric.canRewind / oric.canReplayForward context keys it sets from
+            // qOricHistStatus. history navigation is non-destructive (redo-capable ring).
             return true;
         } catch (e) {
             if (attempt < retries) {
@@ -3717,12 +3720,33 @@ function fireAddrBps() {
 }
 
 // Push the current machine state onto the emulator's history ring before a
-// user-visible FORWARD step, so Step Back / Reverse Continue can return to it.
-// No-op when history is disabled. Called only at the user step-request entry —
-// NOT on the adapter's internal transparent steps (module-watch, step-over temp
-// bp), which would over-capture.
+// user-visible FORWARD step, so Replay Rewind can return to it. No-op when
+// history is disabled. Called only at the user step-request entry — NOT on the
+// adapter's internal transparent steps (module-watch, step-over temp bp), which
+// would over-capture. When the ring cursor is parked in the past, this is also
+// what discards the diverged "future" (handled emulator-side in hist_push).
 async function histPush() {
     if (histEnabled) { try { await gdbCmd('qOricHistPush'); } catch (e) { /* ignore */ } }
+}
+
+// Shared replay navigation: send a qOricHist{Back,Forward} command and, on a T05
+// stop reply, adopt the restored registers, resync breakpoints, and emit a
+// 'stopped' event so VS Code refreshes. A non-'T' reply ("E hist: nothing …")
+// means the cursor was already at an end — we still emit 'stopped' to re-sync the
+// UI at the current location. Returns true if the cursor actually moved.
+async function histNav(gdbHistCmd) {
+    let moved = false;
+    if (histEnabled) {
+        const reply = await gdbCmd(gdbHistCmd);
+        if (typeof reply === 'string' && reply[0] === 'T') {
+            regs = parseStopRegs(reply);
+            running = false;
+            await resyncStubBreakpoints();
+            moved = true;
+        }
+    }
+    evt('stopped', { reason: 'step', threadId: 1, allThreadsStopped: true });
+    return moved;
 }
 
 // Full relaunch from within the restart handler: kill the current emulator,
@@ -4615,7 +4639,7 @@ const handlers = {
 
     async continue(req) {
         resumeMode = 'run';
-        await histPush();   // record the state we're leaving, for Step Back / Reverse
+        await histPush();   // record the state we're leaving (and diverge the future if parked)
         // If PC is sitting on a breakpoint, single-step past it first,
         // then continue via the continueAfterStep flag in onStopReply
         if (regs && regs.pc !== undefined) {
@@ -4709,46 +4733,19 @@ const handlers = {
         gdbWrite('O');
     },
 
-    // -- Reverse execution (time-travel history ring) -------------
-    // The forward handlers push the pre-step state; these pop + restore it. The
-    // stub's qOricHistBack restores and replies with a T05 stop reply (treated as
-    // this command's response, see stopReplyIsResponse). A restored history entry
-    // carries its own saved breakpoint table, so resync the stub to the current
-    // set afterwards (like a snapshot load).
-    async stepBack(req) {
-        respond(req);
-        if (!histEnabled) { evt('stopped', { reason: 'step', threadId: 1, allThreadsStopped: true }); return; }
-        const reply = await gdbCmd('qOricHistBack,1');
-        if (typeof reply !== 'string' || reply[0] === 'E' || reply[0] !== 'T') {
-            evt('stopped', { reason: 'step', threadId: 1, allThreadsStopped: true }); // nothing to step back to
-            return;
-        }
-        regs = parseStopRegs(reply);
-        running = false;
-        await resyncStubBreakpoints();
-        evt('stopped', { reason: 'step', threadId: 1, allThreadsStopped: true });
-    },
-
-    async reverseContinue(req) {
-        respond(req);
-        if (!histEnabled) { evt('stopped', { reason: 'pause', threadId: 1, allThreadsStopped: true }); return; }
-        // Step back through history until a breakpoint PC or the oldest entry.
-        // Bounded by the ring depth so it always terminates.
-        let count = 0;
-        const st = await gdbCmd('qOricHistStatus');
-        const m = /^hist:(\d+)/.exec(st || '');
-        if (m) count = parseInt(m[1], 10);
-        let lastReply = null;
-        for (let i = 0; i < count; i++) {
-            const reply = await gdbCmd('qOricHistBack,1');
-            if (typeof reply !== 'string' || reply[0] !== 'T') break;
-            lastReply = reply;
-            const r = parseStopRegs(reply);
-            if (r && r.pc !== undefined && stoppingBpAt(r.pc)) break; // reached a breakpoint
-        }
-        if (lastReply) { regs = parseStopRegs(lastReply); running = false; await resyncStubBreakpoints(); }
-        evt('stopped', { reason: 'breakpoint', threadId: 1, allThreadsStopped: true });
-    },
+    // -- Replay navigation (time-travel history ring, REDO-capable) -------------
+    // The forward handlers (continue/step) push the pre-step state; these move the
+    // ring CURSOR and restore — WITHOUT discarding anything, so you can replay
+    // forward again toward where you were. The recorded future is dropped only when
+    // you actually execute forward while parked in the past (native to hist_push).
+    // The stub's qOricHistBack/Forward reply with a T05 stop reply (treated as the
+    // command's response, see stopReplyIsResponse). A restored entry carries its own
+    // saved breakpoint table, so resync the stub afterwards (like a snapshot load).
+    // These are custom requests driven by the extension's Replay toolbar buttons.
+    async oricReplayRewind(req)  { respond(req); await histNav('qOricHistBack,1'); },
+    async oricReplayForward(req) { respond(req); await histNav('qOricHistForward,1'); },
+    // Jump to the head (most recent state) in one go: forward by "everything".
+    async oricReplayToHead(req)  { respond(req); await histNav('qOricHistForward,4294967295'); },
 
     pause(req) {
         respond(req);
@@ -6515,16 +6512,18 @@ const handlers = {
             for (const bp of fileBps) for (const b of bp.bindings) (b.armed ? bpAddrs : pendingAddrs).push(b.addr);
         }
 
-        // Time-travel history line: how many steps back are available, and a one-line
-        // preview of where Step Back would land (the top of the ring). The target can be
-        // a far/unrelated address after a free-run, so the view shows it as a distinct
-        // row, NOT as the instruction physically above the PC.
+        // Time-travel history line: how far the cursor can rewind, and a one-line
+        // preview of where Replay Rewind would land. The target can be a far/unrelated
+        // address after a free-run, so the view shows it as a distinct row, NOT as the
+        // instruction physically above the PC. `fwd` carries replay-forward availability
+        // so the panel/buttons can reflect the redo direction too.
         let history = null;
         try {
-            const hs = await gdbCmd('qOricHistStatus');   // "hist:<count>,<prevpchex|->"
-            const hm = /^hist:(\d+),([0-9a-fA-F]+|-)$/.exec(hs || '');
+            const hs = await gdbCmd('qOricHistStatus');   // "hist:<back>,<prevpc>,<fwd>,<nextpc>"
+            const hm = /^hist:(\d+),([0-9a-fA-F]+|-),(\d+),([0-9a-fA-F]+|-)$/.exec(hs || '');
             if (hm) {
                 const depth = parseInt(hm[1], 10);
+                const fwd = parseInt(hm[3], 10);
                 if (depth > 0 && hm[2] !== '-') {
                     const paddr = parseInt(hm[2], 16) & 0xFFFF;
                     const mem = await readMem(paddr, 3);
@@ -6541,9 +6540,9 @@ const handlers = {
                     const label = (R && R.symbol)
                         ? fmtSymOff(R.symbol)
                         : (romLabelFor(paddr) || '');
-                    history = { depth, address: paddr, text, label };
+                    history = { depth, fwd, address: paddr, text, label };
                 } else {
-                    history = { depth };   // ring empty (or disabled → depth 0): no target
+                    history = { depth, fwd };   // ring empty (or disabled → depth 0): no target
                 }
             }
         } catch (e) { /* old stub / history disabled — no history line */ }
@@ -6555,6 +6554,22 @@ const handlers = {
 
     getCycleAnnotation(req) {
         respond(req, { annotation: lastCycleAnnotation });
+    },
+
+    // -- Replay availability (custom request) -------------------------
+    // Cheap status for the Replay toolbar buttons: how many entries the cursor
+    // can rewind (back) / replay forward (fwd). The extension sets its
+    // oric-debug.canRewind / canReplayForward context keys from this on each stop.
+    async histStatus(req) {
+        let back = 0, fwd = 0;
+        if (histEnabled) {
+            try {
+                const hs = await gdbCmd('qOricHistStatus');   // "hist:<back>,<prevpc>,<fwd>,<nextpc>"
+                const hm = /^hist:(\d+),(?:[0-9a-fA-F]+|-),(\d+),(?:[0-9a-fA-F]+|-)$/.exec(hs || '');
+                if (hm) { back = parseInt(hm[1], 10); fwd = parseInt(hm[2], 10); }
+            } catch (e) { /* old stub / disabled */ }
+        }
+        respond(req, { enabled: histEnabled, back, fwd });
     },
 
     // -- Map an address to its source location (custom request) -------
