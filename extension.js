@@ -3034,6 +3034,9 @@ let oricSessionActive = false; // true between an oric-debug session's start and
 let oricWarpOn = false;       // current warp/turbo speed state (mirrors the toggleWarp toggle) — for the Screen View OSD
 let dimLiveViews = null;      // set in activate: greys the live-data views (regs/peripherals/…) when not stopped
 let refreshAllViews = null;   // set in activate = refreshAll; lets module-level code repaint the panels
+let handleSymBpAction = null; // set in activate: perform a Symbols-panel breakpoint action (exec bp / watchpoint)
+let refreshSymbolBpMarks = null; // set in activate: push the set of bp/wp addresses to the Symbols panel
+let lastAddrBpAddrs = [];     // cache of adapter-owned address-bp addresses (for the Symbols panel marks)
 let automationUiTimer = null; // debounces UI repaints while an automation script cycles stop/continue
 let oricUserPaused = false;   // true when the USER paused the debugger mid-automation (not an automation-issued pause) — waits suspend
 let automationPauseInFlight = false; // set while the automation itself issues a pause, so its own stop isn't mistaken for a user pause
@@ -3701,8 +3704,16 @@ function removeWatchedExpr(expr) {
 // adapter's variablesReference is only valid until the next resume, so the
 // webview never stores one — it just reports expand/collapse by path and
 // receives the fully-resolved tree each refresh.
+// Source {file,line} for a top-level watched symbol (from the shared symbol cache),
+// so a pinned row can be clicked to jump to its definition — like the search results.
+// Only plain symbols resolve; computed expressions (a[i].f) have no single source.
+function watchNodeSource(expr) {
+    const c = symbolCache.get(expr);
+    return (c && c.source && c.source.file) ? { file: c.source.file, line: c.source.line } : undefined;
+}
 async function buildWatchNode(session, path, label, value, vref, error, depth) {
     const node = { path, label, value, error: !!error, canExpand: !!vref, expanded: false, children: null };
+    if (depth === 0) { const src = watchNodeSource(label); if (src) node.source = src; }
     if (vref && watchExpanded.has(path) && depth < 8) {
         node.expanded = true;
         try {
@@ -3734,7 +3745,7 @@ async function refreshWatchValues(session) {
     for (const e of exprs) {
         try {
             const r = await session.customRequest('evaluate', { expression: e, context: 'watch' });
-            if (r && r.inactive) inactive.push({ path: e, label: e, owners: r.owners || '' });
+            if (r && r.inactive) inactive.push({ path: e, label: e, owners: r.owners || '', source: watchNodeSource(e) });
             else active.push(await buildWatchNode(session, e, e, (r && r.result) || '', r && r.variablesReference, false, 0));
         } catch (err) {
             const m = err && err.message ? err.message : 'error';
@@ -3755,7 +3766,7 @@ async function refreshWatchValues(session) {
 function postStaleWatch(exprs) {
     if (!lastWatchGood) {
         symbolsPanel.webview.postMessage({ type: 'watch', noSession: true,
-            active: exprs.map(e => ({ path: e, label: e, value: '' })), inactive: [] });
+            active: exprs.map(e => ({ path: e, label: e, value: '', source: watchNodeSource(e) })), inactive: [] });
         return;
     }
     const keep = new Set(exprs);
@@ -3763,7 +3774,7 @@ function postStaleWatch(exprs) {
     const inactive = lastWatchGood.inactive.filter(n => keep.has(n.path));
     const have = new Set([...active.map(n => n.path), ...inactive.map(n => n.path)]);
     for (const e of exprs)
-        if (!have.has(e)) active.push({ path: e, label: e, value: '' });
+        if (!have.has(e)) active.push({ path: e, label: e, value: '', source: watchNodeSource(e) });
     symbolsPanel.webview.postMessage({ type: 'watch', stale: true, active, inactive });
 }
 
@@ -3872,6 +3883,8 @@ function setupSymbolsPanel(panel) {
             removeWatchedExpr(msg.expr);
             saveWatchedExprs();
             refreshWatchValues(vscode.debug.activeDebugSession);
+        } else if (msg.type === 'symBp' && typeof msg.addr === 'number') {
+            if (handleSymBpAction) handleSymBpAction(msg);   // set/remove exec bp or watchpoint (activate closure)
         } else if (msg.type === 'mruGet') {
             panel.webview.postMessage({ type: 'mru', items: symbolMru });
         } else if (msg.type === 'mruUpdate' && Array.isArray(msg.items)) {
@@ -3953,6 +3966,7 @@ function refreshSymbolsPanel(session) {
                 // Merge runtime symbols with defines
                 const combined = [...resp.symbols, ...buildDefineEntries()];
                 symbolsPanel.webview.postMessage({ type: 'symbols', data: combined });
+                if (refreshSymbolBpMarks) refreshSymbolBpMarks();   // light the bp dots
             }
         }
     }).catch(() => {});
@@ -4677,6 +4691,23 @@ col.col-watch { width: 22px; }
 .wdot { cursor: pointer; text-align: center; padding: 2px 0 2px 6px; font-size: 12px; line-height: 1; filter: grayscale(1); opacity: 0.4; }
 .wdot:hover { opacity: 0.85; }
 .wdot.on { filter: none; opacity: 1; }
+/* Breakpoint marker column — the REAL breakpoint (execution or watchpoint), red like
+   the gutter. Hollow ring when none, solid dot when set. Click opens the action menu. */
+col.col-bp { width: 20px; }
+.bpdot { cursor: pointer; text-align: center; padding: 2px 0 2px 6px; font-size: 13px; line-height: 1;
+    color: var(--vscode-debugIcon-breakpointForeground, #e51400); opacity: 0.35; }
+.bpdot:hover { opacity: 0.85; }
+.bpdot.on { opacity: 1; }
+/* Per-row breakpoint action menu (webviews have no native context menu). */
+#symBpMenu {
+    position: fixed; z-index: 50; display: none; min-width: 150px;
+    background: var(--vscode-menu-background, #252526);
+    border: 1px solid var(--vscode-menu-border, #454545);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4); padding: 3px 0;
+}
+#symBpMenu .mi { padding: 4px 14px; cursor: pointer; white-space: nowrap; color: var(--vscode-menu-foreground, #ccc); }
+#symBpMenu .mi:hover { background: var(--vscode-menu-selectionBackground, #094771); color: var(--vscode-menu-selectionForeground, #fff); }
+#symBpMenu .sep { height: 1px; background: var(--vscode-menu-separatorBackground, #454545); margin: 3px 0; }
 </style></head><body>
 <div class="toolbar">
     <div class="search-wrap">
@@ -4700,6 +4731,7 @@ col.col-watch { width: 22px; }
 <div id="symWrap">
 <table>
     <colgroup>
+        <col class="col-bp">
         <col class="col-watch">
         <col class="col-name">
         <col class="col-addr">
@@ -4708,6 +4740,7 @@ col.col-watch { width: 22px; }
         <col class="col-group">
     </colgroup>
     <thead><tr>
+        <th></th>
         <th></th>
         <th data-col="name">Name <span class="arrow"></span></th>
         <th data-col="addr">Addr <span class="arrow"></span></th>
@@ -4719,6 +4752,7 @@ col.col-watch { width: 22px; }
 </table>
 <div class="dim" id="nodata">No debug session or no symbols loaded</div>
 </div>
+<div id="symBpMenu"></div>
 <script>
 const vscode = acquireVsCodeApi();
 const searchEl = document.getElementById('search');
@@ -4739,6 +4773,7 @@ let watchInactive = [];        // [{path, label, owners}]
 let watchNoSession = false;
 let watchStale = false;        // session ended — showing the last live values grayed
 let watchedSet = new Set();    // exprs, for the row dots
+let bpMarks = new Set();       // addresses with an execution bp or watchpoint, for the bp column
 let prevWatchVals = {};        // expr -> value, red-highlight changes
 let watchInactiveOpen = false; // <details> fold state survives re-renders
 let prevValues = {};   // name -> value string for change detection
@@ -4854,12 +4889,21 @@ function render() {
         if (s.aliases && s.aliases.length > 0) {
             nameHtml += ' <span class="alias">/ ' + s.aliases.map(a => nameSpan(a)).join(' / ') + '</span>';
         }
+        // Breakpoint marker (defines are constants / addr-less — no breakpoint).
+        const bpon = bpMarks.has(s.addr);
+        const bpsrc = (s.source && s.source.file)
+            ? ' data-bpfile="' + s.source.file.replace(/"/g, '&quot;') + '" data-bpline="' + s.source.line + '"' : '';
+        const bpcell = (s.defineValue !== undefined || s.addr < 0) ? '<td class="bpdot"></td>'
+            : '<td class="bpdot' + (bpon ? ' on' : '') + '" data-bpaddr="' + s.addr + '" data-bpname="' + s.name + '" data-bpsize="' + (s.size > 0 ? s.size : 1) + '"' + bpsrc
+              + ' title="' + (bpon ? 'Breakpoint set — click to change/remove' : 'Set breakpoint / watchpoint') + '">'
+              + (bpon ? '\\u25CF' : '\\u25CB') + '</td>';
         // Watch toggle dot (defines are constants — nothing to watch)
         const wdot = s.defineValue !== undefined ? '<td class="wdot"></td>'
             : '<td class="wdot' + (watchedSet.has(s.name) ? ' on' : '') + '" data-wname="' + s.name
               + '" title="' + (watchedSet.has(s.name) ? 'Pinned to Watch — click to unpin' : 'Pin to Watch')
               + '">\\uD83D\\uDCCC</td>';   // 📌 pushpin (not a breakpoint dot)
         html += '<tr' + attrs + ' title="' + s.name + (s.aliases && s.aliases.length ? ' / ' + s.aliases.join(' / ') : '') + '">'
+            + bpcell
             + wdot
             + '<td class="name" draggable="true" data-drag="' + s.name + '">' + nameHtml + '</td>'
             + '<td class="addr">' + (s.addr >= 0 ? h(s.addr, 4) : '\u2014') + '</td>'
@@ -4963,11 +5007,46 @@ tbody.addEventListener('click', e => {
         vscode.postMessage({ type: 'watchToggle', expr: dot.dataset.wname });
         return;
     }
+    const bp = e.target.closest('.bpdot[data-bpaddr]');
+    if (bp) {
+        openBpMenu(bp, e.clientX, e.clientY);
+        return;
+    }
     const link = e.target.closest('.sym-link[data-file]');
     if (link) {
         vscode.postMessage({ type: 'gotoSymbol', file: link.dataset.file, line: parseInt(link.dataset.line, 10) });
     }
 });
+
+// --- Per-row breakpoint action menu (webviews have no native context menu) ---
+const symBpMenu = document.getElementById('symBpMenu');
+let bpMenuTarget = null;   // { addr, name, size, on }
+function openBpMenu(cell, x, y) {
+    bpMenuTarget = { addr: parseInt(cell.dataset.bpaddr, 10), name: cell.dataset.bpname,
+                     size: parseInt(cell.dataset.bpsize, 10) || 1, on: cell.classList.contains('on'),
+                     file: cell.dataset.bpfile || null, line: cell.dataset.bpline ? parseInt(cell.dataset.bpline, 10) : 0 };
+    symBpMenu.innerHTML =
+        '<div class="mi" data-act="execute">Break on execute</div>' +
+        '<div class="mi" data-act="change">Break on change</div>' +
+        '<div class="mi" data-act="access">Break on access</div>' +
+        (bpMenuTarget.on ? '<div class="sep"></div><div class="mi" data-act="remove">Remove breakpoint</div>' : '');
+    symBpMenu.style.display = 'block';
+    // Keep the menu on-screen.
+    const mw = symBpMenu.offsetWidth, mh = symBpMenu.offsetHeight;
+    symBpMenu.style.left = Math.max(2, Math.min(x, window.innerWidth - mw - 4)) + 'px';
+    symBpMenu.style.top = Math.max(2, Math.min(y, window.innerHeight - mh - 4)) + 'px';
+}
+function closeBpMenu() { symBpMenu.style.display = 'none'; bpMenuTarget = null; }
+symBpMenu.addEventListener('click', e => {
+    const mi = e.target.closest('.mi');
+    if (!mi || !bpMenuTarget) return;
+    vscode.postMessage({ type: 'symBp', action: mi.dataset.act, addr: bpMenuTarget.addr, name: bpMenuTarget.name, size: bpMenuTarget.size, file: bpMenuTarget.file, line: bpMenuTarget.line });
+    closeBpMenu();
+});
+document.addEventListener('click', e => {
+    if (symBpMenu.style.display === 'block' && !symBpMenu.contains(e.target) && !e.target.closest('.bpdot')) closeBpMenu();
+});
+window.addEventListener('keydown', e => { if (e.key === 'Escape') closeBpMenu(); });
 
 // --- Watched expressions section ---
 function escW(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
@@ -5048,8 +5127,13 @@ function renderWatch() {
         }
         let guides = '';
         for (let i = 0; i < depth; i++) guides += '<span class="wg"></span>';
+        // Top-level symbol rows are clickable to jump to their definition (like the search
+        // results); computed/child rows have no single source, so stay plain.
+        const linkable = depth === 0 && n.source && n.source.file;
+        const nameCls = linkable ? 'wn sym-link' : 'wn';
+        const nameAttrs = linkable ? ' data-file="' + escW(n.source.file) + '" data-line="' + n.source.line + '"' : '';
         let html = '<div class="wrow">' + guides + twisty
-            + '<span class="wn">' + escW(n.label) + '</span>' + x + ' = ' + val + '</div>';
+            + '<span class="' + nameCls + '"' + nameAttrs + '>' + escW(n.label) + '</span>' + x + ' = ' + val + '</div>';
         if (n.expanded && n.children)
             for (const c of n.children) html += wnode(c, depth + 1, false);
         return html;
@@ -5067,6 +5151,8 @@ function renderWatch() {
 }
 
 watchSec.addEventListener('click', e => {
+    const link = e.target.closest('.sym-link[data-file]');
+    if (link) { vscode.postMessage({ type: 'gotoSymbol', file: link.dataset.file, line: parseInt(link.dataset.line, 10) }); return; }
     const x = e.target.closest('.wx[data-expr]');
     if (x) { vscode.postMessage({ type: 'watchRemove', expr: x.dataset.expr }); return; }
     const t = e.target.closest('.wt[data-path]');
@@ -5102,6 +5188,11 @@ window.addEventListener('message', e => {
         if (setChanged) render();
     } else if (e.data.type === 'mru') {
         mruItems = (e.data.items || []).slice(0, MRU_MAX);
+    } else if (e.data.type === 'symBpMarks') {
+        const next = new Set((e.data.addrs || []));
+        const changed = next.size !== bpMarks.size || [...next].some(a => !bpMarks.has(a));
+        bpMarks = next;
+        if (changed) render();   // flip the bp dots
     }
 });
 vscode.postMessage({ type: 'mruGet' }); // load the persisted search history
@@ -5774,6 +5865,84 @@ function activate(context) {
                 .then(undefined, e => vscode.window.showWarningMessage('Oric: watchpoint arm failed — ' + (e && e.message ? e.message : String(e)) + ' (is the emulator the conditional-watchpoint build, and the session live?)'));
         }
     }
+
+    // Push the set of addresses that carry an execution breakpoint OR a watchpoint to the
+    // Symbols panel, so its per-row breakpoint dots show solid. Union of the adapter-owned
+    // address breakpoints (cached in lastAddrBpAddrs, refreshed by rebuildBpTree) and the
+    // extension-owned watchpoints.
+    refreshSymbolBpMarks = () => {
+        if (!symbolsPanel) return;
+        const addrs = new Set();
+        for (const w of watchBpList) addrs.add(w.address & 0xFFFF);
+        for (const a of lastAddrBpAddrs) addrs.add(a & 0xFFFF);
+        // Source breakpoints: light the dot for any symbol whose declared line carries one,
+        // so a bp set from this panel OR from the editor gutter shows on the row (both ways).
+        const srcBps = vscode.debug.breakpoints.filter(b => b instanceof vscode.SourceBreakpoint);
+        if (srcBps.length) {
+            for (const entry of symbolCache.values()) {
+                if (entry.addr < 0 || !entry.source || !entry.source.file || !entry.source.line) continue;
+                const line0 = entry.source.line - 1;
+                if (srcBps.some(b => b.location.range.start.line === line0 &&
+                        canonPath(b.location.uri.fsPath) === canonPath(entry.source.file)))
+                    addrs.add(entry.addr & 0xFFFF);
+            }
+        }
+        symbolsPanel.webview.postMessage({ type: 'symBpMarks', addrs: [...addrs] });
+    };
+
+    // Perform a breakpoint action requested from a Symbols-panel row. All three actions are
+    // address-keyed so the row dot stays accurate: execute = an adapter-owned ADDRESS
+    // (execution) breakpoint; change/access = a watchpoint (write / read+write) sized to the
+    // symbol; remove = clear whichever is set at that address.
+    handleSymBpAction = async (msg) => {
+        const addr = msg.addr & 0xFFFF;
+        const size = msg.size || 1;
+        const label = msg.name || null;
+        const session = vscode.debug.activeDebugSession;
+        const liveOric = session && session.type === 'oric-debug';
+        const addrBpPresent = async () => {
+            if (!liveOric) return false;
+            try { const r = await session.customRequest('listAddressBreakpoints', {}); return !!(r && r.breakpoints && r.breakpoints.some(b => (b.address & 0xFFFF) === addr)); }
+            catch (e) { return false; }
+        };
+        // Find an existing SOURCE breakpoint at the symbol's declared line (if any).
+        const findSrcBp = () => {
+            if (!(msg.file && msg.line > 0)) return null;
+            const uri = vscode.Uri.file(msg.file), line0 = msg.line - 1;
+            return vscode.debug.breakpoints.find(bp => bp instanceof vscode.SourceBreakpoint &&
+                canonPath(bp.location.uri.fsPath) === canonPath(uri.fsPath) &&
+                bp.location.range.start.line === line0) || null;
+        };
+        if (msg.action === 'execute') {
+            // Prefer a real SOURCE breakpoint (visible in the editor gutter, and the SAME
+            // object a gutter click would make — so no duplicate) when the symbol maps to
+            // source; fall back to an adapter-owned address bp only for source-less symbols.
+            if (msg.file && msg.line > 0) {
+                if (!findSrcBp()) vscode.debug.addBreakpoints([new vscode.SourceBreakpoint(
+                    new vscode.Location(vscode.Uri.file(msg.file), new vscode.Position(msg.line - 1, 0)))]);
+            } else if (liveOric) {
+                if (!(await addrBpPresent())) await session.customRequest('toggleAddressBreakpoint', { address: addr }).catch(() => {});
+            } else {
+                vscode.window.showInformationMessage('Start a debug session to set an execution breakpoint (this symbol has no source line).');
+            }
+        } else if (msg.action === 'change' || msg.action === 'access') {
+            const access = msg.action === 'change' ? 'write' : 'readWrite';
+            if (!watchBpList.some(w => (w.address & 0xFFFF) === addr && w.access === access)) {
+                watchBpList.push({ id: 'w' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36),
+                    address: addr, size, access, module: null, condition: null, logMessage: null, enabled: true, label });
+                pushWatchpoints();
+                if (!liveOric) vscode.window.showInformationMessage('Watchpoint added — will arm when you start debugging.');
+            }
+        } else if (msg.action === 'remove') {
+            const before = watchBpList.length;
+            watchBpList = watchBpList.filter(w => (w.address & 0xFFFF) !== addr);
+            if (watchBpList.length !== before) pushWatchpoints();
+            const sb = findSrcBp();
+            if (sb) vscode.debug.removeBreakpoints([sb]);
+            if (await addrBpPresent()) await session.customRequest('toggleAddressBreakpoint', { address: addr }).catch(() => {});
+        }
+        if (refreshSymbolBpMarks) refreshSymbolBpMarks();
+    };
     // Resolve a watch target: "$BFED"/"0xBFED" = hex addr, bare digits = decimal addr
     // (the no-implicit-hex rule), anything else = a symbol resolved via the adapter.
     async function resolveWatchTarget(t) {
@@ -5961,6 +6130,10 @@ function activate(context) {
             } catch (e) { /* old adapter without the request: no address category */ }
         }
         if (gen !== bpTreeGen) return;   // a newer rebuild started during the await — let it win
+        // Cache the address-bp addresses and refresh the Symbols-panel bp dots (also covers
+        // watchpoint changes: pushWatchpoints fires bpTreeEmitter, which re-runs this).
+        lastAddrBpAddrs = addrBpList.map(b => b.address & 0xFFFF);
+        if (refreshSymbolBpMarks) refreshSymbolBpMarks();
         const nameOf = new Map(modulesMeta.map(m => [String(m.id), m.name]));
         // module -> { files: fsPath -> { uri, name, lines: locKey -> { line, col, uri, bps:[] } } }
         const mods = new Map();
