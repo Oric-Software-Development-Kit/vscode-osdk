@@ -454,7 +454,7 @@ function wireMemoryPanel(panel, initialEntries) {
     for (const e of (initialEntries || [])) {
         if (!e || !e.expression) continue;
         const entry = { expression: e.expression, rows: e.rows || 8, format: e.format || 'hex',
-            w: e.w || 40, h: e.h || 128, grid: !!e.grid, zoom: e.zoom || 2 };   // w = bytes/row
+            w: e.w || 40, h: e.h || 128, grid: !!e.grid, zoom: e.zoom || 2, decoder: e.decoder || 'hires', transp: e.transp || 'gray' };   // w = bytes/row
         state.entries.push(entry);
         state.results.push({ ...entry, address: null, data: '', error: null });
     }
@@ -463,7 +463,7 @@ function wireMemoryPanel(panel, initialEntries) {
         if (msg.type === 'add' && msg.expression) {
             const expr = msg.expression.trim();
             if (expr && !state.entries.some(e => e.expression === expr)) {
-                const entry = { expression: expr, rows: 8, format: 'hex', w: 40, h: 128, grid: false, zoom: 2 };   // w = bytes/row
+                const entry = { expression: expr, rows: 8, format: 'hex', w: 40, h: 128, grid: false, zoom: 2, decoder: 'hires', transp: 'gray' };   // w = bytes/row
                 state.entries.push(entry);
                 state.results.push({ ...entry, address: null, data: '', error: null });
                 const session = vscode.debug.activeDebugSession;
@@ -503,6 +503,8 @@ function wireMemoryPanel(panel, initialEntries) {
                 if (msg.h !== undefined) entry.h = Math.max(1, Math.min(2048, msg.h | 0));  // scanlines
                 if (msg.grid !== undefined) entry.grid = !!msg.grid;
                 if (msg.zoom !== undefined) entry.zoom = Math.max(1, Math.min(16, msg.zoom | 0));
+                if (msg.decoder !== undefined) entry.decoder = msg.decoder;
+                if (msg.transp !== undefined) entry.transp = msg.transp;
                 const session = vscode.debug.activeDebugSession;
                 if (session && session.type === 'oric-debug') {
                     evaluateOne(session, state, msg.index).then(() => postResults(panel, state));
@@ -598,7 +600,7 @@ body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(
 .entry-hdr .controls { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 .rows-input { width: 38px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #444); padding: 1px 3px; font-family: inherit; font-size: 0.9em; text-align: center; }
 .rows-label { color: var(--vscode-descriptionForeground, #888); font-size: 0.9em; }
-.fmt-select, .gfx-zoom { background: var(--vscode-dropdown-background, var(--vscode-input-background)); color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground)); border: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, #444)); padding: 1px 3px; font-family: inherit; font-size: 0.9em; }
+.fmt-select, .gfx-zoom, .gfx-dec, .gfx-transp { background: var(--vscode-dropdown-background, var(--vscode-input-background)); color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground)); border: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, #444)); padding: 1px 3px; font-family: inherit; font-size: 0.9em; }
 .remove { cursor: pointer; color: var(--vscode-descriptionForeground, #888); padding: 0 2px; font-size: 1.2em; }
 .remove:hover { color: var(--vscode-errorForeground, #f44); }
 .dump { white-space: pre; line-height: 1.4; color: var(--vscode-editor-foreground); }
@@ -659,7 +661,35 @@ function hiresDecode(hex, w, h, stride) {
     }
     return out;
 }
-const gfxState = {};   // idx -> { off, w, h, stride, base, zoom, grid, px, data }
+// Masked-sprite decoder (Encounter's software format — the real ULA can't show it). Bits 5-0
+// = 6 px (bit 5 leftmost); bit 7 = LEFT-half (px 5-3) alpha, bit 6 = RIGHT-half (px 2-0) alpha
+// (1 = transparent). ON pixels always draw ink; OFF pixels are transparent in a transparent
+// half, else paper. From display.s _BlitSprite/_TableMask. 255 = transparent sentinel.
+function maskedDecode(hex, w, h, stride) {
+    const out = new Uint8Array(w * h);
+    for (let row = 0; row < h; row++) {
+        let x = 0;
+        for (let col = 0; col < stride && x < w; col++) {
+            const idx = (row * stride + col) * 2;
+            if (idx + 1 >= hex.length) break;
+            const c = parseInt(hex.substring(idx, idx + 2), 16);
+            const leftT = (c & 0x80) !== 0, rightT = (c & 0x40) !== 0;
+            for (let p = 0; p < 6 && x < w; p++) {
+                const on = (c >> (5 - p)) & 1;
+                out[row * w + x++] = on ? 7 : (((p < 3) ? leftT : rightT) ? 255 : 0);
+            }
+        }
+    }
+    return out;
+}
+// Fill colour for a transparent (255) pixel — a NON-Oric solid (so it can't be mistaken for a
+// real pixel), or a checkerboard. Default mid-gray.
+function transpRGB(mode, x, y) {
+    if (mode === 'checker') { const v = ((x + y) & 1) ? 102 : 153; return [v, v, v]; }
+    if (mode === 'dark') return [48, 48, 48];
+    return [128, 128, 128];   // 'gray'
+}
+const gfxState = {};   // idx -> { off, w, h, stride, base, zoom, grid, px, data, transp }
 function drawGfxGrid(ctx, st) {
     ctx.strokeStyle = 'rgba(128,128,128,0.4)'; ctx.lineWidth = 1; ctx.beginPath();
     const z = st.zoom;
@@ -694,19 +724,24 @@ function drawGfx(i, r) {
     if (!canvas) return;
     const stride = r.w || 40, h = r.h || 128, zoom = r.zoom || 2;   // stride = bytes/row
     const w = stride * 6;                                           // pixel width (6 px/byte)
-    const px = hiresDecode(r.data || '', w, h, stride);
+    const decode = r.decoder === 'masked' ? maskedDecode : hiresDecode;
+    const px = decode(r.data || '', w, h, stride);
     const off = document.createElement('canvas'); off.width = w; off.height = h;
     const octx = off.getContext('2d'), img = octx.createImageData(w, h);
-    for (let j = 0; j < w * h; j++) { const c = PALETTE[px[j]] || PALETTE[0], o = j * 4; img.data[o] = c[0]; img.data[o+1] = c[1]; img.data[o+2] = c[2]; img.data[o+3] = 255; }
+    for (let j = 0; j < w * h; j++) {
+        const v = px[j], o = j * 4;
+        const rgb = (v === 255) ? transpRGB(r.transp, j % w, (j / w) | 0) : (PALETTE[v] || PALETTE[0]);
+        img.data[o] = rgb[0]; img.data[o+1] = rgb[1]; img.data[o+2] = rgb[2]; img.data[o+3] = 255;
+    }
     octx.putImageData(img, 0, 0);
     canvas.width = w * zoom; canvas.height = h * zoom;
-    gfxState[i] = { off, w, h, stride, base: (typeof r.address === 'number' ? r.address : 0), zoom, grid: !!r.grid, px, data: r.data || '' };
+    gfxState[i] = { off, w, h, stride, base: (typeof r.address === 'number' ? r.address : 0), zoom, grid: !!r.grid, px, data: r.data || '', transp: r.transp || 'gray' };
     drawGfxRedraw(i, -1);
     // Hover: dual-line crosshair here + relay to the ONE Screen View zoomer (no-op if that
     // panel is closed). New canvas elements each render, so property handlers don't stack.
     canvas.onmouseenter = () => {
         const st = gfxState[i]; if (!st) return;
-        vscode.postMessage({ type: 'gfxInspect', sub: 'buf', pixels: Array.from(st.px), w: st.w, h: st.h });
+        vscode.postMessage({ type: 'gfxInspect', sub: 'buf', pixels: Array.from(st.px), w: st.w, h: st.h, transp: st.transp });
     };
     canvas.onmousemove = (e) => {
         const st = gfxState[i]; if (!st) return;
@@ -801,7 +836,7 @@ function formatDump(address, hexData, rows, format) {
 function renderResults(results) {
     // Persist the entry list so the panel's expressions survive a window reload
     // (the WebviewPanelSerializer receives this state).
-    vscode.setState({ entries: (results || []).map(r => ({ expression: r.expression, rows: r.rows, format: r.format, w: r.w, h: r.h, grid: r.grid, zoom: r.zoom })) });
+    vscode.setState({ entries: (results || []).map(r => ({ expression: r.expression, rows: r.rows, format: r.format, w: r.w, h: r.h, grid: r.grid, zoom: r.zoom, decoder: r.decoder, transp: r.transp })) });
     if (!results || results.length === 0) {
         entriesDiv.innerHTML = '<div class="empty">Add an expression to view memory</div>';
         return;
@@ -824,9 +859,17 @@ function renderResults(results) {
         const isGfx = r.format === 'graphic';
         html += '<span class="controls">';
         if (isGfx) {
+            html += '<select class="gfx-dec" data-idx="' + i + '" title="Decoder">';
+            [['hires','HIRES'],['masked','Masked']].forEach(o => { html += '<option value="' + o[0] + '"' + ((r.decoder || 'hires') === o[0] ? ' selected' : '') + '>' + o[1] + '</option>'; });
+            html += '</select>';
             html += '<span class="gfx-lbl" title="Width in bytes (6 pixels each)">W<input type="number" class="gfx-input gfx-w" data-idx="' + i + '" value="' + (r.w || 40) + '" min="1" max="512"><span class="gfx-unit">B</span></span>';
             html += '<span class="gfx-lbl" title="Height in scanlines">H<input type="number" class="gfx-input gfx-h" data-idx="' + i + '" value="' + (r.h || 128) + '" min="1" max="2048"></span>';
             html += '<label class="gfx-lbl"><input type="checkbox" class="gfx-grid" data-idx="' + i + '"' + (r.grid ? ' checked' : '') + '> grid</label>';
+            if ((r.decoder || 'hires') === 'masked') {
+                html += '<select class="gfx-transp" data-idx="' + i + '" title="Transparent pixels">';
+                [['gray','Gray'],['dark','Dark'],['checker','Checker']].forEach(o => { html += '<option value="' + o[0] + '"' + ((r.transp || 'gray') === o[0] ? ' selected' : '') + '>' + o[1] + '</option>'; });
+                html += '</select>';
+            }
             html += '<select class="gfx-zoom" data-idx="' + i + '" title="Zoom">';
             [1,2,3,4].forEach(z => { html += '<option value="' + z + '"' + ((r.zoom || 2) === z ? ' selected' : '') + '>' + z + 'x</option>'; });
             html += '</select>';
@@ -888,6 +931,10 @@ function renderResults(results) {
         vscode.postMessage({ type: 'configure', index: parseInt(el.dataset.idx), grid: el.checked })));
     document.querySelectorAll('.gfx-zoom').forEach(el => el.addEventListener('change', () =>
         vscode.postMessage({ type: 'configure', index: parseInt(el.dataset.idx), zoom: parseInt(el.value) || 2 })));
+    document.querySelectorAll('.gfx-dec').forEach(el => el.addEventListener('change', () =>
+        vscode.postMessage({ type: 'configure', index: parseInt(el.dataset.idx), decoder: el.value })));
+    document.querySelectorAll('.gfx-transp').forEach(el => el.addEventListener('change', () =>
+        vscode.postMessage({ type: 'configure', index: parseInt(el.dataset.idx), transp: el.value })));
 }
 
 window.addEventListener('message', e => {
@@ -2968,7 +3015,12 @@ function updateInspector(px, py) {
 // hovered (you can't hover both surfaces at once, so the screen isn't using it then). The
 // memory panel relays the decoded pixels + the pre-computed address/byte/bit/color, so this
 // just magnifies from that buffer and shows the memory info. Same zoom/grid controls.
-let extZoom = null;   // { px:Uint8Array, w, h, x, y, addr, byte, bit, color }
+let extZoom = null;   // { px:Uint8Array, w, h, transp, x, y, addr, byte, bit, color }
+function transpRGB(mode, x, y) {   // transparent-pixel fill (255 sentinel); mirrors the memory panel
+    if (mode === 'checker') { const v = ((x + y) & 1) ? 102 : 153; return [v, v, v]; }
+    if (mode === 'dark') return [48, 48, 48];
+    return [128, 128, 128];
+}
 function updateInspectorExt() {
     if (!extZoom) return;
     const src = extZoom, px = src.x, py = src.y;
@@ -2982,7 +3034,11 @@ function updateInspectorExt() {
         for (let dx = -zoomR; dx < zoomR; dx++) {
             const sx = px + dx, sy = py + dy;
             let r = 0, g = 0, b = 0;
-            if (sx >= 0 && sx < src.w && sy >= 0 && sy < src.h) { const c = src.px[sy * src.w + sx] & 7; r = PALETTE[c][0]; g = PALETTE[c][1]; b = PALETTE[c][2]; }
+            if (sx >= 0 && sx < src.w && sy >= 0 && sy < src.h) {
+                const v = src.px[sy * src.w + sx];
+                if (v === 255) { const t = transpRGB(src.transp, sx, sy); r = t[0]; g = t[1]; b = t[2]; }
+                else { const c = v & 7; r = PALETTE[c][0]; g = PALETTE[c][1]; b = PALETTE[c][2]; }
+            }
             zoomCtx.fillStyle = 'rgb(' + r + ',' + g + ',' + b + ')';
             zoomCtx.fillRect((dx + zoomR) * zf, (dy + zoomR) * zf, zf, zf);
         }
@@ -2994,12 +3050,15 @@ function updateInspectorExt() {
     zoomCtx.strokeStyle = 'rgba(0,0,0,0.7)'; zoomCtx.strokeRect(p0 - 1.5, p0 - 1.5, zf + 2, zf + 2);
     zoomCtx.strokeStyle = 'rgba(255,255,255,0.9)'; zoomCtx.strokeRect(p0 - 0.5, p0 - 0.5, zf, zf);
     zoomCtx.strokeStyle = 'rgba(0,0,0,0.7)'; zoomCtx.strokeRect(p0 + 0.5, p0 + 0.5, zf - 2, zf - 2);
-    const col = Math.floor(px / 6), c = src.color & 7, rgb = PALETTE[c];
+    const col = Math.floor(px / 6);
+    let colorHtml, swRgb;
+    if (src.color === 255) { colorHtml = 'transparent'; swRgb = transpRGB(src.transp, px, py); }
+    else { const c = src.color & 7; colorHtml = COLOR_NAMES[c] + ' (' + c + ')'; swRgb = PALETTE[c]; }
     let html = '<div class="pxrow"><span><span class="label">Pixel</span> <span class="value">(' + px + ', ' + py + ')</span></span>'
         + '<span><span class="label">Col</span> <span class="value">' + col + '</span></span></div>';
     html += '<div><span class="label">Mem</span> <span class="value">' + hex4(src.addr) + '</span></div>';
     html += '<div class="byteline">= <span class="value">' + hex2(src.byte) + ' ' + bin8hl(src.byte, src.bit) + '</span></div>';
-    html += '<div><span class="label">Color</span> <span class="value">' + COLOR_NAMES[c] + ' (' + c + ')</span><span class="swatch" style="background:rgb(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ')"></span></div>';
+    html += '<div><span class="label">Color</span> <span class="value">' + colorHtml + '</span><span class="swatch" style="background:rgb(' + swRgb[0] + ',' + swRgb[1] + ',' + swRgb[2] + ')"></span></div>';
     infoPanel.innerHTML = html;
 }
 
@@ -3190,7 +3249,7 @@ function updateOsd() {
 window.addEventListener('message', e => {
     if (e.data.type === 'gfxZoom') {
         // A memory graphic entry is driving the zoomer (relayed from the memory panel).
-        if (e.data.sub === 'buf') { extZoom = { px: Uint8Array.from(e.data.pixels || []), w: e.data.w | 0, h: e.data.h | 0, x: 0, y: 0, addr: 0, byte: 0, bit: 0, color: 0 }; }
+        if (e.data.sub === 'buf') { extZoom = { px: Uint8Array.from(e.data.pixels || []), w: e.data.w | 0, h: e.data.h | 0, transp: e.data.transp || 'gray', x: 0, y: 0, addr: 0, byte: 0, bit: 0, color: 0 }; }
         else if (e.data.sub === 'at' && extZoom) { extZoom.x = e.data.x | 0; extZoom.y = e.data.y | 0; extZoom.addr = e.data.addr | 0; extZoom.byte = e.data.byte | 0; extZoom.bit = e.data.bit | 0; extZoom.color = e.data.color | 0; updateInspectorExt(); }
         else if (e.data.sub === 'end') { extZoom = null; infoPanel.innerHTML = ''; zoomCtx.clearRect(0, 0, zoomCanvas.width, zoomCanvas.height); }
         return;
