@@ -323,6 +323,16 @@
                 "icon": "$(refresh)"
             },
             {
+                "command": "oric-debug.snapshotOpenFolder",
+                "title": "Oric: Open Snapshots Folder",
+                "icon": "$(folder-opened)"
+            },
+            {
+                "command": "oric-debug.automationOpenFolder",
+                "title": "Oric: Open Automation Folder",
+                "icon": "$(folder-opened)"
+            },
+            {
                 "command": "oric-debug.snapshotRestoreItem",
                 "title": "Restore",
                 "icon": "$(history)"
@@ -525,8 +535,10 @@
                 { "command": "oric-debug.bpRemoveAll", "when": "view == oricBreakpoints", "group": "navigation@3" },
                 { "command": "oric-debug.snapshotSave", "when": "view == oricSnapshots", "group": "navigation@1" },
                 { "command": "oric-debug.snapshotRefresh", "when": "view == oricSnapshots", "group": "navigation@2" },
+                { "command": "oric-debug.snapshotOpenFolder", "when": "view == oricSnapshots", "group": "navigation@3" },
                 { "command": "oric-debug.stopAutomationScript", "when": "view == oricAutomation && oric-debug.automationRunning", "group": "navigation@1" },
-                { "command": "oric-debug.automationRefresh", "when": "view == oricAutomation", "group": "navigation@2" }
+                { "command": "oric-debug.automationRefresh", "when": "view == oricAutomation", "group": "navigation@2" },
+                { "command": "oric-debug.automationOpenFolder", "when": "view == oricAutomation", "group": "navigation@3" }
             ],
             "view/item/context": [
                 { "command": "oric-debug.snapshotRestoreItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "inline@1" },

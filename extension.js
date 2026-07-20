@@ -1927,19 +1927,35 @@ function createScreenPanel() {
         { enableScripts: true, retainContextWhenHidden: true }
     );
 
-    panel.onDidDispose(() => {
-        screenPanel = null;
-        vizUnregisterConsumer(screenConsumer);
-    });
+    wireScreenPanel(panel);
+    return panel;
+}
 
-    screenPanel = panel; panel.iconPath = panelIcon('panel-screen-v2');
+// Shared Screen View wiring — used by BOTH createScreenPanel and the reload serializer so a
+// RESTORED panel behaves identically. (This was duplicated; the serializer's copy fell behind
+// and dropped hover-help / open-screenshots / screenReady after a reload.) One handler, one setup.
+function wireScreenPanel(panel) {
+    screenPanel = panel;
+    panel.iconPath = panelIcon('panel-screen-v2');
+    panel.webview.options = { enableScripts: true, retainContextWhenHidden: true };
     panel.webview.html = screenPanelHtml();
+    panel.onDidDispose(() => { screenPanel = null; vizUnregisterConsumer(screenConsumer); });
 
     const fs = require('fs');
     const path = require('path');
-
     panel.webview.onDidReceiveMessage(msg => {
         if (msg.type === 'screenReady') { postScreenConn(vizConnected); postScreenRunState(); return; }
+        if (msg.type === 'hover') { showHoverHelp(msg.text); return; }
+        if (msg.type === 'hoverEnd') { showHoverHelp(null); return; }
+        if (msg.type === 'openScreenshots') {
+            const base = (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0])
+                ? vscode.workspace.workspaceFolders[0].uri.fsPath : null;
+            if (!base) { vscode.window.showErrorMessage('No workspace folder open.'); return; }
+            const ssDir = path.join(base, 'screenshots');
+            try { if (!fs.existsSync(ssDir)) fs.mkdirSync(ssDir, { recursive: true }); } catch (_) {}
+            vscode.env.openExternal(vscode.Uri.file(ssDir));
+            return;
+        }
         if (msg.type === 'saveImage' && msg.dataUrl) {
             // Find workspace folder for screenshot subfolder
             let baseDir = null;
@@ -1960,7 +1976,11 @@ function createScreenPanel() {
                 + '_' + now.getHours().toString().padStart(2, '0')
                 + now.getMinutes().toString().padStart(2, '0')
                 + now.getSeconds().toString().padStart(2, '0');
-            const filePath = path.join(ssDir, 'oric_' + ts + '.png');
+            // Enrich the name for easier identification: active overlay module (sanitized) and
+            // the emulator frame counter (also disambiguates two captures in the same second).
+            const modPart = activeOricModuleName ? '_' + activeOricModuleName.replace(/[^A-Za-z0-9._-]+/g, '-') : '';
+            const framePart = (typeof msg.frame === 'number' && msg.frame >= 0) ? '_f' + msg.frame : '';
+            const filePath = path.join(ssDir, 'oric_' + ts + modPart + framePart + '.png');
 
             const base64 = msg.dataUrl.replace(/^data:image\/png;base64,/, '');
             fs.writeFileSync(filePath, Buffer.from(base64, 'base64'));
@@ -1991,8 +2011,6 @@ function createScreenPanel() {
     });
 
     vizRegisterConsumer(screenConsumer);
-
-    return panel;
 }
 
 function screenPanelHtml() {
@@ -2047,7 +2065,8 @@ body {
     font-family: inherit;
     font-size: inherit;
 }
-.controls button:hover { background: var(--vscode-button-hoverBackground); }
+.controls button:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
+.controls button:disabled { opacity: 0.4; cursor: default; }
 /* Row by default: screen fills the space, inspector is a fixed narrow column beside it
    (so a taller screen never squeezes the inspector until it wraps below → scroll). Only
    a genuinely narrow view stacks them (media query) — then the inspector goes full-width. */
@@ -2211,6 +2230,26 @@ body {
     vertical-align: middle;
     margin-left: 4px;
 }
+/* View-options popup: rarely-changed grid / zoom / appearance controls, grouped into
+   sections, opened from the ⚙ Options button so the toolbar stays uncluttered. */
+.opt-menu {
+    position: fixed; z-index: 60; display: none;
+    background: var(--vscode-menu-background, #252526);
+    border: 1px solid var(--vscode-menu-border, #454545);
+    box-shadow: 0 2px 10px rgba(0,0,0,0.5);
+    padding: 6px 0; min-width: 210px; max-height: 80vh; overflow-y: auto;
+}
+.opt-menu.open { display: block; }
+.opt-menu .opt-sec {
+    padding: 4px 12px 2px; font-size: 0.82em; text-transform: uppercase; letter-spacing: 0.5px;
+    color: var(--vscode-descriptionForeground, #888);
+}
+.opt-menu .opt-sec + .opt-sec, .opt-menu label + .opt-sec {
+    margin-top: 5px; border-top: 1px solid var(--vscode-menu-separatorBackground, #454545); padding-top: 6px;
+}
+.opt-menu label { display: flex; align-items: center; gap: 6px; padding: 3px 12px; white-space: nowrap; cursor: pointer; }
+.opt-menu label:hover { background: var(--vscode-list-hoverBackground, #2a2d2e); }
+.opt-menu label select { margin-left: auto; }
 </style></head><body>
 <div class="stage">
 <div class="screen-col">
@@ -2220,29 +2259,11 @@ body {
 </div>
 <div id="error"></div>
 <div class="controls">
-    <label><input type="checkbox" id="colGrid"> Columns</label>
-    <label><input type="checkbox" id="rowGrid"> Rows</label>
-    <select id="gridColor" title="Grid color">
-        <option value="128,0,0">Maroon</option>
-        <option value="0,128,0">Forest</option>
-        <option value="0,0,128">Navy</option>
-        <option value="128,128,0">Olive</option>
-        <option value="128,0,128">Purple</option>
-        <option value="0,128,128">Teal</option>
-        <option value="128,128,128" selected>Gray</option>
-        <option value="255,128,0">Orange</option>
-    </select>
-    <label title="Show the turbo (fast-forward) / paused run-state badge on the screen"><input type="checkbox" id="osdToggle" checked> OSD</label>
-    <label title="Square = 1:1 pixels; off = true 50Hz Oric aspect (wider pixels)"><input type="checkbox" id="squarePx" checked> Square px</label>
-    <label title="Retro CRT effect (scanlines + aperture mask, optional curvature)">CRT <select id="crtMode">
-        <option value="off" selected>Off</option>
-        <option value="flat">Flat CRT</option>
-        <option value="gentle">Curved (slight)</option>
-        <option value="curved">Curved (full)</option>
-    </select></label>
+    <button id="btnOptions">&#9881; Options</button>
     <span style="flex:1"></span>
-    <button id="btnSave" title="Save screenshot to project">Save PNG</button>
-    <button id="btnCopy" title="Copy to clipboard">Copy</button>
+    <button id="btnSave">Save</button>
+    <button id="btnCopy">Copy</button>
+    <button id="btnOpenSs">\u{1F4C1}</button>
 </div>
 <div class="screen-wrap" id="screenWrap">
     <canvas id="screenCanvas" width="240" height="224"></canvas>
@@ -2254,7 +2275,27 @@ body {
 </div>
 </div>
 <div class="inspect-panel">
-<div class="controls">
+<div class="inspector">
+    <canvas id="zoomCanvas" width="120" height="120"></canvas>
+    <div class="info" id="infoPanel"></div>
+</div>
+</div>
+</div>
+<div id="optMenu" class="opt-menu">
+    <div class="opt-sec">Grid</div>
+    <label><input type="checkbox" id="colGrid"> Columns</label>
+    <label><input type="checkbox" id="rowGrid"> Rows</label>
+    <label>Color <select id="gridColor">
+        <option value="128,0,0">Maroon</option>
+        <option value="0,128,0">Forest</option>
+        <option value="0,0,128">Navy</option>
+        <option value="128,128,0">Olive</option>
+        <option value="128,0,128">Purple</option>
+        <option value="0,128,128">Teal</option>
+        <option value="128,128,128" selected>Gray</option>
+        <option value="255,128,0">Orange</option>
+    </select></label>
+    <div class="opt-sec">Zoom (inspector)</div>
     <label>Zoom <select id="zoomFactor">
         <option value="2">2x</option>
         <option value="4">4x</option>
@@ -2268,12 +2309,15 @@ body {
         <option value="30">30px</option>
         <option value="40">40px</option>
     </select></label>
-</div>
-<div class="inspector">
-    <canvas id="zoomCanvas" width="120" height="120"></canvas>
-    <div class="info" id="infoPanel"></div>
-</div>
-</div>
+    <div class="opt-sec">Appearance</div>
+    <label title="Show the turbo / paused / not-running run-state badge on the screen"><input type="checkbox" id="osdToggle" checked> OSD badge</label>
+    <label title="Square = 1:1 pixels; off = true 50Hz Oric aspect (wider pixels)"><input type="checkbox" id="squarePx" checked> Square pixels</label>
+    <label title="Retro CRT effect (scanlines + aperture mask, optional curvature)">Screen type <select id="crtMode">
+        <option value="off" selected>Off</option>
+        <option value="flat">Flat CRT</option>
+        <option value="gentle">Curved (slight)</option>
+        <option value="curved">Curved (full)</option>
+    </select></label>
 </div>
 <script>
 const vscode = acquireVsCodeApi();
@@ -2501,6 +2545,7 @@ function b64decode(str) {
 function renderScreen(msg) {
     errorDiv.style.display = 'none';
     curScrBuf = b64decode(msg.scrBuf);
+    updateSaveButtons();   // a frame exists now — enable Save / Copy
     curVidRamMain = b64decode(msg.vidRamMain);
     curVidRamBottom = b64decode(msg.vidRamBottom);
     curVidMode = msg.vidMode;
@@ -2893,14 +2938,56 @@ zoomRegionSel.addEventListener('change', () => {
 });
 
 // --- Save / Copy buttons ---
+// Save / Copy only make sense once a frame has been captured (curScrBuf). Disable them
+// until then (and they stay enabled after a stop, since the last frame persists).
+function updateSaveButtons() {
+    const has = !!curScrBuf;
+    const s = document.getElementById('btnSave'), c = document.getElementById('btnCopy');
+    if (s) s.disabled = !has;
+    if (c) c.disabled = !has;
+}
 document.getElementById('btnSave').addEventListener('click', () => {
     if (!curScrBuf) return;
-    vscode.postMessage({ type: 'saveImage', dataUrl: screenCanvas.toDataURL('image/png') });
+    vscode.postMessage({ type: 'saveImage', dataUrl: screenCanvas.toDataURL('image/png'), frame: curFrameCounter });
 });
 document.getElementById('btnCopy').addEventListener('click', () => {
     if (!curScrBuf) return;
     vscode.postMessage({ type: 'copyImage', dataUrl: screenCanvas.toDataURL('image/png') });
 });
+updateSaveButtons();   // start disabled until the first frame arrives
+document.getElementById('btnOpenSs').addEventListener('click', () => {
+    vscode.postMessage({ type: 'openScreenshots' });
+});
+// View-options popup: rarely-changed grid / zoom / appearance controls live here so the
+// toolbar keeps only the actions. Toggled by the ⚙ button; clicks inside keep it open
+// (change several at once); a click elsewhere closes it.
+const btnOptions = document.getElementById('btnOptions');
+const optMenu = document.getElementById('optMenu');
+btnOptions.addEventListener('click', e => {
+    e.stopPropagation();
+    if (optMenu.classList.toggle('open')) {
+        const r = btnOptions.getBoundingClientRect();
+        optMenu.style.left = Math.max(2, Math.min(r.left, window.innerWidth - optMenu.offsetWidth - 4)) + 'px';
+        optMenu.style.top = (r.bottom + 2) + 'px';
+    }
+});
+document.addEventListener('click', e => {
+    if (optMenu.classList.contains('open') && !optMenu.contains(e.target) && e.target !== btnOptions) optMenu.classList.remove('open');
+});
+window.addEventListener('keydown', e => { if (e.key === 'Escape') optMenu.classList.remove('open'); });
+// Status-bar hover help for the toolbar buttons (visible alternative to tooltips).
+const SS_HELP = {
+    btnOptions: 'View options — grid lines, zoom/context, and appearance (screen type, pixels, OSD)',
+    btnSave: 'Save the current screen as a PNG in the project screenshots/ folder',
+    btnCopy: 'Copy the current screen to the clipboard',
+    btnOpenSs: 'Open the screenshots/ folder in the file manager'
+};
+for (const id in SS_HELP) {
+    const b = document.getElementById(id);
+    if (!b) continue;
+    b.addEventListener('mouseenter', () => vscode.postMessage({ type: 'hover', text: SS_HELP[id] }));
+    b.addEventListener('mouseleave', () => vscode.postMessage({ type: 'hoverEnd' }));
+}
 
 // Run-state OSD: ⏹ NOT RUNNING when there's no debug session, ‖ when halted at a breakpoint,
 // ▶▶ when warp/turbo is on, nothing while running normally. Purely a status indicator (see
@@ -3029,6 +3116,7 @@ let lineActionLens = null;    // created in activate(); refreshed on stop/contin
 let currentStopLoc = null;    // {path, line} of the top stack frame while stopped (null = no source)
 let bpTreeEmitter = null;     // Oric Breakpoints tree refresh signal (created in activate)
 let activeOricModuleId = null; // active overlay module id (for the breakpoint tree's follow/highlight)
+let activeOricModuleName = null; // active overlay module NAME (for screenshot filenames)
 let debugControlsProvider = null; // Oric Debug Controls webview view (button toolbar in the Run & Debug sidebar)
 let oricSessionActive = false; // true between an oric-debug session's start and terminate (activeDebugSession races on terminate)
 let oricWarpOn = false;       // current warp/turbo speed state (mirrors the toggleWarp toggle) — for the Screen View OSD
@@ -6440,7 +6528,7 @@ function activate(context) {
         vscode.commands.registerCommand('oric-debug.removeWatchpoint', node => removeWatchpoint(node)),
         vscode.commands.registerCommand('oric-debug.editWatchpoint', node => editWatchpoint(node)),
         vscode.commands.registerCommand('oric-debug.editWatchProp', node => { if (node && node.w && node.prop) editWatchProp(watchBpList.find(x => x.id === node.w.id), node.prop); }),
-        vscode.debug.onDidTerminateDebugSession(() => { activeOricModuleId = null; rebuildBpTree(); }),
+        vscode.debug.onDidTerminateDebugSession(() => { activeOricModuleId = null; activeOricModuleName = null; rebuildBpTree(); }),
         vscode.commands.registerCommand('oric-debug.bpEnableModule', node => { if (node && node.mod) setBpsEnabled(modBps(node.mod), true); }),
         vscode.commands.registerCommand('oric-debug.bpDisableModule', node => { if (node && node.mod) setBpsEnabled(modBps(node.mod), false); }),
         vscode.commands.registerCommand('oric-debug.bpEnableFile', node => { if (node && node.file) setBpsEnabled(fileBps(node.file), true); }),
@@ -6610,6 +6698,11 @@ function activate(context) {
             if (!to || to === node.snap.name) return;
             try { await s.customRequest('renameSnapshot', { name: node.snap.name, to }); }
             catch (e) { vscode.window.showErrorMessage('Rename failed: ' + (e && e.message ? e.message : e)); }
+        }),
+        vscode.commands.registerCommand('oric-debug.snapshotOpenFolder', () => {
+            const dir = snapshotsFolder();
+            if (!dir) { vscode.window.showInformationMessage('No snapshots folder yet — save a snapshot first (it creates .oric-snapshots/).'); return; }
+            vscode.env.openExternal(vscode.Uri.file(dir));
         })
     );
     if (snapSession()) refreshSnapshots();
@@ -6625,6 +6718,20 @@ function activate(context) {
         const files = await vscode.workspace.findFiles('**/automation/*.js', '**/node_modules/**', 200);
         return files.map(f => ({ name: nodePath.basename(f.fsPath), fsPath: f.fsPath }))
             .sort((a, b) => a.name.localeCompare(b.name));
+    }
+    // The automation scripts folder: the dir of an existing script if any, else
+    // <cwd|workspace>/automation (may not exist yet — the caller handles that).
+    async function automationFolder() {
+        const found = await vscode.workspace.findFiles('**/automation/*.js', '**/node_modules/**', 1);
+        if (found.length) return nodePath.dirname(found[0].fsPath);
+        const fsx = require('fs');
+        const s = vscode.debug.activeDebugSession, cfg = s && s.configuration;
+        const bases = [];
+        const cwd = cfg && (cfg.cwd || (cfg.build && cfg.build.cwd));
+        if (cwd) bases.push(cwd);
+        for (const f of (vscode.workspace.workspaceFolders || [])) bases.push(f.uri.fsPath);
+        for (const b of bases) { const d = nodePath.join(b, 'automation'); try { if (fsx.existsSync(d)) return d; } catch (_) {} }
+        return bases.length ? nodePath.join(bases[0], 'automation') : null;
     }
     const autoTreeProvider = {
         onDidChangeTreeData: autoEmitter.event,
@@ -6655,7 +6762,12 @@ function activate(context) {
         autoTree, autoWatcher,
         vscode.commands.registerCommand('oric-debug.automationRunItem', node => { if (node && node.fsPath) runAutomationScript(node.fsPath); }),
         vscode.commands.registerCommand('oric-debug.automationOpenItem', node => { if (node && node.fsPath) vscode.window.showTextDocument(vscode.Uri.file(node.fsPath)); }),
-        vscode.commands.registerCommand('oric-debug.automationRefresh', () => autoEmitter.fire())
+        vscode.commands.registerCommand('oric-debug.automationRefresh', () => autoEmitter.fire()),
+        vscode.commands.registerCommand('oric-debug.automationOpenFolder', async () => {
+            const dir = await automationFolder();
+            if (!dir || !require('fs').existsSync(dir)) { vscode.window.showInformationMessage('No automation folder yet — create <project>/automation/ (scripts) with utilities in automation/lib/.'); return; }
+            vscode.env.openExternal(vscode.Uri.file(dir));
+        })
     );
 
     // Tint source-file name labels (editor tabs + Explorer) by type — .c green, .h gray, .s/.asm
@@ -7102,53 +7214,7 @@ function activate(context) {
     });
     vscode.window.registerWebviewPanelSerializer('oricScreenView', {
         async deserializeWebviewPanel(panel) {
-            screenPanel = panel; panel.iconPath = panelIcon('panel-screen-v2');
-            panel.webview.options = { enableScripts: true, retainContextWhenHidden: true };
-            panel.webview.html = screenPanelHtml();
-            panel.onDidDispose(() => { screenPanel = null; vizUnregisterConsumer(screenConsumer); });
-
-            const fs = require('fs');
-            const path = require('path');
-            panel.webview.onDidReceiveMessage(msg => {
-                if (msg.type === 'saveImage' && msg.dataUrl) {
-                    let baseDir = null;
-                    if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
-                        baseDir = vscode.workspace.workspaceFolders[0].uri.fsPath;
-                    }
-                    if (!baseDir) { vscode.window.showErrorMessage('No workspace folder open.'); return; }
-                    const ssDir = path.join(baseDir, 'screenshots');
-                    if (!fs.existsSync(ssDir)) fs.mkdirSync(ssDir, { recursive: true });
-                    const now = new Date();
-                    const ts = now.getFullYear().toString()
-                        + (now.getMonth()+1).toString().padStart(2,'0')
-                        + now.getDate().toString().padStart(2,'0')
-                        + '_' + now.getHours().toString().padStart(2,'0')
-                        + now.getMinutes().toString().padStart(2,'0')
-                        + now.getSeconds().toString().padStart(2,'0');
-                    const filePath = path.join(ssDir, 'oric_' + ts + '.png');
-                    const base64 = msg.dataUrl.replace(/^data:image\/png;base64,/, '');
-                    fs.writeFileSync(filePath, Buffer.from(base64, 'base64'));
-                    vscode.window.showInformationMessage('Screenshot saved: ' + path.basename(filePath));
-                } else if (msg.type === 'copyImage' && msg.dataUrl) {
-                    const os = require('os');
-                    const tmpFile = path.join(os.tmpdir(), 'oric_clipboard.png');
-                    const base64 = msg.dataUrl.replace(/^data:image\/png;base64,/, '');
-                    fs.writeFileSync(tmpFile, Buffer.from(base64, 'base64'));
-                    const { exec } = require('child_process');
-                    const psCmd = `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::SetImage([System.Drawing.Image]::FromFile('${tmpFile.replace(/\\/g, '\\\\')}'))`;
-                    exec('powershell -NoProfile -Command "' + psCmd + '"', (err) => {
-                        if (err) vscode.window.showErrorMessage('Clipboard copy failed: ' + err.message);
-                        else vscode.window.showInformationMessage('Screenshot copied to clipboard');
-                        try { fs.unlinkSync(tmpFile); } catch (_) {}
-                    });
-                } else if (msg.type === 'oricKey') {
-                    vizSendInput(vizProto.keyFrame(msg.id, msg.down));
-                } else if (msg.type === 'oricKeyReleaseAll') {
-                    vizSendInput(vizProto.releaseAllFrame());
-                }
-            });
-
-            vizRegisterConsumer(screenConsumer);
+            wireScreenPanel(panel);   // same setup + message handler as createScreenPanel (DRY)
         }
     });
     vscode.window.registerWebviewPanelSerializer('oricSymbols', {
@@ -7491,6 +7557,7 @@ function activate(context) {
                             moduleStatusBar.text = '$(layers) Module: ' + msg.body.name;
                             moduleStatusBar.show();
                             activeOricModuleId = (msg.body.id !== undefined ? msg.body.id : null);
+                            activeOricModuleName = (activeOricModuleId != null && msg.body.name && msg.body.name !== '(none)') ? msg.body.name : null;
                             if (bpTreeEmitter) bpTreeEmitter.fire();   // re-highlight / re-fold the active module
                         }
                         // Symbols (re)loaded or module switched — the cached symbol
