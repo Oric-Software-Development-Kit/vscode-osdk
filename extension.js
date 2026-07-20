@@ -511,6 +511,10 @@ function wireMemoryPanel(panel, initialEntries) {
                     postResults(panel, state);
                 }
             }
+        } else if (msg.type === 'gfxInspect') {
+            // Relay a graphic-view hover to the ONE Screen View zoomer. No-op (never throws) if
+            // that panel isn't open — the user's responsibility, per design.
+            if (screenPanel) screenPanel.webview.postMessage({ type: 'gfxZoom', sub: msg.sub, pixels: msg.pixels, w: msg.w, h: msg.h, x: msg.x, y: msg.y, addr: msg.addr, byte: msg.byte, bit: msg.bit, color: msg.color });
         }
     });
 
@@ -655,6 +659,36 @@ function hiresDecode(hex, w, h, stride) {
     }
     return out;
 }
+const gfxState = {};   // idx -> { off, w, h, stride, base, zoom, grid, px, data }
+function drawGfxGrid(ctx, st) {
+    ctx.strokeStyle = 'rgba(128,128,128,0.4)'; ctx.lineWidth = 1; ctx.beginPath();
+    const z = st.zoom;
+    for (let gx = 0; gx <= st.w; gx += 6) { const X = gx * z + 0.5; ctx.moveTo(X, 0); ctx.lineTo(X, st.h * z); }
+    for (let gy = 0; gy <= st.h; gy += 8) { const Y = gy * z + 0.5; ctx.moveTo(0, Y); ctx.lineTo(st.w * z, Y); }
+    ctx.stroke();
+}
+// Repaint one graphic canvas from its cached image (+ grid), optionally with the hover
+// crosshair — the SAME dual-line (black/white/black) style as the Screen View overlay.
+function drawGfxRedraw(i, hx, hy) {
+    const st = gfxState[i];
+    const canvas = document.querySelector('.gfx-canvas[data-idx="' + i + '"]');
+    if (!st || !canvas) return;
+    const z = st.zoom, W = st.w * z, H = st.h * z;
+    const ctx = canvas.getContext('2d'); ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, W, H);
+    ctx.drawImage(st.off, 0, 0, W, H);
+    if (st.grid) drawGfxGrid(ctx, st);
+    if (hx >= 0) {
+        const cx = Math.round((hx + 0.5) * z), cy = Math.round((hy + 0.5) * z);
+        const lines = [{ o: -1, c: 'rgba(0,0,0,0.6)' }, { o: 0, c: 'rgba(255,255,255,0.8)' }, { o: 1, c: 'rgba(0,0,0,0.6)' }];
+        ctx.lineWidth = 1;
+        for (const l of lines) {
+            ctx.strokeStyle = l.c;
+            ctx.beginPath(); ctx.moveTo(cx + l.o + 0.5, 0); ctx.lineTo(cx + l.o + 0.5, H); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(0, cy + l.o + 0.5); ctx.lineTo(W, cy + l.o + 0.5); ctx.stroke();
+        }
+    }
+}
 function drawGfx(i, r) {
     const canvas = document.querySelector('.gfx-canvas[data-idx="' + i + '"]');
     if (!canvas) return;
@@ -666,14 +700,27 @@ function drawGfx(i, r) {
     for (let j = 0; j < w * h; j++) { const c = PALETTE[px[j]] || PALETTE[0], o = j * 4; img.data[o] = c[0]; img.data[o+1] = c[1]; img.data[o+2] = c[2]; img.data[o+3] = 255; }
     octx.putImageData(img, 0, 0);
     canvas.width = w * zoom; canvas.height = h * zoom;
-    const ctx = canvas.getContext('2d'); ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(off, 0, 0, w * zoom, h * zoom);
-    if (r.grid) {
-        ctx.strokeStyle = 'rgba(128,128,128,0.4)'; ctx.lineWidth = 1; ctx.beginPath();
-        for (let gx = 0; gx <= w; gx += 6) { const X = gx * zoom + 0.5; ctx.moveTo(X, 0); ctx.lineTo(X, h * zoom); }
-        for (let gy = 0; gy <= h; gy += 8) { const Y = gy * zoom + 0.5; ctx.moveTo(0, Y); ctx.lineTo(w * zoom, Y); }
-        ctx.stroke();
-    }
+    gfxState[i] = { off, w, h, stride, base: (typeof r.address === 'number' ? r.address : 0), zoom, grid: !!r.grid, px, data: r.data || '' };
+    drawGfxRedraw(i, -1);
+    // Hover: dual-line crosshair here + relay to the ONE Screen View zoomer (no-op if that
+    // panel is closed). New canvas elements each render, so property handlers don't stack.
+    canvas.onmouseenter = () => {
+        const st = gfxState[i]; if (!st) return;
+        vscode.postMessage({ type: 'gfxInspect', sub: 'buf', pixels: Array.from(st.px), w: st.w, h: st.h });
+    };
+    canvas.onmousemove = (e) => {
+        const st = gfxState[i]; if (!st) return;
+        const rect = canvas.getBoundingClientRect();
+        const x = Math.floor((e.clientX - rect.left) / st.zoom), y = Math.floor((e.clientY - rect.top) / st.zoom);
+        if (x < 0 || x >= st.w || y < 0 || y >= st.h) return;
+        drawGfxRedraw(i, x, y);
+        const col = Math.floor(x / 6), bit = 5 - (x % 6);
+        const addr = (st.base + y * st.stride + col) & 0xffff;
+        const bidx = (y * st.stride + col) * 2;
+        const byte = (st.data && bidx + 1 < st.data.length) ? parseInt(st.data.substring(bidx, bidx + 2), 16) : 0;
+        vscode.postMessage({ type: 'gfxInspect', sub: 'at', x, y, addr, byte, bit, color: st.px[y * st.w + x] });
+    };
+    canvas.onmouseleave = () => { drawGfxRedraw(i, -1); vscode.postMessage({ type: 'gfxInspect', sub: 'end' }); };
 }
 
 function addExpr() {
@@ -2917,6 +2964,45 @@ function updateInspector(px, py) {
     infoPanel.innerHTML = html;
 }
 
+// External feed: an Oric Memory graphic entry drives this ONE zoomer while its canvas is
+// hovered (you can't hover both surfaces at once, so the screen isn't using it then). The
+// memory panel relays the decoded pixels + the pre-computed address/byte/bit/color, so this
+// just magnifies from that buffer and shows the memory info. Same zoom/grid controls.
+let extZoom = null;   // { px:Uint8Array, w, h, x, y, addr, byte, bit, color }
+function updateInspectorExt() {
+    if (!extZoom) return;
+    const src = extZoom, px = src.x, py = src.y;
+    const zf = parseInt(zoomFactorSel.value) || 6;
+    const region = parseInt(zoomRegionSel.value) || 20;
+    const zoomR = Math.floor(region / 2);
+    const canvasSize = region * zf;
+    if (zoomCanvas.width !== canvasSize || zoomCanvas.height !== canvasSize) { zoomCanvas.width = canvasSize; zoomCanvas.height = canvasSize; }
+    zoomCtx.clearRect(0, 0, canvasSize, canvasSize);
+    for (let dy = -zoomR; dy < zoomR; dy++) {
+        for (let dx = -zoomR; dx < zoomR; dx++) {
+            const sx = px + dx, sy = py + dy;
+            let r = 0, g = 0, b = 0;
+            if (sx >= 0 && sx < src.w && sy >= 0 && sy < src.h) { const c = src.px[sy * src.w + sx] & 7; r = PALETTE[c][0]; g = PALETTE[c][1]; b = PALETTE[c][2]; }
+            zoomCtx.fillStyle = 'rgb(' + r + ',' + g + ',' + b + ')';
+            zoomCtx.fillRect((dx + zoomR) * zf, (dy + zoomR) * zf, zf, zf);
+        }
+    }
+    const gridColor = getGridColor(0.4); zoomCtx.strokeStyle = gridColor; zoomCtx.lineWidth = 1;
+    if (colGridCb.checked) { const l = px - zoomR, f = Math.ceil(l / 6) * 6; for (let cx = f; cx < l + region; cx += 6) { const zx = (cx - l) * zf + 0.5; zoomCtx.beginPath(); zoomCtx.moveTo(zx, 0); zoomCtx.lineTo(zx, canvasSize); zoomCtx.stroke(); } }
+    if (rowGridCb.checked) { const t = py - zoomR, f = Math.ceil(t / 8) * 8; for (let ry = f; ry < t + region; ry += 8) { const zy = (ry - t) * zf + 0.5; zoomCtx.beginPath(); zoomCtx.moveTo(0, zy); zoomCtx.lineTo(canvasSize, zy); zoomCtx.stroke(); } }
+    const p0 = zoomR * zf; zoomCtx.lineWidth = 1;
+    zoomCtx.strokeStyle = 'rgba(0,0,0,0.7)'; zoomCtx.strokeRect(p0 - 1.5, p0 - 1.5, zf + 2, zf + 2);
+    zoomCtx.strokeStyle = 'rgba(255,255,255,0.9)'; zoomCtx.strokeRect(p0 - 0.5, p0 - 0.5, zf, zf);
+    zoomCtx.strokeStyle = 'rgba(0,0,0,0.7)'; zoomCtx.strokeRect(p0 + 0.5, p0 + 0.5, zf - 2, zf - 2);
+    const col = Math.floor(px / 6), c = src.color & 7, rgb = PALETTE[c];
+    let html = '<div class="pxrow"><span><span class="label">Pixel</span> <span class="value">(' + px + ', ' + py + ')</span></span>'
+        + '<span><span class="label">Col</span> <span class="value">' + col + '</span></span></div>';
+    html += '<div><span class="label">Mem</span> <span class="value">' + hex4(src.addr) + '</span></div>';
+    html += '<div class="byteline">= <span class="value">' + hex2(src.byte) + ' ' + bin8hl(src.byte, src.bit) + '</span></div>';
+    html += '<div><span class="label">Color</span> <span class="value">' + COLOR_NAMES[c] + ' (' + c + ')</span><span class="swatch" style="background:rgb(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ')"></span></div>';
+    infoPanel.innerHTML = html;
+}
+
 // Mouse tracking on the screen canvas wrapper
 screenWrap.addEventListener('mousemove', (e) => {
     const rect = screenCanvas.getBoundingClientRect();
@@ -3102,6 +3188,13 @@ function updateOsd() {
 }
 
 window.addEventListener('message', e => {
+    if (e.data.type === 'gfxZoom') {
+        // A memory graphic entry is driving the zoomer (relayed from the memory panel).
+        if (e.data.sub === 'buf') { extZoom = { px: Uint8Array.from(e.data.pixels || []), w: e.data.w | 0, h: e.data.h | 0, x: 0, y: 0, addr: 0, byte: 0, bit: 0, color: 0 }; }
+        else if (e.data.sub === 'at' && extZoom) { extZoom.x = e.data.x | 0; extZoom.y = e.data.y | 0; extZoom.addr = e.data.addr | 0; extZoom.byte = e.data.byte | 0; extZoom.bit = e.data.bit | 0; extZoom.color = e.data.color | 0; updateInspectorExt(); }
+        else if (e.data.sub === 'end') { extZoom = null; infoPanel.innerHTML = ''; zoomCtx.clearRect(0, 0, zoomCanvas.width, zoomCanvas.height); }
+        return;
+    }
     if (e.data.type === 'screenFrame') renderScreen(e.data);
     if (e.data.type === 'status') { status.textContent = e.data.text; errorDiv.style.display = 'none'; }
     if (e.data.type === 'error') { errorDiv.textContent = e.data.text; errorDiv.style.display = 'block'; }
