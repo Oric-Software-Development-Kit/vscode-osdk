@@ -2501,6 +2501,64 @@ function bitsetBytes(ed) {
     return (max >> 3) + 1;
 }
 
+// The ONE symbol-record builder — PURE (symbol table + resolver only, NO memory reads).
+// Produces one record per address with merged co-located labels, canonical-name ordering,
+// per-name source, size/group/typeInfo. Shared by readAllSymbols (which layers live value +
+// annotated display on top) and symbolTableLite (Memory Map). Keeping this single means the
+// Symbol Browser and the Memory Map see identical labels/aliases/sources by construction —
+// the earlier split reimplemented alias gathering and drifted (aliases went missing on the map).
+// Co-located labels = the flat `symbols` map merged by address UNIONed with the resolver's
+// aliases at that exact address (the resolver is the authority; the flat map may not carry all).
+function assembleSymbols() {
+    if (symbols.size === 0) return [];
+    const allAddrs = [];
+    for (const [name, addr] of symbols) {
+        const info = symInfo.get(name);
+        allAddrs.push({ name, addr, size: info ? info.size : 1,
+                        group: info ? info.group : (addr <= 0xFF ? 'zp' : (addr < 0xC000 ? 'ram' : 'high')) });
+    }
+    allAddrs.sort((a, b) => a.addr - b.addr);
+    const out = [];
+    for (let i = 0; i < allAddrs.length; ) {
+        const s = allAddrs[i];
+        let names = [s.name], maxSize = s.size, j = i + 1;
+        while (j < allAddrs.length && allAddrs[j].addr === s.addr) {
+            names.push(allAddrs[j].name);
+            if (allAddrs[j].size > maxSize) maxSize = allAddrs[j].size;
+            j++;
+        }
+        i = j;
+        // Canonical owner + union the resolver's co-located aliases (exact-address record).
+        const rec = resolverInstance ? resolverInstance.resolve(s.addr) : null;
+        if (rec && rec.symbol) {
+            if (rec.symbol.name && !names.includes(rec.symbol.name)) names.push(rec.symbol.name);
+            for (const al of (rec.symbol.aliases || [])) if (al.name && !names.includes(al.name)) names.push(al.name);
+        }
+        const master = rec && rec.symbol ? rec.symbol.name : null;
+        if (master && names.includes(master)) names = [master, ...names.filter(n => n !== master).sort((a, b) => a.length - b.length)];
+        else names.sort((a, b) => a.length - b.length);
+        // Per-name navigation source: owner → the record's winning source, each alias → its
+        // own #SYM decl (resolver aliases[].source), declOf() as the fallback.
+        const aliasSrc = new Map();
+        if (rec && rec.symbol) for (const al of rec.symbol.aliases) if (al.source) aliasSrc.set(al.name, al.source);
+        const nameSources = {};
+        for (const n of names) {
+            const src2 = (n === master && rec && rec.source) ? rec.source
+                : aliasSrc.get(n) || (resolverInstance ? resolverInstance.declOf(n) : null);
+            if (src2) nameSources[n] = { file: src2.file, line: src2.line };
+        }
+        const src = rec && rec.source ? rec.source : null;
+        const vt = varTypes.get(names[0]);
+        out.push({ name: names[0], aliases: names.slice(1), addr: s.addr,
+                   size: vt ? vt.totalSize : maxSize, rawSize: maxSize, group: s.group,
+                   source: src ? { file: src.file, line: src.line } : null,
+                   nameSources,
+                   typeInfo: vt ? { type: vt.type, base: vt.base, count: vt.count,
+                                    fields: typeDefs.has(vt.base) ? typeDefs.get(vt.base).fields : null } : null });
+    }
+    return out;
+}
+
 // Parse comment-based debug annotations from all source files (.h uses "// @...",
 // .s uses "; @..."). Rebuilds annByField (C struct members) and annBySymbol
 // (C globals & asm data labels). Directives: @bool, @enum <E>, @bitset <E>.
@@ -5765,59 +5823,26 @@ const handlers = {
     },
 
     // -- Symbol table WITHOUT values (custom request) ------------------
-    // A flat name/addr/source list built purely from the symbol table + resolver — NO memory
-    // reads, so it's safe to call while the CPU is RUNNING (readAllSymbols would hang on `m`).
-    // Feeds the Memory Map, which only needs the static layout. Addresses are merged by the
-    // client; here we emit one row per symbol name (memmap's flat-input model).
+    // The merged per-address records from the ONE builder (assembleSymbols) — NO memory reads,
+    // so it's safe while the CPU is RUNNING (readAllSymbols would hang on `m`). Feeds the Memory
+    // Map, which only needs the static layout (name + co-located aliases + source).
     symbolTableLite(req) {
-        // One row per LABEL at each address: the symbol map PLUS the resolver's co-located
-        // aliases (the resolver is the authority on multiple labels sharing an address — the
-        // same source the Symbol Browser uses). The client merges rows by address. No `m` reads.
-        const out = [], seen = new Set(), doneAddr = new Set();
-        const push = (name, addr, src) => {
-            const k = addr + ':' + name;
-            if (!name || seen.has(k)) return; seen.add(k);
-            out.push({ name, addr, source: src ? { file: src.file, line: src.line } : null });
-        };
-        for (const [name, addr] of symbols) {
-            push(name, addr, resolverInstance ? resolverInstance.declOf(name) : null);
-            if (resolverInstance && !doneAddr.has(addr)) {
-                doneAddr.add(addr);
-                const rec = resolverInstance.resolve(addr);
-                if (rec && rec.symbol) {
-                    push(rec.symbol.name, addr, rec.source || resolverInstance.declOf(rec.symbol.name));
-                    for (const al of (rec.symbol.aliases || [])) push(al.name, addr, al.source || resolverInstance.declOf(al.name));
-                }
-            }
-        }
-        respond(req, { symbols: out });
+        respond(req, { symbols: assembleSymbols() });
     },
 
     // -- Read all symbols with current values (custom request) ---------
 
     async readAllSymbols(req) {
-        if (symbols.size === 0) {
-            respond(req, { symbols: [] });
-            return;
-        }
+        // Records (merged aliases, source, size/group/typeInfo) come from the ONE shared builder;
+        // this handler only adds the LIVE value + annotated display (the memory-dependent part).
+        const recs = assembleSymbols();
+        if (recs.length === 0) { respond(req, { symbols: [] }); return; }
 
-        // Build sorted list of all symbols with addresses and sizes — sizes and groups
-        // come straight from the single symbol registry (symInfo), so the browser shows
-        // the same size every other view uses.
-        const allAddrs = [];
-        for (const [name, addr] of symbols) {
-            const info = symInfo.get(name);
-            allAddrs.push({ name, addr,
-                            size: info ? info.size : 1,
-                            group: info ? info.group : (addr <= 0xFF ? 'zp' : (addr < 0xC000 ? 'ram' : 'high')) });
-        }
-        allAddrs.sort((a, b) => a.addr - b.addr);
-
-        // Collect unique 256-byte pages that need reading
+        // Collect the unique 256-byte pages the values span (read size = each record's byte extent).
         const pages = new Set();
-        for (const s of allAddrs) {
+        for (const s of recs) {
             const page = s.addr >> 8;
-            const endPage = (s.addr + s.size - 1) >> 8;
+            const endPage = (s.addr + s.rawSize - 1) >> 8;
             pages.add(page);
             if (endPage !== page) pages.add(endPage);
         }
@@ -5856,76 +5881,25 @@ const handlers = {
             }
         }
 
-        // Merge symbols at the same address (aliases)
-        const merged = [];
-        for (let i = 0; i < allAddrs.length; ) {
-            const s = allAddrs[i];
-            const names = [s.name];
-            // Group size = the largest among aliases at this address. An annotated
-            // symbol (e.g. @bcd, size 2) may share its address with an inherited
-            // 1-byte symbol; the wider, annotation-derived size is the correct one.
-            let maxSize = s.size;
-            let j = i + 1;
-            while (j < allAddrs.length && allAddrs[j].addr === s.addr) {
-                names.push(allAddrs[j].name);
-                if (allAddrs[j].size > maxSize) maxSize = allAddrs[j].size;
-                j++;
-            }
-            merged.push({ names, addr: s.addr, size: maxSize, group: s.group });
-            i = j;
-        }
-
-        // Build result with values
+        // Layer the live value + annotated display onto each record (naming/source/size/type
+        // already resolved by assembleSymbols). Value spans the record's byte extent (rawSize);
+        // display goes through the SAME formatAnnotated path as Watch (@bcd/@enum/@bool/@bitset).
         const result = [];
-        for (const s of merged) {
+        for (const s of recs) {
             const value = [];
-            for (let i = 0; i < s.size; i++) {
-                const a = s.addr + i;
-                const page = a >> 8;
-                const off = a & 0xFF;
-                const pageData = mem.get(page);
+            for (let i = 0; i < s.rawSize; i++) {
+                const a = s.addr + i, page = a >> 8, off = a & 0xFF, pageData = mem.get(page);
                 value.push(pageData ? pageData[off] : 0);
             }
-            // Canonical owner first — the resolver's stage-3b pick, i.e. the SAME
-            // name the call stack and disassembly show at this address — then
-            // aliases sorted by name length.
-            const rec = resolverInstance ? resolverInstance.resolve(s.addr) : null;
-            const master = rec && rec.symbol ? rec.symbol.name : null;
-            if (master && s.names.includes(master)) {
-                s.names = [master, ...s.names.filter(n => n !== master).sort((a, b) => a.length - b.length)];
-            } else {
-                s.names.sort((a, b) => a.length - b.length);
-            }
-            // Per-name navigation targets, all off the one resolver record:
-            // the owner gets the record's source (winning exact line, else its
-            // decl); each alias gets its own #SYM decl (aliases[].source), with
-            // declOf() as the fallback for names the record doesn't carry.
-            const aliasSrc = new Map();
-            if (rec && rec.symbol) for (const al of rec.symbol.aliases) if (al.source) aliasSrc.set(al.name, al.source);
-            const nameSources = {};
-            for (const n of s.names) {
-                const src = (n === master && rec.source) ? rec.source
-                    : aliasSrc.get(n) || (resolverInstance ? resolverInstance.declOf(n) : null);
-                if (src) nameSources[n] = { file: src.file, line: src.line };
-            }
-            const src = rec && rec.source ? rec.source : null;
-            const vt = varTypes.get(s.names[0]);
-            // Annotated value rendered through the SAME path as Watch (formatAnnotated),
-            // so a @bcd/@enum/@bool/@bitset symbol shows the decoded value + type token
-            // instead of the browser's raw little-endian byte read.
             let display = null;
-            const mAnn = annForSymbol(s.names[0]);
+            const mAnn = annForSymbol(s.name);
             if (mAnn) {
-                const fa = await formatAnnotated(mAnn, s.addr, s.size);
+                const fa = await formatAnnotated(mAnn, s.addr, s.rawSize);
                 if (fa) display = fa.value + (fa.type ? '  ' + fa.type : '');
             }
-            result.push({ name: s.names[0], aliases: s.names.slice(1),
-                          addr: s.addr, size: vt ? vt.totalSize : s.size, value, group: s.group,
-                          display,
-                          source: src ? { file: src.file, line: src.line } : null,
-                          nameSources,
-                          typeInfo: vt ? { type: vt.type, base: vt.base, count: vt.count,
-                                          fields: typeDefs.has(vt.base) ? typeDefs.get(vt.base).fields : null } : null });
+            result.push({ name: s.name, aliases: s.aliases, addr: s.addr, size: s.size, value,
+                          group: s.group, display, source: s.source, nameSources: s.nameSources,
+                          typeInfo: s.typeInfo });
         }
 
         respond(req, { symbols: result });

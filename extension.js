@@ -4400,16 +4400,24 @@ tr.flash td { background: var(--vscode-editor-findMatchHighlightBackground, rgba
 <script>
 const vscode = acquireVsCodeApi();
 const SEC = [['Normal', 0x400, 0xBFFF], ['Overlay', 0xC000, 0xFFFF], ['Zero', 0x00, 0xFF]];
-let syms = null, active = 'Normal', filter = '';
+let syms = null, active = 'Normal', filter = '', flashAddr = null;   // flashAddr = the "Largest"-selected row; re-applied on every render so a focus/refresh rebuild can't drop it
 const tabsEl = document.getElementById('tabs'), tbody = document.getElementById('tbody'), tbl = document.getElementById('tbl'), dim = document.getElementById('dim'), searchEl = document.getElementById('search'), summaryEl = document.getElementById('summary');
 function h(v, w) { return '$' + (v >>> 0).toString(16).toUpperCase().padStart(w, '0'); }
 function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 function isMaster(n) { return !!n && (n[0] === '_' || n.slice(0, 4) === 'osdk'); }
 function masterName(b) { const m = b.labels.find(l => isMaster(l.name)); return m ? m.name : b.labels[0].name; }
 function computeSection(begin, end) {
-    const byAddr = new Map();
-    for (const s of (syms || [])) { if (s.addr == null || s.addr < begin || s.addr > end) continue; let b = byAddr.get(s.addr); if (!b) { b = { addr: s.addr, labels: [] }; byAddr.set(s.addr, b); } b.labels.push(s); }
-    const blocks = [...byAddr.values()].sort((a, b) => a.addr - b.addr);
+    // syms = adapter's merged per-address records {name, aliases, addr, source, nameSources}.
+    // One record = one block; expand its labels (name + aliases) with each label's source.
+    const blocks = [];
+    for (const r of (syms || [])) {
+        if (r.addr == null || r.addr < begin || r.addr > end) continue;
+        const ns = r.nameSources || {};
+        const labels = [{ name: r.name, source: ns[r.name] || r.source }];
+        for (const a of (r.aliases || [])) labels.push({ name: a, source: ns[a] || null });
+        blocks.push({ addr: r.addr, labels });
+    }
+    blocks.sort((a, b) => a.addr - b.addr);
     let master = null;
     for (let i = 0; i < blocks.length; i++) {
         const b = blocks[i];
@@ -4420,7 +4428,15 @@ function computeSection(begin, end) {
     }
     return blocks;
 }
-function matchCount(begin, end) { if (!filter) return 0; const f = filter.toLowerCase(); let n = 0; for (const s of (syms || [])) if (s.addr >= begin && s.addr <= end && s.name.toLowerCase().includes(f)) n++; return n; }
+function matchCount(begin, end) {
+    if (!filter) return 0;
+    const f = filter.toLowerCase(); let n = 0;
+    for (const r of (syms || [])) {
+        if (r.addr == null || r.addr < begin || r.addr > end) continue;
+        if (r.name.toLowerCase().includes(f) || (r.aliases || []).some(a => a.toLowerCase().includes(f))) n++;
+    }
+    return n;
+}
 function renderTabs() {
     tabsEl.innerHTML = '';
     for (const [name, begin, end] of SEC) {
@@ -4456,11 +4472,21 @@ function render() {
     }
     tbody.innerHTML = html || '<tr><td colspan="4" class="dim">No symbols in this section' + (f ? ' matching "' + esc(filter) + '"' : '') + '</td></tr>';
     dim.style.display = 'none'; tbl.style.display = '';
+    applyFlash(false);   // re-apply the Largest-selection highlight after the rebuild (no scroll)
+}
+// Highlight the flashAddr row (clearing any previous), optionally scrolling to it. Called on
+// click AND at the end of render(), so a focus/refresh/tab rebuild re-applies it instead of
+// dropping it — fixes the "first click's highlight blinks and vanishes" (focus re-render).
+function applyFlash(scroll) {
+    tbody.querySelectorAll('tr.flash').forEach(r => r.classList.remove('flash'));
+    if (flashAddr == null) return;
+    const row = tbody.querySelector('tr[data-addr="' + flashAddr + '"]');
+    if (row) { row.classList.add('flash'); if (scroll) row.scrollIntoView({ block: 'center' }); }
 }
 summaryEl.addEventListener('click', e => {
     const a = e.target.closest('a[data-addr]'); if (!a) return;
-    const row = tbody.querySelector('tr[data-addr="' + a.dataset.addr + '"]');
-    if (row) { row.scrollIntoView({ block: 'center' }); row.classList.add('flash'); setTimeout(() => row.classList.remove('flash'), 900); }
+    flashAddr = a.dataset.addr;
+    applyFlash(true);
 });
 tbody.addEventListener('click', e => { const el = e.target.closest('.sym-link[data-file]'); if (el) vscode.postMessage({ type: 'gotoSymbol', file: el.dataset.file, line: parseInt(el.dataset.line, 10) }); });
 searchEl.addEventListener('input', () => {
