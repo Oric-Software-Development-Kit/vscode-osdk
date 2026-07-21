@@ -7297,18 +7297,21 @@ function activate(context) {
 
     // --- Oric Documentation panel — quick links to the manual + internal/external references.
     // Static rows: each fires a command (internal reference panels) or opens a URL (external).
+    // Each row gets a distinct theme-aware icon colour (charts.* palette). VS Code doesn't let a
+    // TreeView recolour label/description text, but icon tints via ThemeColor are supported and
+    // adapt to light/dark themes — enough to give the panel some colour.
     const docsItems = [
-        { label: 'Extension manual', icon: 'book', desc: 'This extension’s page & README', cmd: 'oric-debug.openManual' },
-        { label: 'XA assembler reference', icon: 'symbol-keyword', desc: 'Internal quick reference', cmd: 'osdk.xaReference' },
-        { label: '6502 opcode reference', icon: 'symbol-numeric', desc: 'Internal quick reference', cmd: 'osdk.6502Reference' },
-        { label: 'OSDK website', icon: 'globe', desc: 'osdk.org (external)', cmd: 'vscode.open', args: [vscode.Uri.parse('http://www.osdk.org')] },
-        { label: 'Defence Force forum', icon: 'comment-discussion', desc: 'forum.defence-force.org (external)', cmd: 'vscode.open', args: [vscode.Uri.parse('https://forum.defence-force.org')] }
+        { label: 'Extension manual', icon: 'book', color: 'charts.blue', desc: 'This extension’s page & README', cmd: 'oric-debug.openManual' },
+        { label: 'XA assembler reference', icon: 'symbol-keyword', color: 'charts.purple', desc: 'Internal quick reference', cmd: 'osdk.xaReference' },
+        { label: '6502 opcode reference', icon: 'symbol-numeric', color: 'charts.green', desc: 'Internal quick reference', cmd: 'osdk.6502Reference' },
+        { label: 'OSDK website', icon: 'globe', color: 'charts.orange', desc: 'osdk.org (external)', cmd: 'vscode.open', args: [vscode.Uri.parse('http://www.osdk.org')] },
+        { label: 'Defence Force forum', icon: 'comment-discussion', color: 'charts.yellow', desc: 'forum.defence-force.org (external)', cmd: 'vscode.open', args: [vscode.Uri.parse('https://forum.defence-force.org')] }
     ];
     const docsProvider = {
         getChildren: () => docsItems,
         getTreeItem: (it) => {
             const t = new vscode.TreeItem(it.label);
-            t.iconPath = new vscode.ThemeIcon(it.icon);
+            t.iconPath = new vscode.ThemeIcon(it.icon, it.color ? new vscode.ThemeColor(it.color) : undefined);
             t.description = it.desc;
             t.tooltip = it.desc;
             t.command = { command: it.cmd, title: it.label, arguments: it.args || [] };
