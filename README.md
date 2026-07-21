@@ -6,7 +6,7 @@
 
 - **OSDK** (Oric Software Development Kit) - version TBD or later
 - **Oricutron** with GDB stub support - version TBD or later (must include the `--gdb_port` command-line option)
-- **VS Code** 1.64.0 or later
+- **VS Code** 1.74.0 or later
 
 No additional dependencies are required. The extension is pure JavaScript and uses only Node.js built-in modules.
 

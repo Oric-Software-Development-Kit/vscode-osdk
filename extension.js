@@ -769,7 +769,7 @@ addBtn.addEventListener('click', addExpr);
 input.addEventListener('keydown', e => { if (e.key === 'Enter') addExpr(); });
 
 function escapeHtml(s) {
-    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 function formatDump(address, hexData, rows, format) {
@@ -1041,7 +1041,7 @@ const directives = [
   ]},
 ];
 
-function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 function render(filter) {
     const f = filter.toLowerCase().trim();
@@ -1303,7 +1303,7 @@ const opcodes = [
   ]},
 ];
 
-function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 function render(filter) {
     const f = filter.toLowerCase().trim();
@@ -5046,7 +5046,7 @@ function render() {
 }
 
 function escHtml(s) {
-    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 // Restore state after webview becomes visible again
@@ -6284,7 +6284,7 @@ function activate(context) {
                 const src = document.getElementById('src');
                 const ann = document.getElementById('ann');
                 const asm = document.getElementById('asm');
-                function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+                function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
                 function classify(id){
                     if (/^e_/.test(id)) return 'kw';
                     if (id === id.toUpperCase() && /_/.test(id)) return 'kw';

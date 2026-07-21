@@ -14,7 +14,7 @@
         "url": "https://github.com/Oric-Software-Development-Kit/vscode-osdk/issues"
     },
     "engines": {
-        "vscode": "^1.64.0"
+        "vscode": "^1.74.0"
     },
     "categories": [
         "Debuggers",
@@ -30,17 +30,12 @@
     "activationEvents": [
         "onDebugResolve:oric-debug",
         "onLanguage:osdk",
-        "onCommand:osdk.xaReference",
-        "onCommand:osdk.6502Reference",
-        "onCommand:oric-debug.openScreenView",
-        "onCommand:oric-debug.openSymbols",
-        "onCommand:oric-debug.openMemoryMap",
-        "onCommand:oric-debug.showCurrentLocation",
         "onWebviewPanel:oricHeatmap",
         "onWebviewPanel:oricScreenView",
         "onWebviewPanel:oricSymbols",
         "onWebviewPanel:oricMemoryMap",
-        "onWebviewPanel:oricDisassembly"
+        "onWebviewPanel:oricDisassembly",
+        "onWebviewPanel:oricMemory"
     ],
     "main": "./extension.js",
     "configurationDefaults": {
@@ -736,11 +731,18 @@
                         }
                     },
                     "launch": {
-                        "required": ["emulatorPath", "diskImage"],
                         "properties": {
+                            "launchScript": {
+                                "type": "string",
+                                "description": "Path to an OSDK launch script (e.g. osdk_debug.bat) that builds and starts the emulator with the GDB stub. The recommended \"OSDK way\" — an alternative to emulatorPath+diskImage. When set, cwd/build.cwd is used as its working directory."
+                            },
+                            "cwd": {
+                                "type": "string",
+                                "description": "Working directory for the launch script and build command (defaults to build.cwd, then the process cwd). Distinct from emulatorCwd, which is the emulator's own working directory."
+                            },
                             "emulatorPath": {
                                 "type": "string",
-                                "description": "Path to Oricutron executable"
+                                "description": "Path to Oricutron executable (used when launchScript is not set)"
                             },
                             "emulatorArgs": {
                                 "type": "array",
