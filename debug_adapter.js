@@ -24,6 +24,10 @@ let ADAPTER_LOADED_MTIME = 0;
 try { ADAPTER_LOADED_MTIME = fs.statSync(__filename).mtimeMs; } catch (_) { /* ignore */ }
 let staleWarned = false;
 function warnIfStale() {
+    // Dev-only aid (opt-in): warns when you've edited debug_adapter.js but the session
+    // is still running the old process. Off by default so a shipped end user never sees it;
+    // set OSDK_ADAPTER_STALE_CHECK=1 in the debug launch env to re-enable during development.
+    if (!process.env.OSDK_ADAPTER_STALE_CHECK) return;
     if (staleWarned) return;
     try {
         const cur = fs.statSync(__filename).mtimeMs;
@@ -1381,6 +1385,19 @@ function loadSymbols(file) {
     }
 }
 
+// Source-file extensions we scan for symbol definitions (workspace + OSDK lib).
+const SOURCE_EXT_RE = /\.(s|asm|inc|h)$/i;
+// Recursively add every source file under `dir` to `set`. Best-effort: a missing or
+// unreadable directory is logged at verbose level, not silently swallowed.
+function scanSourcesInto(dir, set) {
+    if (!dir) return;
+    try {
+        for (const f of readdirRecursive(dir)) if (SOURCE_EXT_RE.test(f)) set.add(f);
+    } catch (e) {
+        logVerbose('source scan skipped for ' + dir + ': ' + e.message);
+    }
+}
+
 // Scan source and library files to find the original definition of symbols
 // whose V2 source info points to a build artifact like linked.s.
 function resolveLibrarySources(fileIndex) {
@@ -1409,26 +1426,12 @@ function resolveLibrarySources(fileIndex) {
     }
 
     // Workspace sources
-    const wsDir = config.sourceRoot || config.workspaceFolder;
-    if (wsDir) {
-        try {
-            const wsFiles = readdirRecursive(wsDir);
-            for (const f of wsFiles) {
-                if (/\.(s|asm|inc|h)$/i.test(f)) filesToScan.add(f);
-            }
-        } catch (_) {}
-    }
+    scanSourcesInto(config.sourceRoot || config.workspaceFolder, filesToScan);
 
     // OSDK library: derive from emulator path (e.g. .../Oricutron/Oricutron.exe → .../lib/)
     if (config.emulatorPath) {
         const osdkRoot = path.dirname(path.dirname(config.emulatorPath));
-        const libDir = path.join(osdkRoot, 'lib');
-        try {
-            const libFiles = readdirRecursive(libDir);
-            for (const f of libFiles) {
-                if (/\.(s|asm|inc|h)$/i.test(f)) filesToScan.add(f);
-            }
-        } catch (_) {}
+        scanSourcesInto(path.join(osdkRoot, 'lib'), filesToScan);
     }
 
     if (filesToScan.size === 0) return;
