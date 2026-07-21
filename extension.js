@@ -4246,6 +4246,10 @@ function setupSymbolsPanel(panel) {
                     editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
                 });
             }).catch(() => {});
+        } else if (msg.type === 'hover') {
+            showHoverHelp(msg.text);
+        } else if (msg.type === 'hoverEnd') {
+            showHoverHelp(null);
         }
     });
 }
@@ -5098,27 +5102,34 @@ body {
     flex: 1; min-width: 100px; position: relative;
 }
 .search-wrap input {
-    width: 100%;
+    width: 100%; box-sizing: border-box; height: 24px;
     background: var(--vscode-input-background, #3c3c3c);
     color: var(--vscode-input-foreground, #ccc);
     border: 1px solid var(--vscode-input-border, #555);
-    padding: 3px 38px 3px 6px;
+    padding: 3px 46px 3px 6px;
     font-family: inherit; font-size: inherit;
 }
+/* Recent-searches caret = a real dropdown button on the right, styled to read
+   like the groupFilter <select>'s arrow: full height, its own separator, and the
+   foreground colour (not a tiny dim glyph). Same behaviour → same look. */
 .search-wrap .mru-btn {
-    position: absolute; right: 18px; top: 50%; transform: translateY(-50%);
-    background: none; border: none; color: var(--vscode-descriptionForeground, #888);
-    cursor: pointer; font-size: 11px; line-height: 1; padding: 2px 3px;
+    position: absolute; right: 1px; top: 1px; bottom: 1px; width: 22px;
+    display: flex; align-items: center; justify-content: center;
+    background: none; border: none; border-left: 1px solid var(--vscode-input-border, #555);
+    color: var(--vscode-foreground); cursor: pointer; font-size: 12px; line-height: 1; padding: 0;
 }
-.search-wrap .mru-btn:hover { color: var(--vscode-foreground); }
+.search-wrap .mru-btn:hover { background: var(--vscode-list-hoverBackground, #2a2d2e); }
+/* Clear × sits just left of the caret button, and only while there is text. */
 .search-wrap .clear-btn {
-    position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
+    position: absolute; right: 26px; top: 50%; transform: translateY(-50%);
     background: none; border: none; color: var(--vscode-descriptionForeground, #888);
     cursor: pointer; font-size: 14px; line-height: 1; padding: 2px 4px;
     display: none;
 }
 .search-wrap .clear-btn:hover { color: var(--vscode-foreground); }
 .search-wrap input:not(:placeholder-shown) ~ .clear-btn { display: block; }
+/* Match the field height to the sibling dropdown so the combo and the select line up. */
+.toolbar select { height: 24px; box-sizing: border-box; }
 .search-wrap .mru-list {
     position: absolute; top: 100%; left: 0; right: 0; z-index: 20;
     background: var(--vscode-dropdown-background, #3c3c3c);
@@ -5525,6 +5536,22 @@ clearBtn.addEventListener('click', () => {
 });
 
 groupEl.addEventListener('change', () => { filterGroup = groupEl.value; render(); });
+
+// Status-bar hover help (visible alternative to native tooltips, which a large cursor
+// covers — see no-tooltip-dependent-ui). Mirrors Screen View's SS_HELP; the panel forwards
+// these 'hover'/'hoverEnd' messages to the shared showHoverHelp() status-bar item.
+const SYM_HELP = {
+    mruBtn: 'Recent searches',
+    clearBtn: 'Clear the search (Esc)',
+    watchBtn: 'Watch the typed expression (name, cast, register, or $address)',
+    groupFilter: 'Filter by memory region: All / Zero Page / RAM / High / Define'
+};
+for (const id in SYM_HELP) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    el.addEventListener('mouseenter', () => vscode.postMessage({ type: 'hover', text: SYM_HELP[id] }));
+    el.addEventListener('mouseleave', () => vscode.postMessage({ type: 'hoverEnd' }));
+}
 
 headers.forEach(th => {
     th.addEventListener('click', () => {
