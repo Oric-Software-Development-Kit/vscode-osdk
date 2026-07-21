@@ -263,7 +263,7 @@
             },
             {
                 "command": "oric-debug.automationRefresh",
-                "title": "Refresh Automation Scripts",
+                "title": "Oric: Refresh Automation Scripts",
                 "icon": "$(refresh)"
             },
             {
@@ -485,11 +485,11 @@
             },
             {
                 "command": "osdk.xaReference",
-                "title": "OSDK: XA Quick Reference"
+                "title": "Oric: XA Quick Reference"
             },
             {
                 "command": "osdk.6502Reference",
-                "title": "OSDK: 6502 Opcode Reference"
+                "title": "Oric: 6502 Opcode Reference"
             }
         ],
         "keybindings": [
@@ -692,7 +692,20 @@
                 {
                     "command": "oric-debug.replayToHead",
                     "when": "debugType == 'oric-debug' && debugState == 'stopped'"
-                }
+                },
+                { "command": "oric-debug.bpEdit", "when": "false" },
+                { "command": "oric-debug.bpEditDetail", "when": "false" },
+                { "command": "oric-debug.bpRemove", "when": "false" },
+                { "command": "oric-debug.bpRemoveFile", "when": "false" },
+                { "command": "oric-debug.bpRemoveModule", "when": "false" },
+                { "command": "oric-debug.editWatchpoint", "when": "false" },
+                { "command": "oric-debug.removeWatchpoint", "when": "false" },
+                { "command": "oric-debug.editWatchProp", "when": "false" },
+                { "command": "oric-debug.snapshotRestoreItem", "when": "false" },
+                { "command": "oric-debug.snapshotDeleteItem", "when": "false" },
+                { "command": "oric-debug.snapshotRenameItem", "when": "false" },
+                { "command": "oric-debug.automationRunItem", "when": "false" },
+                { "command": "oric-debug.automationOpenItem", "when": "false" }
             ]
         },
         "debuggers": [

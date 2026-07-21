@@ -964,8 +964,11 @@ function xaReferenceHtml() {
 <html><head><style>
 body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(--vscode-editor-font-size, 13px); color: var(--vscode-foreground); padding: 12px 20px; margin: 0; max-width: 960px; }
 .search-bar { position: sticky; top: 0; background: var(--vscode-editor-background); padding: 8px 0 12px 0; z-index: 10; }
-.search-bar input { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #444); padding: 6px 10px; font-family: inherit; font-size: inherit; }
+.search-bar input { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #444); padding: 6px 28px 6px 10px; font-family: inherit; font-size: inherit; }
 .search-bar input:focus { outline: 1px solid var(--vscode-focusBorder); }
+.search-bar .clear-btn { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); background: none; border: none; color: var(--vscode-descriptionForeground, #888); cursor: pointer; font-size: 16px; line-height: 1; padding: 0 3px; display: none; }
+.search-bar .clear-btn:hover { color: var(--vscode-foreground); }
+.search-bar input:not(:placeholder-shown) ~ .clear-btn { display: block; }
 h2 { color: var(--vscode-sideBarSectionHeader-foreground, #ccc); font-size: 1.15em; margin: 18px 0 8px 0; border-bottom: 1px solid var(--vscode-widget-border, #444); padding-bottom: 4px; }
 h2:first-of-type { margin-top: 8px; }
 .entry { margin: 0 0 14px 0; padding: 8px 10px; background: var(--vscode-editor-inactiveSelectionBackground, rgba(255,255,255,0.04)); border-radius: 4px; border-left: 3px solid var(--vscode-debugTokenExpression-name, #9cdcfe); }
@@ -979,7 +982,7 @@ h2:first-of-type { margin-top: 8px; }
 .no-results { color: var(--vscode-descriptionForeground, #888); font-style: italic; padding: 20px 0; text-align: center; }
 </style></head><body>
 <div class="search-bar">
-    <input type="text" id="searchInput" placeholder="Search directives... (e.g. byt, segment, define)" autofocus />
+    <input type="text" id="searchInput" placeholder="Search directives... (e.g. byt, segment, define)" autofocus /><button class="clear-btn" id="clearBtn" title="Clear (Esc)">×</button>
 </div>
 <div id="content"></div>
 <script>
@@ -1082,7 +1085,10 @@ function render(filter) {
     content.innerHTML = html;
 }
 
-document.getElementById('searchInput').addEventListener('input', e => render(e.target.value));
+const searchInput = document.getElementById('searchInput');
+searchInput.addEventListener('input', e => render(e.target.value));
+searchInput.addEventListener('keydown', e => { if (e.key === 'Escape' && searchInput.value) { e.preventDefault(); searchInput.value = ''; render(''); } });
+document.getElementById('clearBtn').addEventListener('click', () => { searchInput.value = ''; searchInput.focus(); render(''); });
 render('');
 </script>
 </body></html>`;
@@ -1107,8 +1113,11 @@ function opcodeReferenceHtml() {
 <html><head><style>
 body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(--vscode-editor-font-size, 13px); color: var(--vscode-foreground); padding: 12px 20px; margin: 0; max-width: 1100px; }
 .search-bar { position: sticky; top: 0; background: var(--vscode-editor-background); padding: 8px 0 12px 0; z-index: 10; }
-.search-bar input { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #444); padding: 6px 10px; font-family: inherit; font-size: inherit; }
+.search-bar input { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #444); padding: 6px 28px 6px 10px; font-family: inherit; font-size: inherit; }
 .search-bar input:focus { outline: 1px solid var(--vscode-focusBorder); }
+.search-bar .clear-btn { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); background: none; border: none; color: var(--vscode-descriptionForeground, #888); cursor: pointer; font-size: 16px; line-height: 1; padding: 0 3px; display: none; }
+.search-bar .clear-btn:hover { color: var(--vscode-foreground); }
+.search-bar input:not(:placeholder-shown) ~ .clear-btn { display: block; }
 h2 { color: var(--vscode-sideBarSectionHeader-foreground, #ccc); font-size: 1.15em; margin: 18px 0 8px 0; border-bottom: 1px solid var(--vscode-widget-border, #444); padding-bottom: 4px; }
 .opcode { margin: 0 0 14px 0; padding: 8px 10px; background: var(--vscode-editor-inactiveSelectionBackground, rgba(255,255,255,0.04)); border-radius: 4px; border-left: 3px solid var(--vscode-debugTokenExpression-name, #9cdcfe); }
 .op-header { display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px; }
@@ -1124,7 +1133,7 @@ td.c02 { color: var(--vscode-charts-orange, #d19a66); }
 .no-results { color: var(--vscode-descriptionForeground, #888); font-style: italic; padding: 20px 0; text-align: center; }
 </style></head><body>
 <div class="search-bar">
-    <input type="text" id="searchInput" placeholder="Search opcodes... (e.g. LDA, load, branch, A9)" autofocus />
+    <input type="text" id="searchInput" placeholder="Search opcodes... (e.g. LDA, load, branch, A9)" autofocus /><button class="clear-btn" id="clearBtn" title="Clear (Esc)">×</button>
 </div>
 <div id="content"></div>
 <script>
@@ -1350,7 +1359,10 @@ function render(filter) {
     content.innerHTML = html;
 }
 
-document.getElementById('searchInput').addEventListener('input', e => render(e.target.value));
+const searchInput = document.getElementById('searchInput');
+searchInput.addEventListener('input', e => render(e.target.value));
+searchInput.addEventListener('keydown', e => { if (e.key === 'Escape' && searchInput.value) { e.preventDefault(); searchInput.value = ''; render(''); } });
+document.getElementById('clearBtn').addEventListener('click', () => { searchInput.value = ''; searchInput.focus(); render(''); });
 render('');
 </script>
 </body></html>`;
@@ -6250,8 +6262,10 @@ function activate(context) {
             body { font-family: var(--vscode-editor-font-family, monospace);
                    font-size: var(--vscode-editor-font-size, 13px);
                    color: var(--vscode-editor-foreground); padding: 6px 10px; margin: 0; }
-            #hdr { color: #808080; font-size: 0.85em; padding-bottom: 5px; margin-bottom: 6px;
+            #hdr { color: var(--vscode-descriptionForeground, #808080); font-size: 0.85em; padding-bottom: 5px; margin-bottom: 6px;
                    border-bottom: 1px solid var(--vscode-panel-border, #80808040); }
+            #hdr .loc-link { color: var(--vscode-textLink-foreground); cursor: pointer; }
+            #hdr .loc-link:hover { text-decoration: underline; }
             #src { white-space: pre-wrap; word-break: break-word; padding-bottom: 6px; margin-bottom: 6px;
                    border-bottom: 1px solid var(--vscode-panel-border, #80808040); opacity: 0.9; }
             #ann { white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
@@ -6259,18 +6273,22 @@ function activate(context) {
             .vrow .op { padding: 0 3px; }
             #asm { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--vscode-panel-border, #80808040);
                    white-space: pre-wrap; word-break: break-word; }
-            #asm .lbl { color: #808080; font-size: 0.85em; }
-            #asmann { color: #808080; }
+            #asm .lbl { color: var(--vscode-descriptionForeground, #808080); font-size: 0.85em; }
+            #asmann { color: var(--vscode-descriptionForeground, #808080); }
+            /* Comment green has no workbench color var (it is a TextMate token colour),
+               so it stays literal with an explicit light-theme override. */
             #cmt { color: #6A9955; font-style: italic; margin-bottom: 5px;
                    white-space: pre-wrap; word-break: break-word; }
             body.vscode-light #cmt { color: #008000; }
-            .empty { color: #808080; font-style: italic; }
+            .empty { color: var(--vscode-descriptionForeground, #808080); font-style: italic; }
             body.stale { opacity: 0.5; filter: grayscale(0.35); }
-            .val { color: #B5CEA8; } .kw { color: #C586C0; } .sym { color: #9CDCFE; } .op { color: #808080; }
-            .mne { color: #569CD6; }
-            body.vscode-light .val { color: #098658; } body.vscode-light .kw { color: #AF00DB; }
-            body.vscode-light .sym { color: #001080; } body.vscode-light .op { color: #6A737D; }
-            body.vscode-light .mne { color: #0000FF; }
+            /* Token colours = the same theme vars the Symbols/Memory panels use — theme-aware,
+               so no manual body.vscode-light overrides are needed. */
+            .val { color: var(--vscode-debugTokenExpression-number, #b5cea8); }
+            .kw  { color: var(--vscode-debugTokenExpression-type, #c586c0); }
+            .sym { color: var(--vscode-debugTokenExpression-name, #9cdcfe); }
+            .op  { color: var(--vscode-descriptionForeground, #808080); }
+            .mne { color: var(--vscode-symbolIcon-keywordForeground, #569cd6); }
         </style></head><body>
             <div id="hdr"></div>
             <div id="cmt"></div>
@@ -6334,9 +6352,12 @@ function activate(context) {
                     const hasVars = d.lineVars && d.lineVars.length;
                     if (!d.annotation && !hasVars){ hdr.style.display='none'; cmt.style.display='none'; src.style.display='none'; ann.innerHTML='<span class="empty">— no instruction —</span>'; return; }
                     let h = '';
-                    if (typeof d.pc === 'number') h += '$' + (d.pc & 0xFFFF).toString(16).toUpperCase().padStart(4,'0');
-                    if (d.file && d.line){ const base = String(d.file).split(/[\\\\/]/).pop(); h += (h?'  ·  ':'') + base + ':' + d.line; }
-                    hdr.textContent = h; hdr.style.display = '';
+                    if (typeof d.pc === 'number') h += esc('$' + (d.pc & 0xFFFF).toString(16).toUpperCase().padStart(4,'0'));
+                    if (d.file && d.line){
+                        const base = String(d.file).split(/[\\\\/]/).pop();
+                        h += (h?'  ·  ':'') + '<span class="loc-link" data-file="' + esc(String(d.file)) + '" data-line="' + d.line + '">' + esc(base + ':' + d.line) + '</span>';
+                    }
+                    hdr.innerHTML = h; hdr.style.display = '';
                     cmt.textContent = d.comment || ''; cmt.style.display = d.comment ? '' : 'none';
                     // C source colorizes as C (plain identifiers); asm as a mnemonic line.
                     src.innerHTML = d.isC ? colorize(d.src || '') : colorizeAsm(d.src || ''); src.style.display = d.src ? '' : 'none';
@@ -6351,6 +6372,10 @@ function activate(context) {
                         asm.innerHTML = a; asm.style.display = '';
                     } else { asm.style.display = 'none'; asm.innerHTML = ''; }
                 });
+                hdr.addEventListener('click', function(e){
+                    const el = e.target.closest('.loc-link[data-file]');
+                    if (el) vs.postMessage({ type: 'gotoSymbol', file: el.dataset.file, line: parseInt(el.dataset.line, 10) });
+                });
                 vs.postMessage({ type: 'ready' });
             </script>
         </body></html>`.replace(/\r/g, '');
@@ -6360,7 +6385,20 @@ function activate(context) {
         resolveWebviewView(view) {
             currentInstrView = view;
             view.webview.options = { enableScripts: true };
-            view.webview.onDidReceiveMessage(msg => { if (msg && msg.type === 'ready') renderCurrentInstr(); });
+            view.webview.onDidReceiveMessage(msg => {
+                if (msg && msg.type === 'ready') { renderCurrentInstr(); return; }
+                if (msg && msg.type === 'gotoSymbol' && msg.file && msg.line > 0) {
+                    const uri = vscode.Uri.file(msg.file);
+                    vscode.workspace.openTextDocument(uri).then(doc => {
+                        vscode.window.showTextDocument(doc, { preview: true, viewColumn: vscode.ViewColumn.One }).then(ed => {
+                            const line = Math.max(0, msg.line - 1);
+                            const range = new vscode.Range(line, 0, line, 0);
+                            ed.selection = new vscode.Selection(range.start, range.start);
+                            ed.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+                        });
+                    }).catch(() => {});
+                }
+            });
             view.onDidDispose(() => { if (currentInstrView === view) currentInstrView = null; });
             view.webview.html = currentInstrHtml();
         }
