@@ -4,8 +4,8 @@
 
 ## Requirements
 
-- **OSDK** (Oric Software Development Kit) - version TBD or later
-- **Oricutron** with GDB stub support - version TBD or later (must include the `--gdb_port` command-line option)
+- **OSDK** (Oric Software Development Kit) - version 2.0 or later
+- **Oricutron** with GDB stub support - included in OSDK 2.0 (provides the `--gdb_port` command-line option)
 - **VS Code** 1.74.0 or later
 
 No additional dependencies are required. The extension is pure JavaScript and uses only Node.js built-in modules.
@@ -33,19 +33,60 @@ Connects VS Code to Oricutron's GDB Remote Serial Protocol (RSP) stub over TCP.
 - **Time-travel / reverse debugging** — step backwards through recent history (see *Time-Travel Debugging* below).
 - **Logpoints (print breakpoints)** — a breakpoint that prints instead of stopping. Right-click the editor gutter → *Add Logpoint*, and enter a message with `{expr}` placeholders. On hit the message is evaluated, written to the Debug Console (in cyan, to stand out from the emulator's own output), and execution resumes automatically. Placeholders accept a register (`{a}`, `{pc}` — decoded via its type tag), a symbol (`{gCurrentLocation}` — fully typed: enum name, struct, etc.), or a `$hex` address (`{$C000}`). `{{`/`}}` are literal braces. Put **`[stop]`** anywhere in the message to both log **and** stop at that line (VS Code allows only one breakpoint-or-logpoint per line, so this is how to get both behaviours at one spot); the `[stop]` marker itself is not printed. Put **`[save]`** in the message to take a machine **snapshot** every time the line is hit (see *Snapshots*) — e.g. a logpoint `Entering level {level} [save]` gives you a restore point at each level. Marker tokens are never printed.
 - **Call stack** walking (reconstructed from the hardware stack)
-- **Disassembly view** with symbol resolution in operands
-- **Virtual disassembly source**: when no source mapping exists, the extension generates a disassembly document centered on the current PC
+- **Disassembly panel** — a dockable view (*Oric: Disassembly View*) with symbol-resolved operands and per-line run / turbo-run / jump / skip actions
+- **Automatic disassembly fallback** — when execution stops in code with *no source mapping* (ROM or a library), the debugger opens a generated disassembly of the surrounding instructions in a read-only editor tab, centered on the current PC — so you land on the instructions instead of a blank "no source" screen, and can keep stepping
+
+### Screen & Video
+
+- **Oric Screen View** (*Oric: Screen View*) — a live view of the Oric's display, with an optional WebGL **CRT shader** (scanlines, aperture mask, optional curvature) and a pixel-aspect toggle.
+- **Full keyboard control** — type into the Screen View to drive the running program; key presses are queued to the emulator over a live control channel.
+- **Screenshots** — save a PNG or copy the current screen to the clipboard (and open the screenshots folder).
+- **Pixel inspection** — hover the screen (or a graphic memory view) to zoom in with a crosshair and read the pixel / byte / colour under the cursor.
+
+### Memory & Graphics
+
+- **Oric Memory** (*Oric: Memory View*) — inspect memory at any expression (`_Symbol`, `*_Ptr`, `$A000`, `_Buf+X`) as **hex / words / decimal / binary**, or as a **graphic** view that decodes the bytes as an Oric HIRES bitmap (HIRES and masked/alpha decoders, width in bytes, zoom, optional grid), with hover inspection relayed to the Screen View zoomer.
+- **Oric Memory Map** (*Oric: Memory Map*) — a built-in memory map (Normal / Overlay / Zero tabs, section totals, largest blocks, clickable labels), regenerated from the current module's symbols (see *Memory Map*).
+- **Oric Memory Heatmap** (*Oric: Memory Heatmap*) — a heatmap view of memory activity across the address space.
+- **Oric Symbol Browser** (*Oric: Symbol Browser*) — a searchable symbol + `#define` browser with live typed values, jump-to-source and pin-to-Watch, plus a Watch section for arbitrary expressions.
+
+### Typed C-Language Decoding
+
+- Values are decoded from the symbol file's type info and `@…` source annotations — **enums** by name, **pointers** followed, **structs / arrays / members / subscripts**, **bitsets**, **BCD**, **booleans** and **strings** — consistently across the Watch, Variables, the **Current Instruction** panel, inline annotations, breakpoint conditions and disassembly operands.
+
+### Registers & Peripherals
+
+- **Oric Registers** — CPU registers (A / X / Y / SP / PC), flags, cycle / frame / raster counters and interrupt vectors; A / X / Y show their decoded value when carrying a type tag.
+- **Oric Peripherals** — live VIA, AY (PSG), FDC and ACIA hardware registers.
+
+### Snapshots
+
+- Save and restore full machine-state **snapshots**, with a lightweight history ring that powers time-travel and one-click restore points (including via `[save]` logpoints). See *Snapshots*.
+
+### Automation
+
+- Run **automation scripts** (`automation/*.js`) against the live session — step, read/write memory, set breakpoints, capture screenshots — from the **Oric Automation** panel (see *Automation Scripting*).
+
+### AI Collaboration (MCP)
+
+- Expose the live debug session over the **Model Context Protocol** so an AI assistant (e.g. Claude) can inspect and drive it (*Oric: Register MCP Server*), and share your running GUI session through a **collaborative bridge** with an on-screen control indicator (*Oric: AI Collaboration — Start/Stop Bridge*). See *Collaborative mode*.
+
+### Editor Integration
+
+- **Source-file label colouring** by type — C / header / assembler / automation — in editor tabs and the Explorer.
+- **`@` annotations** (`@enum`, `@ptr16`, `@bool`, `@bcd`, `@word`, `@str`, `@bitset`) drive the typed decoding and are re-read on save (*Oric: Reparse Annotations*); *Oric: Reload Symbols* picks up new symbols/types after a byte-identical rebuild.
+- **Documentation panel** — one-click links to this manual, the XA / 6502 references, and the OSDK site / Defence Force forum.
 
 ---
 
 ## Debug Panels
 
-Dedicated panels appear in the Debug sidebar when a session is active:
+Most dedicated panels appear in the **Run & Debug** sidebar when a session is active; the one exception is **Current Instruction**, which lives in the bottom **Panel** area (an *Oric Debug* group, alongside Terminal / Output):
 
 | Panel | Description |
 |---|---|
 | **Oric Debug Controls** | A compact toolbar of the Oric-specific actions (warp, replay rewind/forward/to-head, skip, reset cycles, show current location, snapshot) so they're one click away without hunting the Command Palette. |
-| **Current Instruction** | The instruction about to execute, decoded with its operand values and the symbols/types they resolve to — the same annotation shown inline, in a persistent panel (globals/locals/members/subscripts/enums). |
+| **Current Instruction** | The instruction about to execute, decoded with its operand values and the symbols/types they resolve to — the same annotation shown inline, in a persistent panel (globals/locals/members/subscripts/enums). **Shown in the bottom Panel area (the *Oric Debug* group), not the sidebar.** Its `file:line` header is a clickable jump to source. |
 | **Oric Registers** | CPU registers (A, X, Y, SP, PC), processor flags (N, V, B, D, I, Z, C), last PC, cycle counter, frame count, raster line, and interrupt vectors (NMI, RST, IRQ). A/X/Y show their decoded value when the register carries a type tag. |
 | **Oric Breakpoints** | All breakpoints as a tree: **module → file → line**, with a child row per condition / hit-count / watchpoint property. Enable/disable or delete at any level (all / module / file / line), and optionally *follow the active module*. |
 | **Oric Snapshots** | Saved machine-state snapshots for this project — restore, rename, or delete (see *Snapshots*). |
@@ -137,8 +178,8 @@ A built-in memory map (like `osdk_showmap`) generated from the current module's 
 
 ### Reference Panels
 
-- **OSDK: XA Quick Reference** - searchable XA assembler directive reference
-- **OSDK: 6502 Opcode Reference** - searchable 6502 instruction set reference with cycle counts
+- **Oric: XA Quick Reference** - searchable XA assembler directive reference
+- **Oric: 6502 Opcode Reference** - searchable 6502 instruction set reference with cycle counts
 - **Oric Documentation** panel (in the Run & Debug sidebar) — one-click links to this manual, the XA/6502 references, the [OSDK website](http://www.osdk.org), and the [Defence Force forum](https://forum.defence-force.org). External links prompt once (VS Code's link protection) — add them via *Configure Trusted Domains* to skip it thereafter.
 
 ---
@@ -393,24 +434,28 @@ All commands are available from the Command Palette (Ctrl+Shift+P):
 | **Oric: Reload Symbols (after byte-identical rebuild)** | Re-read the symbol file in place after a rebuild that left the binary unchanged — new enum members/types/symbols without relaunching | Debug |
 | **Oric: Toggle Binary Column in Values** | Show/hide the `%binary` part of decoded values (also the `oric-debug.showBinary` setting) | Always |
 | **Oric: Copy Line + Annotation** | Copy the source line plus its inline decoded annotation (gutter right-click, or the palette) | Debug (stopped) |
+| **Oric: Copy Instruction Annotation** | Copy just the decoded annotation for the current instruction (without the source line) | Debug (stopped) |
 | **Oric: Active Module** | Pick the active overlay module (multi-module projects) | Debug |
-| **Oric: Toggle Step Granularity** | Switch stepping between C statement and instruction | Debug |
+| **Oric: Toggle Step Granularity (Statement / Instruction)** | Switch stepping between C statement and instruction | Debug |
 | **Oric: Debug Log Level** | Set log verbosity (Errors / Normal / Verbose) | Always |
 | **Oric: Skip Instruction** | Advance PC past the current instruction without executing it | Debug (stopped) |
 | **Oric: Toggle Warp Speed** | Toggle Oricutron's warp mode (run at maximum speed) | Debug |
 | **Oric: Reset Cycle Counter** | Reset the CPU cycle counter to zero | Debug (stopped) |
 | **Oric: Show Current Location** | Navigate the editor to the current PC location | Debug (stopped) |
+| **Oric: Turbo Run to Cursor** | Fast-forward at warp speed to the cursor's line (also on the debug toolbar) | Debug (stopped) |
 | **Oric: Save Snapshot** / **Restore Snapshot** | Save / restore full machine state (see *Snapshots*) | Debug |
 | **Oric: Restart to Most Recent Snapshot** | Jump back to the latest restore point | Debug |
 | **Oric: Delete Snapshot** / **Refresh Snapshots** | Manage the snapshot list | Debug |
+| **Oric: Open Snapshots Folder** | Reveal the project's `.oric-snapshots/` folder in the OS file manager | Always |
 | **Oric: Run Automation Script…** / **Stop Automation Script** | Run / stop a `automation/*.js` script against the live session | Debug |
+| **Oric: Open Automation Folder** | Reveal the project's `automation/` folder in the OS file manager | Always |
 | **Oric: Register MCP Server (for Claude)…** | Write/merge `.mcp.json` and validate the MCP server | Always |
 | **Oric: AI Collaboration — Start/Stop Bridge** | Share the live session with an MCP assistant (see *Collaborative mode*) | Debug |
 | **Oric: Take Debug Control (from AI)** | Reclaim execution control while an assistant is piloting | Debug |
 | **Oric: Add Watchpoint…** | Add a (conditional) data breakpoint on an address | Debug |
 | **Oric: Enable/Disable Warp Speed** | Turn warp on/off explicitly (vs. the toggle) | Debug |
-| **OSDK: XA Quick Reference** | Open the XA assembler directive reference | Always |
-| **OSDK: 6502 Opcode Reference** | Open the 6502 instruction set reference | Always |
+| **Oric: XA Quick Reference** | Open the XA assembler directive reference | Always |
+| **Oric: 6502 Opcode Reference** | Open the 6502 instruction set reference | Always |
 
 The line-number **gutter right-click** menu (while stopped) also offers **Run to This Line**, **Turbo Run to This Line**, **Jump to This Line** / **Skip This Line** (contextual — skip only on the PC line), and **Copy Line + Annotation**.
 
@@ -444,14 +489,18 @@ Standard VS Code debug shortcuts also apply:
 
 ## Debug Toolbar Buttons
 
-When a debug session is active, four extra buttons appear in the debug toolbar:
+When a debug session is active, extra Oric-specific buttons appear in the debug toolbar. Most act on the stopped session; **Warp Speed** toggles at any time:
 
-| Icon | Action |
+| Action | Description |
 |---|---|
-| Step Over icon | **Skip Instruction** - advance PC without executing |
-| Rocket icon | **Toggle Warp Speed** - run at maximum speed |
-| History icon | **Reset Cycle Counter** - zero the cycle counter |
-| Stackframe icon | **Show Current Location** - navigate to current PC |
+| **Replay Rewind** | Load the previous history snapshot (step back in time) |
+| **Replay Forward** | Load the next snapshot |
+| **Replay to Head** | Jump to the most recent snapshot |
+| **Skip Instruction** | Advance PC without executing the current instruction |
+| **Warp Speed** (on/off) | Toggle running at maximum speed (a single button that flips between enable/disable) |
+| **Reset Cycle Counter** | Zero the cycle counter |
+| **Show Current Location** | Navigate the editor to the current PC |
+| **Turbo Run to Cursor** | Fast-forward at warp speed to the cursor's line |
 
 ---
 
@@ -495,7 +544,17 @@ VS Code settings (User or Workspace) under **Oric Debug**:
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `oric-debug.showBinary` | boolean | `true` | Show the `%binary` column in decoded values (`$02\|2\|%00000010`). Turn off for a compact `$02\|2`. Applies live to a running session; also toggleable via **Oric: Toggle Binary Column in Values** or the `bin` console command. |
-| `oric-debug.breakpointsFollowActiveModule` | boolean | `true` | In the **Oric Breakpoints** panel, auto-focus the module that's currently executing (multi-module/overlay projects). |
+| `oric-debug.breakpointsFollowActiveModule` | boolean | `true` | In the **Oric Breakpoints** panel, expand the active overlay module's section and collapse the others as the active module changes (multi-module/overlay projects). The active module is always highlighted regardless of this setting. |
+| `oric-debug.colorSourceFilesByType` | boolean | `true` | Tint file-name labels (editor tabs and Explorer) by type: C source `.c` green, headers `.h` teal, assembler `.s`/`.asm` blue, automation scripts `.js` violet. The colors are the `oric.*` theme colors below — override them in `workbench.colorCustomizations`. |
+
+File-label tint colors (contributed theme colors, overridable in `workbench.colorCustomizations`):
+
+| Color id | Applies to |
+|---|---|
+| `oric.cFileColor` | C source files (`.c`) |
+| `oric.headerFileColor` | Header files (`.h`) |
+| `oric.asmFileColor` | Assembler files (`.s`/`.asm`) |
+| `oric.scriptFileColor` | Automation scripts (`.js`) |
 
 ---
 
@@ -667,14 +726,20 @@ All attach properties above, plus:
 
 | Property | Type | Default | Description |
 |---|---|---|---|
-| `emulatorPath` | string | *required* | Path to the Oricutron executable |
+| `launchScript` | string | | An OSDK launch script (e.g. `osdk_debug.bat`) that builds and starts the emulator with the GDB stub — the recommended "OSDK way", and an alternative to `emulatorPath` + `diskImage`. |
+| `emulatorPath` | string | *required¹* | Path to the Oricutron executable |
 | `emulatorArgs` | string[] | `[]` | Additional command-line arguments for Oricutron |
-| `diskImage` | string | *required* | Disk image to load (`.dsk` or `.tap`) |
+| `diskImage` | string | *required¹* | Disk image to load (`.dsk` or `.tap`) |
 | `emulatorCwd` | string | | Working directory for Oricutron (defaults to the emulator's directory) |
+| `cwd` | string | | Working directory for `launchScript` / build (defaults to `build.cwd`, then the process cwd) |
+| `stopOnEntry` | boolean | | Break at the program entry point on launch |
+| `turboRunTo` | string | | Symbol to warp (max-speed) fast-forward to on launch (e.g. a game or module entry label) |
 | `build.command` | string | | Build command (e.g. `osdk_build.bat`) |
 | `build.cwd` | string | | Working directory for the build command |
 | `build.output` | string | | Build output file to check for staleness |
 | `build.sources` | string[] | | Source directories/files to check for staleness |
+
+¹ Required unless `launchScript` is set (which supplies its own emulator invocation).
 
 ---
 
