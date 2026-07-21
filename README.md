@@ -51,6 +51,7 @@ Dedicated panels appear in the Debug sidebar when a session is active:
 | **Oric Snapshots** | Saved machine-state snapshots for this project — restore, rename, or delete (see *Snapshots*). |
 | **Oric Automation** | Runnable automation scripts (`automation/*.js`) with a **▶ Run** button each (see *Automation Scripting*). |
 | **Oric Peripherals** | Live state of the VIA 6522, AY-3-8912 (PSG), WD1793 floppy disk controller, Microdisc interface, and ACIA 6551 serial controller. |
+| **Oric Documentation** | Quick links: the extension manual, the internal **XA** and **6502** references, and the external **OSDK website** & **Defence Force forum**. |
 
 (Zero-page variables are no longer a separate panel — view them in the **Symbol Browser** with the group filter set to *Zero Page*.)
 
@@ -122,10 +123,23 @@ The Symbol Browser doubles as a **watch panel**, kept above the symbol table and
 - **Search history** persists per workspace behind the ▾ button.
 - Remove a watch with the ✕ or by clicking its dot off. Entries persist per workspace.
 
+### Memory Map
+
+Open via command palette: **Oric: Memory Map**
+
+A built-in memory map (like `osdk_showmap`) generated from the current module's symbols — no external tool, and it **auto-regenerates** whenever symbols change (on build/reload and on module switch, so the *Overlay* tab always reflects the active module). It works while the program is running or stopped, once a session has loaded symbols.
+
+- **Tabs**: *Normal* (`$0400–$BFFF`), *Overlay* (`$C000–$FFFF`), *Zero* (`$00–$FF`).
+- **Layout table** — Address · Total · Size · Name(s). Block size = gap to the next symbol; a label starting with `_` or `osdk` is a **section marker** whose *Total* sums every block until the next marker (bold rows). Page-aligned addresses are bold, and co-located labels are listed together (e.g. `_ImageBuffer, _SavedData1`).
+- **Largest** — a summary of the biggest sections by total; click one to jump to its row.
+- **Search** — incremental filter with per-tab match counts; if the term isn't in the current tab it **auto-jumps** to the tab that has it. Clear with the **×** or **Esc**.
+- **Clickable labels** jump to the symbol's definition in source.
+
 ### Reference Panels
 
 - **OSDK: XA Quick Reference** - searchable XA assembler directive reference
 - **OSDK: 6502 Opcode Reference** - searchable 6502 instruction set reference with cycle counts
+- **Oric Documentation** panel (in the Run & Debug sidebar) — one-click links to this manual, the XA/6502 references, the [OSDK website](http://www.osdk.org), and the [Defence Force forum](https://forum.defence-force.org). External links prompt once (VS Code's link protection) — add them via *Configure Trusted Domains* to skip it thereafter.
 
 ---
 
@@ -373,6 +387,7 @@ All commands are available from the Command Palette (Ctrl+Shift+P):
 | **Oric: Memory Heatmap** | Open the real-time memory access heatmap | Always |
 | **Oric: Screen View** | Open the live Oric screen display | Always |
 | **Oric: Symbol Browser** | Open the symbol/define browser + watch panel | Always |
+| **Oric: Memory Map** | Open the built-in memory map (Normal/Overlay/Zero tabs) | Always |
 | **Oric: Disassembly View** | Open the disassembly panel (with per-line run/turbo/jump/skip actions) | Always |
 | **Oric: Reparse Annotations (no rebuild)** | Re-read `@…` comment annotations from source into the live session (also runs automatically on save) | Debug |
 | **Oric: Reload Symbols (after byte-identical rebuild)** | Re-read the symbol file in place after a rebuild that left the binary unchanged — new enum members/types/symbols without relaunching | Debug |

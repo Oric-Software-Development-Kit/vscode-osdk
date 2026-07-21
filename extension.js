@@ -4301,6 +4301,187 @@ function refreshSymbolsPanel(session) {
 }
 
 // ----------------------------------------------------------------
+// Oric Memory Map panel — built-in memmap (like osdk_showmap), regenerated from the
+// module-composed symbols on every symbol change. Sections Zero/Normal/Overlay as tabs;
+// block size = gap to the next symbol; a label starting with '_' or 'osdk' is a section
+// marker whose "total" = sum until the next marker (ported from osdk MemMap/memmap.cpp).
+// Labels are clickable → jump to source. Incremental search across all sections.
+// ----------------------------------------------------------------
+let memoryMapPanel = null;
+function createMemoryMapPanel() {
+    if (memoryMapPanel) { memoryMapPanel.reveal(); return memoryMapPanel; }
+    const panel = vscode.window.createWebviewPanel('oricMemoryMap', 'Oric Memory Map',
+        vscode.ViewColumn.Beside, { enableScripts: true, retainContextWhenHidden: true });
+    wireMemoryMapPanel(panel);
+    return panel;
+}
+// Shared by create + the reload serializer (DRY — see the Screen View lesson).
+function wireMemoryMapPanel(panel) {
+    memoryMapPanel = panel;
+    panel.iconPath = panelIcon('panel-memory-v2');
+    panel.webview.options = { enableScripts: true, retainContextWhenHidden: true };
+    panel.webview.html = memoryMapHtml();
+    panel.onDidDispose(() => { memoryMapPanel = null; });
+    panel.onDidChangeViewState(e => { if (e.webviewPanel.visible) refreshMemoryMap(vscode.debug.activeDebugSession); });
+    panel.webview.onDidReceiveMessage(msg => {
+        if (msg.type === 'gotoSymbol' && msg.file && msg.line > 0) {
+            const uri = vscode.Uri.file(msg.file);
+            vscode.workspace.openTextDocument(uri).then(doc => {
+                vscode.window.showTextDocument(doc, { preview: true, viewColumn: vscode.ViewColumn.One }).then(ed => {
+                    const line = Math.max(0, msg.line - 1);
+                    const range = new vscode.Range(line, 0, line, 0);
+                    ed.selection = new vscode.Selection(range.start, range.start);
+                    ed.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+                });
+            }).catch(() => {});
+        }
+    });
+    refreshMemoryMap(vscode.debug.activeDebugSession);
+}
+let lastMapSymbols = null;   // last module-composed symbol list — persists after the session ends so the map stays visible
+// Feed the map the module-composed symbols (name/addr/source; NO values, NO memory read — so
+// it works while the CPU is running, stopped, and after the session via the cached copy).
+function refreshMemoryMap(session) {
+    if (!memoryMapPanel) return;
+    if (session && session.type === 'oric-debug') {
+        session.customRequest('symbolTableLite').then(resp => {
+            if (!memoryMapPanel) return;
+            if (resp && resp.symbols) { lastMapSymbols = resp.symbols; memoryMapPanel.webview.postMessage({ type: 'mapSymbols', symbols: resp.symbols }); }
+        }).catch(() => { /* old adapter without the request — keep the last map */ });
+    } else {
+        // No live session: show the last symbols we saw this run (the map is a static layout).
+        memoryMapPanel.webview.postMessage({ type: 'mapSymbols', symbols: lastMapSymbols });
+    }
+}
+function memoryMapHtml() {
+    return `<!DOCTYPE html>
+<html><head><style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(--vscode-editor-font-size, 13px); color: var(--vscode-foreground); background: var(--vscode-editor-background); display: flex; flex-direction: column; overflow: hidden; }
+.toolbar { flex: none; display: flex; gap: 8px; align-items: center; padding: 6px 8px; border-bottom: 1px solid var(--vscode-widget-border, #444); }
+.tabs { display: flex; gap: 2px; }
+.tab { cursor: pointer; padding: 3px 10px; border: 1px solid transparent; border-radius: 4px; color: var(--vscode-descriptionForeground, #888); background: none; font-family: inherit; font-size: inherit; }
+.tab.active { color: var(--vscode-foreground); border-color: var(--vscode-widget-border, #444); background: var(--vscode-list-activeSelectionBackground, #094771); }
+.tab .cnt { font-size: 0.85em; opacity: 0.8; }
+.search { flex: 1; position: relative; }
+.search input { width: 100%; background: var(--vscode-input-background, #3c3c3c); color: var(--vscode-input-foreground, #ccc); border: 1px solid var(--vscode-input-border, #555); padding: 3px 22px 3px 6px; font-family: inherit; font-size: inherit; }
+.search .clear-btn { position: absolute; right: 3px; top: 50%; transform: translateY(-50%); background: none; border: none; color: var(--vscode-descriptionForeground, #888); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 3px; display: none; }
+.search .clear-btn:hover { color: var(--vscode-foreground); }
+.search input:not(:placeholder-shown) ~ .clear-btn { display: block; }
+.summary { flex: none; padding: 4px 8px; border-bottom: 1px solid var(--vscode-widget-border, #444); color: var(--vscode-descriptionForeground, #888); font-size: 0.9em; max-height: 22%; overflow-y: auto; }
+.summary a { color: var(--vscode-textLink-foreground); cursor: pointer; white-space: nowrap; }
+.summary a:hover { text-decoration: underline; }
+#wrap { flex: 1 1 auto; overflow: auto; }
+table { width: 100%; border-collapse: collapse; }
+th { position: sticky; top: 0; z-index: 2; background: var(--vscode-editor-background); text-align: left; padding: 3px 8px; border-bottom: 1px solid var(--vscode-widget-border, #444); color: var(--vscode-sideBarSectionHeader-foreground, #ccc); font-weight: bold; }
+th.r { text-align: right; }
+td { padding: 1px 8px; white-space: nowrap; }
+tr:nth-child(even) td { background: rgba(255,255,255,0.03); }
+.addr { color: var(--vscode-debugTokenExpression-number, #b5cea8); }
+.sz { color: var(--vscode-descriptionForeground, #888); text-align: right; }
+tr.master td { font-weight: bold; }
+tr.master .total { color: var(--vscode-debugTokenExpression-number, #b5cea8); }
+.name { color: var(--vscode-debugTokenExpression-name, #9cdcfe); }
+.sym-link { cursor: pointer; }
+.sym-link:hover { text-decoration: underline; }
+tr.flash td { background: var(--vscode-editor-findMatchHighlightBackground, rgba(255,220,0,0.35)) !important; }
+.dim { color: var(--vscode-descriptionForeground, #888); padding: 16px 8px; font-style: italic; }
+</style></head><body>
+<div class="toolbar">
+    <div class="tabs" id="tabs"></div>
+    <div class="search"><input type="text" id="search" placeholder="Find symbol..." autocomplete="off"><button class="clear-btn" id="clearBtn" title="Clear (Esc)">×</button></div>
+</div>
+<div class="summary" id="summary" style="display:none"></div>
+<div id="wrap">
+    <div class="dim" id="dim">No debug session or no symbols loaded</div>
+    <table id="tbl" style="display:none"><thead><tr><th>Address</th><th class="r">Total</th><th class="r">Size</th><th>Name(s)</th></tr></thead><tbody id="tbody"></tbody></table>
+</div>
+<script>
+const vscode = acquireVsCodeApi();
+const SEC = [['Normal', 0x400, 0xBFFF], ['Overlay', 0xC000, 0xFFFF], ['Zero', 0x00, 0xFF]];
+let syms = null, active = 'Normal', filter = '';
+const tabsEl = document.getElementById('tabs'), tbody = document.getElementById('tbody'), tbl = document.getElementById('tbl'), dim = document.getElementById('dim'), searchEl = document.getElementById('search'), summaryEl = document.getElementById('summary');
+function h(v, w) { return '$' + (v >>> 0).toString(16).toUpperCase().padStart(w, '0'); }
+function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function isMaster(n) { return !!n && (n[0] === '_' || n.slice(0, 4) === 'osdk'); }
+function masterName(b) { const m = b.labels.find(l => isMaster(l.name)); return m ? m.name : b.labels[0].name; }
+function computeSection(begin, end) {
+    const byAddr = new Map();
+    for (const s of (syms || [])) { if (s.addr == null || s.addr < begin || s.addr > end) continue; let b = byAddr.get(s.addr); if (!b) { b = { addr: s.addr, labels: [] }; byAddr.set(s.addr, b); } b.labels.push(s); }
+    const blocks = [...byAddr.values()].sort((a, b) => a.addr - b.addr);
+    let master = null;
+    for (let i = 0; i < blocks.length; i++) {
+        const b = blocks[i];
+        b.blockSize = (i + 1 < blocks.length ? blocks[i + 1].addr : end + 1) - b.addr;
+        b.isMaster = b.labels.some(l => isMaster(l.name)); b.total = 0;
+        if (b.isMaster) master = b;
+        if (master) master.total += b.blockSize;
+    }
+    return blocks;
+}
+function matchCount(begin, end) { if (!filter) return 0; const f = filter.toLowerCase(); let n = 0; for (const s of (syms || [])) if (s.addr >= begin && s.addr <= end && s.name.toLowerCase().includes(f)) n++; return n; }
+function renderTabs() {
+    tabsEl.innerHTML = '';
+    for (const [name, begin, end] of SEC) {
+        const b = document.createElement('button'); b.className = 'tab' + (name === active ? ' active' : ''); b.textContent = name;
+        if (filter) { const c = matchCount(begin, end); if (c) { const s = document.createElement('span'); s.className = 'cnt'; s.textContent = ' (' + c + ')'; b.appendChild(s); } }
+        b.onclick = () => { active = name; render(); };
+        tabsEl.appendChild(b);
+    }
+}
+function nameHtml(lbl) {
+    const src = (lbl.nameSources && lbl.nameSources[lbl.name]) || lbl.source;
+    if (src && src.file) return '<span class="name sym-link" data-file="' + esc(src.file) + '" data-line="' + (src.line || 0) + '">' + esc(lbl.name) + '</span>';
+    return '<span class="name">' + esc(lbl.name) + '</span>';
+}
+function render() {
+    renderTabs();
+    if (!syms) { dim.style.display = 'block'; tbl.style.display = 'none'; summaryEl.style.display = 'none'; dim.textContent = 'No debug session or no symbols loaded'; return; }
+    const sec = SEC.find(s => s[0] === active);
+    const blocks = computeSection(sec[1], sec[2]);
+    const f = filter.toLowerCase();
+    // Largest sections summary (master blocks by total) — hidden while filtering.
+    const masters = blocks.filter(b => b.isMaster && b.total > 0).sort((a, b) => b.total - a.total).slice(0, 20);
+    if (masters.length && !f) { summaryEl.style.display = 'block'; summaryEl.innerHTML = 'Largest: ' + masters.map(m => '<a data-addr="' + m.addr + '">' + esc(masterName(m)) + '</a> (' + m.total + ')').join(' · '); }
+    else summaryEl.style.display = 'none';
+    let html = '';
+    for (const b of blocks) {
+        const hit = f && b.labels.some(l => l.name.toLowerCase().includes(f));
+        if (f && !hit) continue;
+        const bold = (b.addr & 0xFF) === 0;
+        const addrCell = '<td class="addr">' + (bold ? '<b>' : '') + h(b.addr, 4) + (bold ? '</b>' : '') + '</td>';
+        const sizeCells = (b.isMaster && b.total) ? '<td class="sz total">' + b.total + '</td><td class="sz">' + b.blockSize + '</td>' : '<td class="sz" colspan="2">' + b.blockSize + '</td>';
+        html += '<tr class="' + (b.isMaster ? 'master' : '') + '" data-addr="' + b.addr + '">' + addrCell + sizeCells + '<td>' + b.labels.map(nameHtml).join(', ') + '</td></tr>';
+    }
+    tbody.innerHTML = html || '<tr><td colspan="4" class="dim">No symbols in this section' + (f ? ' matching "' + esc(filter) + '"' : '') + '</td></tr>';
+    dim.style.display = 'none'; tbl.style.display = '';
+}
+summaryEl.addEventListener('click', e => {
+    const a = e.target.closest('a[data-addr]'); if (!a) return;
+    const row = tbody.querySelector('tr[data-addr="' + a.dataset.addr + '"]');
+    if (row) { row.scrollIntoView({ block: 'center' }); row.classList.add('flash'); setTimeout(() => row.classList.remove('flash'), 900); }
+});
+tbody.addEventListener('click', e => { const el = e.target.closest('.sym-link[data-file]'); if (el) vscode.postMessage({ type: 'gotoSymbol', file: el.dataset.file, line: parseInt(el.dataset.line, 10) }); });
+searchEl.addEventListener('input', () => {
+    filter = searchEl.value.trim();
+    // If the active tab has no matches but another does, jump to the first that does (in
+    // Normal/Overlay/Zero order). Only when the current tab is empty — so manual tab clicks stick.
+    if (filter) {
+        const cur = SEC.find(s => s[0] === active);
+        if (matchCount(cur[1], cur[2]) === 0) { const hit = SEC.find(s => matchCount(s[1], s[2]) > 0); if (hit) active = hit[0]; }
+    }
+    render();
+});
+searchEl.addEventListener('keydown', e => { if (e.key === 'Escape' && searchEl.value) { e.preventDefault(); searchEl.value = ''; filter = ''; render(); } });
+document.getElementById('clearBtn').addEventListener('click', () => { searchEl.value = ''; filter = ''; searchEl.focus(); render(); });
+window.addEventListener('message', e => { if (e.data.type === 'mapSymbols') { syms = e.data.symbols; render(); } });
+render();
+</script>
+</body></html>`;
+}
+
+// ----------------------------------------------------------------
 // Oric Disassembly Panel — create / refresh / HTML
 // ----------------------------------------------------------------
 
@@ -7010,6 +7191,38 @@ function activate(context) {
         })
     );
 
+    // --- Oric Documentation panel — quick links to the manual + internal/external references.
+    // Static rows: each fires a command (internal reference panels) or opens a URL (external).
+    const docsItems = [
+        { label: 'Extension manual', icon: 'book', desc: 'This extension’s page & README', cmd: 'oric-debug.openManual' },
+        { label: 'XA assembler reference', icon: 'symbol-keyword', desc: 'Internal quick reference', cmd: 'osdk.xaReference' },
+        { label: '6502 opcode reference', icon: 'symbol-numeric', desc: 'Internal quick reference', cmd: 'osdk.6502Reference' },
+        { label: 'OSDK website', icon: 'globe', desc: 'osdk.org (external)', cmd: 'vscode.open', args: [vscode.Uri.parse('http://www.osdk.org')] },
+        { label: 'Defence Force forum', icon: 'comment-discussion', desc: 'forum.defence-force.org (external)', cmd: 'vscode.open', args: [vscode.Uri.parse('https://forum.defence-force.org')] }
+    ];
+    const docsProvider = {
+        getChildren: () => docsItems,
+        getTreeItem: (it) => {
+            const t = new vscode.TreeItem(it.label);
+            t.iconPath = new vscode.ThemeIcon(it.icon);
+            t.description = it.desc;
+            t.tooltip = it.desc;
+            t.command = { command: it.cmd, title: it.label, arguments: it.args || [] };
+            return t;
+        }
+    };
+    context.subscriptions.push(
+        vscode.window.registerTreeDataProvider('oricDocs', docsProvider),
+        // Open the extension's page (README rendered inside VS Code); fall back to a README preview.
+        vscode.commands.registerCommand('oric-debug.openManual', async () => {
+            try { await vscode.commands.executeCommand('extension.open', 'dbug.osdk-debug'); }
+            catch (e) {
+                const readme = vscode.Uri.file(nodePath.join(nodePath.dirname(__filename), 'README.md'));
+                vscode.commands.executeCommand('markdown.showPreview', readme).then(undefined, () => vscode.commands.executeCommand('vscode.open', readme));
+            }
+        })
+    );
+
     // Tint source-file name labels (editor tabs + Explorer) by type — .c green, .h gray, .s/.asm
     // blue, .js violet — via a FileDecorationProvider (theme colors only; label text, not
     // background). No type badge: the extension already names the type, and the badge slot is left
@@ -7276,6 +7489,7 @@ function activate(context) {
         vscode.commands.registerCommand('osdk.xaReference', () => createXaReferencePanel()),
         vscode.commands.registerCommand('osdk.6502Reference', () => create6502ReferencePanel()),
         vscode.commands.registerCommand('oric-debug.openSymbols', () => createSymbolsPanel(context)),
+        vscode.commands.registerCommand('oric-debug.openMemoryMap', () => createMemoryMapPanel()),
         vscode.commands.registerCommand('oric-debug.reparseAnnotations', () => reparseAnnotations(true)),
         vscode.commands.registerCommand('oric-debug.reloadSymbols', () => reloadSymbols()),
         vscode.commands.registerCommand('oric-debug.toggleBinary', async () => {
@@ -7455,6 +7669,11 @@ function activate(context) {
     vscode.window.registerWebviewPanelSerializer('oricScreenView', {
         async deserializeWebviewPanel(panel) {
             wireScreenPanel(panel);   // same setup + message handler as createScreenPanel (DRY)
+        }
+    });
+    vscode.window.registerWebviewPanelSerializer('oricMemoryMap', {
+        async deserializeWebviewPanel(panel) {
+            wireMemoryMapPanel(panel);   // same setup as createMemoryMapPanel (DRY)
         }
     });
     vscode.window.registerWebviewPanelSerializer('oricSymbols', {
@@ -7809,6 +8028,7 @@ function activate(context) {
                             refreshSymbolsPanel(session);
                             refreshWatchValues(session); // re-sort active/inactive on module switch
                             rebuildBpTree();             // module map may now be available/changed
+                            refreshMemoryMap(session);   // rebuild the memory map for the new module/symbols
                         }
                         // Log verbosity changed (initial config, status bar, or console) — reflect it
                         if (msg.type === 'event' && msg.event === 'oricLogLevel' && msg.body) {

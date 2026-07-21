@@ -34,10 +34,12 @@
         "onCommand:osdk.6502Reference",
         "onCommand:oric-debug.openScreenView",
         "onCommand:oric-debug.openSymbols",
+        "onCommand:oric-debug.openMemoryMap",
         "onCommand:oric-debug.showCurrentLocation",
         "onWebviewPanel:oricHeatmap",
         "onWebviewPanel:oricScreenView",
         "onWebviewPanel:oricSymbols",
+        "onWebviewPanel:oricMemoryMap",
         "onWebviewPanel:oricDisassembly"
     ],
     "main": "./extension.js",
@@ -165,6 +167,11 @@
                 {
                     "id": "oricAutomation",
                     "name": "Oric Automation",
+                    "icon": "images/oric.svg"
+                },
+                {
+                    "id": "oricDocs",
+                    "name": "Oric Documentation",
                     "icon": "images/oric.svg"
                 }
             ],
@@ -405,6 +412,10 @@
             {
                 "command": "oric-debug.openSymbols",
                 "title": "Oric: Symbol Browser"
+            },
+            {
+                "command": "oric-debug.openMemoryMap",
+                "title": "Oric: Memory Map"
             },
             {
                 "command": "oric-debug.reparseAnnotations",

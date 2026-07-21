@@ -5764,6 +5764,35 @@ const handlers = {
         respond(req, { name });
     },
 
+    // -- Symbol table WITHOUT values (custom request) ------------------
+    // A flat name/addr/source list built purely from the symbol table + resolver — NO memory
+    // reads, so it's safe to call while the CPU is RUNNING (readAllSymbols would hang on `m`).
+    // Feeds the Memory Map, which only needs the static layout. Addresses are merged by the
+    // client; here we emit one row per symbol name (memmap's flat-input model).
+    symbolTableLite(req) {
+        // One row per LABEL at each address: the symbol map PLUS the resolver's co-located
+        // aliases (the resolver is the authority on multiple labels sharing an address — the
+        // same source the Symbol Browser uses). The client merges rows by address. No `m` reads.
+        const out = [], seen = new Set(), doneAddr = new Set();
+        const push = (name, addr, src) => {
+            const k = addr + ':' + name;
+            if (!name || seen.has(k)) return; seen.add(k);
+            out.push({ name, addr, source: src ? { file: src.file, line: src.line } : null });
+        };
+        for (const [name, addr] of symbols) {
+            push(name, addr, resolverInstance ? resolverInstance.declOf(name) : null);
+            if (resolverInstance && !doneAddr.has(addr)) {
+                doneAddr.add(addr);
+                const rec = resolverInstance.resolve(addr);
+                if (rec && rec.symbol) {
+                    push(rec.symbol.name, addr, rec.source || resolverInstance.declOf(rec.symbol.name));
+                    for (const al of (rec.symbol.aliases || [])) push(al.name, addr, al.source || resolverInstance.declOf(al.name));
+                }
+            }
+        }
+        respond(req, { symbols: out });
+    },
+
     // -- Read all symbols with current values (custom request) ---------
 
     async readAllSymbols(req) {
