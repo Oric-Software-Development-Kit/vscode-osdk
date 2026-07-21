@@ -274,11 +274,11 @@ body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(
 .r { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 3px 0; align-items: baseline; }
 .n { color: var(--vscode-debugTokenExpression-name, #9cdcfe); }
 .v { color: var(--vscode-debugTokenExpression-number, #b5cea8); }
-.mod { color: #e04040; }
+.mod { color: var(--vscode-charts-red, #e04040); }
 .fon { color: var(--vscode-debugTokenExpression-number, #b5cea8); font-weight: bold; }
-.fon.mod { color: #e04040; font-weight: bold; }
+.fon.mod { color: var(--vscode-charts-red, #e04040); font-weight: bold; }
 .foff { opacity: 0.35; }
-.foff.mod { opacity: 1.0; color: #e04040; }
+.foff.mod { opacity: 1.0; color: var(--vscode-charts-red, #e04040); }
 .sep { border-top: 1px solid var(--vscode-widget-border, #444); margin: 4px 0; }
 ${STALE_CSS}
 </style></head><body class="${stale ? 'stale' : ''}">
@@ -408,7 +408,7 @@ body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(
 .r { display: flex; flex-wrap: wrap; gap: 2px 10px; margin: 2px 0 6px 0; }
 .n { color: var(--vscode-debugTokenExpression-name, #9cdcfe); }
 .v { color: var(--vscode-debugTokenExpression-number, #b5cea8); }
-.mod { color: #e04040; }
+.mod { color: var(--vscode-charts-red, #e04040); }
 .x { color: var(--vscode-descriptionForeground, #888); font-size: 0.9em; }
 .hdr { color: var(--vscode-sideBarSectionHeader-foreground, #ccc); font-weight: bold; font-size: 0.95em; margin-top: 2px; }
 .addr { color: var(--vscode-descriptionForeground, #888); font-weight: normal; font-size: 0.9em; }
@@ -517,6 +517,10 @@ function wireMemoryPanel(panel, initialEntries) {
             // Relay a graphic-view hover to the ONE Screen View zoomer. No-op (never throws) if
             // that panel isn't open — the user's responsibility, per design.
             if (screenPanel) screenPanel.webview.postMessage({ type: 'gfxZoom', sub: msg.sub, pixels: msg.pixels, w: msg.w, h: msg.h, x: msg.x, y: msg.y, addr: msg.addr, byte: msg.byte, bit: msg.bit, color: msg.color });
+        } else if (msg.type === 'hover') {
+            showHoverHelp(msg.text);
+        } else if (msg.type === 'hoverEnd') {
+            showHoverHelp(null);
         }
     });
 
@@ -586,21 +590,25 @@ function memoryPanelHtml() {
 <html><head><style>
 body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(--vscode-editor-font-size, 13px); color: var(--vscode-foreground); padding: 8px 12px; margin: 0; }
 .input-row { display: flex; gap: 4px; margin-bottom: 10px; }
-.input-row input[type="text"] { flex: 1; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #444); padding: 4px 8px; font-family: inherit; font-size: inherit; }
+.input-row input[type="text"] { flex: 1; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #555); padding: 4px 24px 4px 8px; font-family: inherit; font-size: inherit; }
 .input-row button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 4px 12px; cursor: pointer; font-size: inherit; }
 .input-row button:hover { background: var(--vscode-button-hoverBackground); }
+.input-wrap { position: relative; flex: 1; display: flex; }
+.input-wrap .clear-btn { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); background: none; border: none; color: var(--vscode-descriptionForeground, #888); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 3px; display: none; }
+.input-wrap .clear-btn:hover { background: none; color: var(--vscode-foreground); }
+.input-wrap input:not(:placeholder-shown) ~ .clear-btn { display: block; }
 .entry { margin-bottom: 10px; }
 .entry-hdr { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px; gap: 6px; }
 .entry-hdr .left { display: flex; align-items: center; gap: 4px; flex-shrink: 1; min-width: 0; }
 .entry-hdr .expr { color: var(--vscode-debugTokenExpression-name, #9cdcfe); font-weight: bold; white-space: nowrap; }
 .expr-input { background: transparent; color: var(--vscode-debugTokenExpression-name, #9cdcfe); font-weight: bold; font-family: inherit; font-size: inherit; border: 1px solid transparent; border-radius: 3px; padding: 1px 4px; min-width: 60px; max-width: 320px; }
-.expr-input:hover { border-color: var(--vscode-input-border, #444); }
+.expr-input:hover { border-color: var(--vscode-input-border, #555); }
 .expr-input:focus { outline: none; border-color: var(--vscode-focusBorder); background: var(--vscode-input-background); color: var(--vscode-input-foreground); }
 .entry-hdr .addr { color: var(--vscode-debugTokenExpression-number, #b5cea8); white-space: nowrap; }
 .entry-hdr .controls { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
-.rows-input { width: 38px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #444); padding: 1px 3px; font-family: inherit; font-size: 0.9em; text-align: center; }
+.rows-input { width: 38px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #555); padding: 1px 3px; font-family: inherit; font-size: 0.9em; text-align: center; }
 .rows-label { color: var(--vscode-descriptionForeground, #888); font-size: 0.9em; }
-.fmt-select, .gfx-zoom, .gfx-dec, .gfx-transp { background: var(--vscode-dropdown-background, var(--vscode-input-background)); color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground)); border: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, #444)); padding: 1px 3px; font-family: inherit; font-size: 0.9em; }
+.fmt-select, .gfx-zoom, .gfx-dec, .gfx-transp { background: var(--vscode-dropdown-background, var(--vscode-input-background)); color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground)); border: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, #555)); padding: 1px 3px; font-family: inherit; font-size: 0.9em; }
 .remove { cursor: pointer; color: var(--vscode-descriptionForeground, #888); padding: 0 2px; font-size: 1.2em; }
 .remove:hover { color: var(--vscode-errorForeground, #f44); }
 .dump { white-space: pre; line-height: 1.4; color: var(--vscode-editor-foreground); }
@@ -610,7 +618,7 @@ body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(
 .sep { border-top: 1px solid var(--vscode-widget-border, #444); margin: 8px 0; }
 .empty { color: var(--vscode-descriptionForeground, #888); font-style: italic; }
 /* Graphic view controls + canvas */
-.gfx-input { width: 44px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #444); padding: 1px 3px; font-family: inherit; font-size: 0.9em; text-align: center; }
+.gfx-input { width: 44px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #555); padding: 1px 3px; font-family: inherit; font-size: 0.9em; text-align: center; }
 .gfx-lbl { color: var(--vscode-descriptionForeground, #888); font-size: 0.9em; display: inline-flex; align-items: center; gap: 2px; }
 .gfx-unit { color: var(--vscode-descriptionForeground, #888); font-size: 0.8em; }
 .gfx-wrap { overflow: auto; background: #000; padding: 4px; border: 1px solid var(--vscode-widget-border, #444); display: inline-block; max-width: 100%; }
@@ -621,8 +629,8 @@ body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(
 body.stale { opacity: 0.5; filter: grayscale(0.35); }
 </style></head><body>
 <div class="input-row">
-    <input type="text" id="exprInput" placeholder="Expression: _Symbol, *_Ptr, $A000, _Buf+X" />
-    <button id="addBtn">Add</button>
+    <span class="input-wrap"><input type="text" id="exprInput" placeholder="Expression: _Symbol, *_Ptr, $A000, _Buf+X" data-help="Add a memory watch — a symbol, *pointer, $address, or an expression like _Buf+X" /><button class="clear-btn" id="exprClear" data-help="Clear the expression (Esc)">×</button></span>
+    <button id="addBtn" data-help="Add the expression as a new memory view">Add</button>
 </div>
 <div id="entries"><div class="empty">Add an expression to view memory</div></div>
 <script>
@@ -766,7 +774,12 @@ function addExpr() {
     }
 }
 addBtn.addEventListener('click', addExpr);
-input.addEventListener('keydown', e => { if (e.key === 'Enter') addExpr(); });
+input.addEventListener('keydown', e => { if (e.key === 'Enter') addExpr(); else if (e.key === 'Escape' && input.value) { e.preventDefault(); input.value = ''; } });
+document.getElementById('exprClear').addEventListener('click', () => { input.value = ''; input.focus(); });
+// Status-bar hover help (no native tooltips — a large cursor covers them). Delegated so it also
+// covers the dynamically-rendered per-row controls; the panel forwards these to showHoverHelp.
+document.body.addEventListener('mouseover', e => { const el = e.target.closest('[data-help]'); if (el) vscode.postMessage({ type: 'hover', text: el.getAttribute('data-help') }); });
+document.body.addEventListener('mouseout', e => { const el = e.target.closest('[data-help]'); if (el) vscode.postMessage({ type: 'hoverEnd' }); });
 
 function escapeHtml(s) {
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -847,7 +860,7 @@ function renderResults(results) {
         const addrStr = r.address !== null ? ' \\u2192 $' + r.address.toString(16).toUpperCase().padStart(4, '0') : '';
         const fmtOpts = ['hex','words','decimal','binary','graphic'];
         const fmtLabels = ['Hex','Words','Decimal','Binary','Graphic'];
-        let selHtml = '<select class="fmt-select" data-idx="' + i + '" title="Display format">';
+        let selHtml = '<select class="fmt-select" data-idx="' + i + '" data-help="Display format for these bytes (Hex / Words / Decimal / Binary / Graphic)">';
         for (let f = 0; f < fmtOpts.length; f++) {
             selHtml += '<option value="' + fmtOpts[f] + '"' + (r.format === fmtOpts[f] ? ' selected' : '') + '>' + fmtLabels[f] + '</option>';
         }
@@ -855,30 +868,30 @@ function renderResults(results) {
 
         html += '<div class="entry">';
         html += '<div class="entry-hdr">';
-        html += '<span class="left"><input class="expr-input" data-idx="' + i + '" data-orig="' + escapeHtml(r.expression) + '" value="' + escapeHtml(r.expression) + '" spellcheck="false" title="Edit expression, Enter to apply (e.g. messagePtr \\u2192 *messagePtr)"><span class="addr">' + addrStr + '</span></span>';
+        html += '<span class="left"><input class="expr-input" data-idx="' + i + '" data-orig="' + escapeHtml(r.expression) + '" value="' + escapeHtml(r.expression) + '" spellcheck="false" data-help="Edit the expression, Enter to apply (e.g. messagePtr \\u2192 *messagePtr)"><span class="addr">' + addrStr + '</span></span>';
         const isGfx = r.format === 'graphic';
         html += '<span class="controls">';
         if (isGfx) {
-            html += '<select class="gfx-dec" data-idx="' + i + '" title="Decoder">';
+            html += '<select class="gfx-dec" data-idx="' + i + '" data-help="Graphic decoder (HIRES or Masked)">';
             [['hires','HIRES'],['masked','Masked']].forEach(o => { html += '<option value="' + o[0] + '"' + ((r.decoder || 'hires') === o[0] ? ' selected' : '') + '>' + o[1] + '</option>'; });
             html += '</select>';
-            html += '<span class="gfx-lbl" title="Width in bytes (6 pixels each)">W<input type="number" class="gfx-input gfx-w" data-idx="' + i + '" value="' + (r.w || 40) + '" min="1" max="512"><span class="gfx-unit">B</span></span>';
-            html += '<span class="gfx-lbl" title="Height in scanlines">H<input type="number" class="gfx-input gfx-h" data-idx="' + i + '" value="' + (r.h || 128) + '" min="1" max="2048"></span>';
-            html += '<label class="gfx-lbl"><input type="checkbox" class="gfx-grid" data-idx="' + i + '"' + (r.grid ? ' checked' : '') + '> grid</label>';
+            html += '<span class="gfx-lbl" data-help="Width in bytes (6 pixels each)">W<input type="number" class="gfx-input gfx-w" data-idx="' + i + '" value="' + (r.w || 40) + '" min="1" max="512"><span class="gfx-unit">B</span></span>';
+            html += '<span class="gfx-lbl" data-help="Height in scanlines">H<input type="number" class="gfx-input gfx-h" data-idx="' + i + '" value="' + (r.h || 128) + '" min="1" max="2048"></span>';
+            html += '<label class="gfx-lbl" data-help="Overlay a pixel grid on the graphic view"><input type="checkbox" class="gfx-grid" data-idx="' + i + '"' + (r.grid ? ' checked' : '') + '> grid</label>';
             if ((r.decoder || 'hires') === 'masked') {
-                html += '<select class="gfx-transp" data-idx="' + i + '" title="Transparent pixels">';
+                html += '<select class="gfx-transp" data-idx="' + i + '" data-help="How transparent (masked) pixels are shown">';
                 [['gray','Gray'],['dark','Dark'],['checker','Checker']].forEach(o => { html += '<option value="' + o[0] + '"' + ((r.transp || 'gray') === o[0] ? ' selected' : '') + '>' + o[1] + '</option>'; });
                 html += '</select>';
             }
-            html += '<select class="gfx-zoom" data-idx="' + i + '" title="Zoom">';
+            html += '<select class="gfx-zoom" data-idx="' + i + '" data-help="Zoom factor for the graphic view">';
             [1,2,3,4].forEach(z => { html += '<option value="' + z + '"' + ((r.zoom || 2) === z ? ' selected' : '') + '>' + z + 'x</option>'; });
             html += '</select>';
         } else {
-            html += '<input type="number" class="rows-input" data-idx="' + i + '" value="' + r.rows + '" min="1" max="128" title="Number of rows">';
+            html += '<input type="number" class="rows-input" data-idx="' + i + '" value="' + r.rows + '" min="1" max="128" data-help="Number of rows to display">';
             html += '<span class="rows-label">rows</span>';
         }
         html += selHtml;
-        html += '<span class="remove" data-idx="' + i + '" title="Remove">\\u00d7</span>';
+        html += '<span class="remove" data-idx="' + i + '" data-help="Remove this memory view">\\u00d7</span>';
         html += '</span></div>';
         if (r.error) {
             html += '<div class="error">' + escapeHtml(r.error) + '</div>';
@@ -964,7 +977,7 @@ function xaReferenceHtml() {
 <html><head><style>
 body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(--vscode-editor-font-size, 13px); color: var(--vscode-foreground); padding: 12px 20px; margin: 0; max-width: 960px; }
 .search-bar { position: sticky; top: 0; background: var(--vscode-editor-background); padding: 8px 0 12px 0; z-index: 10; }
-.search-bar input { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #444); padding: 6px 28px 6px 10px; font-family: inherit; font-size: inherit; }
+.search-bar input { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #555); padding: 6px 28px 6px 10px; font-family: inherit; font-size: inherit; }
 .search-bar input:focus { outline: 1px solid var(--vscode-focusBorder); }
 .search-bar .clear-btn { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); background: none; border: none; color: var(--vscode-descriptionForeground, #888); cursor: pointer; font-size: 16px; line-height: 1; padding: 0 3px; display: none; }
 .search-bar .clear-btn:hover { color: var(--vscode-foreground); }
@@ -1113,7 +1126,7 @@ function opcodeReferenceHtml() {
 <html><head><style>
 body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(--vscode-editor-font-size, 13px); color: var(--vscode-foreground); padding: 12px 20px; margin: 0; max-width: 1100px; }
 .search-bar { position: sticky; top: 0; background: var(--vscode-editor-background); padding: 8px 0 12px 0; z-index: 10; }
-.search-bar input { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #444); padding: 6px 28px 6px 10px; font-family: inherit; font-size: inherit; }
+.search-bar input { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #555); padding: 6px 28px 6px 10px; font-family: inherit; font-size: inherit; }
 .search-bar input:focus { outline: 1px solid var(--vscode-focusBorder); }
 .search-bar .clear-btn { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); background: none; border: none; color: var(--vscode-descriptionForeground, #888); cursor: pointer; font-size: 16px; line-height: 1; padding: 0 3px; display: none; }
 .search-bar .clear-btn:hover { color: var(--vscode-foreground); }
@@ -4406,7 +4419,7 @@ tr.flash td { background: var(--vscode-editor-findMatchHighlightBackground, rgba
 </style></head><body>
 <div class="toolbar">
     <div class="tabs" id="tabs"></div>
-    <div class="search"><input type="text" id="search" placeholder="Find symbol..." autocomplete="off"><button class="clear-btn" id="clearBtn" title="Clear (Esc)">×</button></div>
+    <div class="search"><input type="text" id="search" placeholder="Search symbols..." autocomplete="off" autofocus><button class="clear-btn" id="clearBtn" title="Clear (Esc)">×</button></div>
 </div>
 <div class="summary" id="summary" style="display:none"></div>
 <div id="wrap">
@@ -5196,7 +5209,7 @@ tr:nth-child(even) td {
 .addr { color: var(--vscode-descriptionForeground, #888); }
 .sz   { color: var(--vscode-descriptionForeground, #888); }
 .val  { color: var(--vscode-debugTokenExpression-number, #b5cea8); overflow: hidden; text-overflow: ellipsis; }
-.val.mod { color: #e04040; }
+.val.mod { color: var(--vscode-charts-red, #e04040); }
 .grp  { color: var(--vscode-descriptionForeground, #888); font-size: 0.9em; }
 .dim  { color: var(--vscode-descriptionForeground, #888); padding: 16px 8px; }
 .sym-link { cursor: pointer; }
@@ -5237,7 +5250,7 @@ tr:nth-child(even) td {
 #watchSec.stale .wrow { opacity: 0.55; }
 .wn { color: var(--vscode-debugTokenExpression-name, #9cdcfe); flex: none; }
 .wv { color: var(--vscode-debugTokenExpression-number, #b5cea8); overflow-wrap: anywhere; }
-.wv.mod { color: #e04040; }
+.wv.mod { color: var(--vscode-charts-red, #e04040); }
 .wv.err { color: var(--vscode-errorForeground, #f48771); }
 .wv.idle { color: var(--vscode-descriptionForeground, #888); font-style: italic; }
 #watchSec details { margin-top: 2px; }
