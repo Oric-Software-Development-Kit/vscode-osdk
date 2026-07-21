@@ -4,6 +4,7 @@
     "description": "Oric Software Development Kit - 6502/XA assembly highlighting and Oricutron debugging",
     "version": "0.0.11",
     "publisher": "dbug",
+    "license": "MIT",
     "icon": "images/oric-icon.png",
     "homepage": "https://osdk.org",
     "repository": {

@@ -743,4 +743,4 @@ No npm dependencies are required.
 
 ## License
 
-TBD
+MIT — see the [LICENSE](LICENSE) file.
