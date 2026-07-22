@@ -766,7 +766,7 @@
                             },
                             "diskImage": {
                                 "type": "string",
-                                "description": "Disk image to load (.dsk or .tap)"
+                                "description": "Disk image to load (.dsk or .tap). Optional: if unset, the newest .dsk under build/ is auto-detected (else newest .tap). Tape projects with no diskImage are loaded via the launch script."
                             },
                             "emulatorCwd": {
                                 "type": "string",
@@ -814,12 +814,22 @@
                                     },
                                     "output": {
                                         "type": "string",
-                                        "description": "Build output file to check for staleness"
+                                        "description": "Build output file to check for staleness. Optional: if unset (and no diskImage), the newest .dsk under build/ is auto-detected, else the newest .tap."
                                     },
                                     "sources": {
                                         "type": "array",
                                         "items": { "type": "string" },
-                                        "description": "Source directories/files to check for staleness"
+                                        "description": "Source files/directories to check for staleness (typically under ${workspaceFolder}). Pair with extensions/exclude to filter a whole workspace to just source files."
+                                    },
+                                    "extensions": {
+                                        "type": "array",
+                                        "items": { "type": "string" },
+                                        "description": "If set, only files with these extensions (no leading dot, e.g. [\"c\",\"s\",\"h\",\"asm\"]) count when checking staleness."
+                                    },
+                                    "exclude": {
+                                        "type": "array",
+                                        "items": { "type": "string" },
+                                        "description": "Directory names to skip during the staleness walk (e.g. [\".git\",\"build\",\"node_modules\"]). Matched against any path segment."
                                     }
                                 }
                             }

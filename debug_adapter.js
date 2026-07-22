@@ -805,32 +805,99 @@ function readdirRecursive(dir) {
     return results;
 }
 
-function checkStale(outputPath, sourceDirs) {
+// Build staleness check. Pure fs, cross-platform, no shell/bat parsing.
+//
+// `sourceDirs` entries are literal files or directories (typically under
+// ${workspaceFolder}). `opts.extensions` (if set) restricts the walk to those
+// suffixes, and `opts.exclude` drops any path containing a listed segment
+// (e.g. [".git","build","node_modules"]). Both are optional.
+//
+// Never count files under the build-output directory as "sources" — the build
+// writes there, so including it (e.g. sources: ["${workspaceFolder}"]) would make
+// the project perpetually look stale right after a successful build.
+function checkStale(outputPath, sourceDirs, opts) {
     let outMtime;
     try { outMtime = fs.statSync(outputPath).mtimeMs; }
     catch (e) { return true; } // output missing → stale
     if (!sourceDirs || sourceDirs.length === 0) return false;
-    // Never count files under the build-output directory as "sources" — the build
-    // writes there, so including it (e.g. sources: ["${workspaceFolder}"]) would make
-    // the project perpetually look stale right after a successful build.
+
+    opts = opts || {};
+    const exts = opts.extensions && opts.extensions.length
+        ? new Set(opts.extensions.map(e => e.toLowerCase().replace(/^\./, '')))
+        : null;
+    const excludeSegs = new Set((opts.exclude || []).map(s => canonPath(s)));
+    const newerThan = (f) => {
+        try { return fs.statSync(f).mtimeMs > outMtime; } catch (_) { return false; }
+    };
+    const wanted = (f) => {
+        // drop excluded paths (any path segment in the exclude list)
+        if (excludeSegs.size) {
+            const segs = canonPath(f).split(/[\\/]/);
+            for (const s of segs) if (excludeSegs.has(s)) return false;
+        }
+        if (!exts) return true;
+        const m = f.match(/\.([^.\\/]+)$/);
+        return !!m && exts.has(m[1].toLowerCase());
+    };
+
     const outDir = canonPath(path.dirname(outputPath)) + path.sep;
     const underOutDir = (p) => canonPath(p).startsWith(outDir);
-    for (const dir of sourceDirs) {
+
+    for (const entry of sourceDirs) {
+        // Each entry is a literal file or directory (typically under
+        // ${workspaceFolder}). extensions/exclude filter the walk below.
         let stat;
-        try { stat = fs.statSync(dir); } catch (e) { continue; }
+        try { stat = fs.statSync(entry); } catch (e) { continue; }
         if (stat.isFile()) {
-            if (!underOutDir(dir) && stat.mtimeMs > outMtime) return true;
+            if (!underOutDir(entry) && wanted(entry) && stat.mtimeMs > outMtime) return true;
             continue;
         }
-        const files = readdirRecursive(dir);
-        for (const f of files) {
-            if (underOutDir(f)) continue;
-            try {
-                if (fs.statSync(f).mtimeMs > outMtime) return true;
-            } catch (e) { /* skip unreadable */ }
+        for (const f of readdirRecursive(entry)) {
+            if (underOutDir(f) || !wanted(f)) continue;
+            if (newerThan(f)) return true;
         }
     }
     return false;
+}
+
+// Resolve the build target artifact path. Cross-platform, build-driven (no
+// .bat/makefile parsing — the build is the source of truth). Precedence:
+//   1. explicit hint (config.diskImage / config.build.output), if it exists
+//   2. newest *.dsk under buildDir   (disk projects; a tap2dsk .tap is only an
+//      intermediate, so .dsk wins when both exist)
+//   3. newest *.tap under buildDir   (pure-tape projects)
+//   4. null  — caller treats as "no known output yet" (first launch → stale →
+//      build runs → re-scan finds what was produced)
+function resolveBuildArtifact(hint, buildDir) {
+    if (hint) {
+        try { if (fs.statSync(hint).isFile()) return hint; } catch (_) { /* fall through */ }
+    }
+    if (!buildDir) return hint || null;
+    const pickNewest = (ext) => {
+        let best = null, bestMtime = -1;
+        try {
+            for (const f of readdirRecursive(buildDir)) {
+                if (!f.toLowerCase().endsWith('.' + ext)) continue;
+                let m;
+                try { m = fs.statSync(f).mtimeMs; } catch (_) { continue; }
+                if (m > bestMtime) { bestMtime = m; best = f; }
+            }
+        } catch (_) { /* build dir missing/unreadable */ }
+        return best;
+    };
+    return pickNewest('dsk') || pickNewest('tap') || hint || null;
+}
+
+// The media path to pass to Oricutron when launching it directly (emulatorPath
+// path, not the launchScript/OSDK path). Rule: an explicit diskImage wins; else
+// the auto-detected target only if it's a .dsk. A .tap is NEVER passed here —
+// tape loading is handled by the launchScript path (auto-CLOAD), and handing a
+// .tap to Oricutron as a media arg would be wrong. Returns undefined when no
+// disk media applies (tape projects, or nothing detected yet).
+function resolvedDiskMedia() {
+    if (config.diskImage) return config.diskImage;
+    if (resolvedTarget && /\.dsk$/i.test(resolvedTarget)) return resolvedTarget;
+    return undefined;
 }
 
 // ----------------------------------------------------------------
@@ -984,6 +1051,11 @@ function buildSymInfo() {
 // binary — reloading symbols would mismatch, so we refuse and ask for a restart.
 let launchArtifactPath = null;
 let launchArtifactHash = null;
+// Resolved build target for the current session: explicit output/diskImage if
+// set, else auto-detected from build/ (newest .dsk, else newest .tap). Shared
+// between launch and restart so both build-if-stale and the launch consumers
+// (Oricutron media arg, snapshot hashing) agree on one path.
+let resolvedTarget = null;
 function hashFile(p) {
     try { return crypto.createHash('md5').update(fs.readFileSync(p)).digest('hex'); }
     catch (e) { return null; }
@@ -3847,7 +3919,7 @@ async function relaunchEmulator(req) {
         runner.on('error', err => log('Relaunch script failed to start: ' + err.message));
         scriptLaunched = true;
     } else if (config.emulatorPath) {
-        const emuArgs = [config.diskImage, '--gdb_port', String(port), '-s', 'symbols', ...(config.emulatorArgs || [])];
+        const emuArgs = [resolvedDiskMedia(), '--gdb_port', String(port), '-s', 'symbols', ...(config.emulatorArgs || [])];
         const emuCwd = config.emulatorCwd || path.dirname(config.emulatorPath);
         log('Relaunching: ' + config.emulatorPath + ' ' + emuArgs.join(' '));
         launchedProcess = child_process.spawn(config.emulatorPath, emuArgs, { cwd: emuCwd, detached: false, windowsHide: false });
@@ -3946,19 +4018,36 @@ const handlers = {
         // Artifact whose checksum decides snapshot validity: the disk image if set,
         // else the build output (e.g. the .tap that actually gets loaded — OSDK tape
         // projects have no diskImage). Without this the hash is null and snapshot
-        // invalidation is inert.
-        launchArtifactPath = config.diskImage || (config.build && config.build.output) || null;
-        launchArtifactHash = launchArtifactPath ? hashFile(launchArtifactPath) : null;   // reloadsymbols uses this; NOT for snapshots
+        // invalidation is inert. (Assigned after Step 1, once resolvedTarget is
+        // known — see below.)
+        launchArtifactPath = null;
+        launchArtifactHash = null;
 
         // --- Step 1: Build if stale ---
+        // Resolve the target artifact once: explicit output/diskImage if set,
+        // else auto-detected from build/ (newest .dsk, else newest .tap). This
+        // lets a generic template omit output/diskImage entirely; the build is
+        // the source of truth, so we scan what it produced.
+        const buildCwdHint = (config.build && config.build.cwd) || config.cwd || process.cwd();
+        const buildDir = path.join(buildCwdHint, 'build');
+        resolvedTarget = resolveBuildArtifact(
+            config.diskImage || (config.build && config.build.output),
+            buildDir
+        );
+
         if (config.build) {
-            const buildOutput = config.build.output;
-            const sourceDirs  = config.build.sources;
             const buildCmd    = config.build.command;
             const buildCwd    = config.build.cwd;
+            const staleOpts   = {
+                extensions: config.build.extensions,
+                exclude:    config.build.exclude
+            };
 
-            if (buildOutput && buildCmd) {
-                const stale = checkStale(buildOutput, sourceDirs);
+            if (buildCmd) {
+                // checkStale treats a missing/null output as stale (statSync fails),
+                // so a generic template with no output builds on first launch, then
+                // we re-scan below to pick up whatever the build produced.
+                const stale = checkStale(resolvedTarget, config.build.sources, staleOpts);
                 if (stale) {
                     log('Build is stale, running ' + buildCmd + '...');
                     try {
@@ -3968,11 +4057,22 @@ const handlers = {
                         respond(req, {}, false, e.message);
                         return;
                     }
+                    // Re-resolve: the build may have produced an artifact we
+                    // couldn't see before (first launch, or a renamed output).
+                    if (!resolvedTarget) {
+                        const after = resolveBuildArtifact(null, buildDir);
+                        if (after) { resolvedTarget = after; log('Detected build output: ' + after); }
+                    }
                 } else {
                     log('Build is up to date.');
                 }
             }
         }
+
+        // Now that resolvedTarget is final (post any rebuild + re-scan), set the
+        // artifact path/hash used for snapshot-invalidation and reloadsymbols.
+        launchArtifactPath = resolvedTarget;
+        launchArtifactHash = launchArtifactPath ? hashFile(launchArtifactPath) : null;
 
         // --- Step 2a: Launch via OSDK script (preferred) ---
         // Run the project's execute script (e.g. osdk_execute.bat), which launches
@@ -4033,8 +4133,8 @@ const handlers = {
                 }
             }
             const emuArgs = isNoDebug
-                ? [config.diskImage, '-s', 'symbols', ...(config.emulatorArgs || [])]
-                : [config.diskImage, '--gdb_port', String(port), '-s', 'symbols', ...(config.emulatorArgs || [])];
+                ? [resolvedDiskMedia(), '-s', 'symbols', ...(config.emulatorArgs || [])]
+                : [resolvedDiskMedia(), '--gdb_port', String(port), '-s', 'symbols', ...(config.emulatorArgs || [])];
             const emuCwd = config.emulatorCwd || path.dirname(config.emulatorPath);
 
             log('Launching: ' + config.emulatorPath + ' ' + emuArgs.join(' '));
@@ -4166,15 +4266,26 @@ const handlers = {
         log('Restarting debug session...');
 
         // --- Step 1: Build if stale ---
+        // Same resolution as launch: explicit output/diskImage if set, else
+        // auto-detected from build/ (newest .dsk, else newest .tap).
         let rebuilt = false;
+        const buildCwdHint = (config.build && config.build.cwd) || config.cwd || process.cwd();
+        const buildDir = path.join(buildCwdHint, 'build');
+        resolvedTarget = resolveBuildArtifact(
+            config.diskImage || (config.build && config.build.output),
+            buildDir
+        );
+
         if (config.build) {
-            const buildOutput = config.build.output;
-            const sourceDirs  = config.build.sources;
             const buildCmd    = config.build.command;
             const buildCwd    = config.build.cwd;
+            const staleOpts   = {
+                extensions: config.build.extensions,
+                exclude:    config.build.exclude
+            };
 
-            if (buildOutput && buildCmd) {
-                const stale = checkStale(buildOutput, sourceDirs);
+            if (buildCmd) {
+                const stale = checkStale(resolvedTarget, config.build.sources, staleOpts);
                 if (stale) {
                     log('Build is stale, running ' + buildCmd + '...');
                     try {
@@ -4185,11 +4296,17 @@ const handlers = {
                         respond(req, {}, false, 'Rebuild failed: ' + e.message);
                         return;
                     }
+                    if (!resolvedTarget) {
+                        const after = resolveBuildArtifact(null, buildDir);
+                        if (after) { resolvedTarget = after; log('Detected build output: ' + after); }
+                    }
                 } else {
                     log('Build is up to date.');
                 }
             }
         }
+        // Keep the artifact hash in step with the (possibly rebuilt) target.
+        launchArtifactPath = resolvedTarget;
 
         // --- Step 2: Reload symbols ---
         if (config.symbolFile) {
