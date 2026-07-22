@@ -631,6 +631,10 @@ let addrSym    = new Map();   // address -> name
 let addrSource = new Map();   // address -> { file, line } (from symbol defs)
 let symSource  = new Map();   // name  -> { file, line } (per-symbol source)
 let lineTable  = [];          // [{addr, file, line}] sorted by addr (from #LINES)
+let filesWithLines = new Set();   // canonPath of every file that has >=1 #LINES entry
+                              // (used to warn when a .c breakpoint can't bind because the
+                              // project was built without -g1: a workspace .c file absent
+                              // from this set has no source-line info)
 let regs       = null;        // { a, x, y, sp, pc, f }
 let running    = false;
 let bpPollTimer = null;       // interval that reconciles monitor-set breakpoints while stopped
@@ -736,6 +740,9 @@ let displayHex = true;        // true = hex primary, false = decimal primary
 let configDone = false;
 let pendingStop = null;       // deferred stopped event body
 let srcBps     = new Map();   // file -> [{id, line, source, bindings:[{addr,module,armed}]}] — one binding per owning overlay (shared files span several)
+// Per-session set of files for which we've already emitted the "no C line info"
+// warning, so a flapping/re-sent setBreakpoints doesn't spam the console.
+let warnedNoCLineInfo = new Set();
 let dataBps    = new Map();   // id -> { addr, accessType, gdbType } (plain DAP data breakpoints)
 // Extension-owned WATCHPOINT EVENTS (access-triggered breakpoints with exec-bp parity:
 // module scope, condition, and log/[save]/[stop] actions). The extension owns the list
@@ -889,6 +896,7 @@ function applyActiveModule(id) {
     symbols.clear(); addrSym.clear(); addrSource.clear(); symSource.clear();
     typeDefs.clear(); varTypes.clear(); localDefs.clear(); enumDefs.clear();
     lineTable = []; zpSymbols = [];
+    filesWithLines = new Set();
 
     const order = [];
     if (moduleBuckets.has('R')) order.push(moduleBuckets.get('R'));
@@ -913,7 +921,7 @@ function applyActiveModule(id) {
         for (const [k, v] of b.varTypes)   varTypes.set(k, v);
         for (const [k, v] of b.localDefs)  localDefs.set(k, v);
         for (const [k, v] of b.enumDefs)   enumDefs.set(k, v);
-        for (const e of b.lineTable)       lineTable.push(e);
+        for (const e of b.lineTable)       { lineTable.push(e); filesWithLines.add(canonPath(e.file)); }
     }
     activeModuleId = id;
     if (resolverInstance) resolverInstance.setActiveModule(id); // keep the resolver's composed view in sync
@@ -1161,6 +1169,8 @@ async function rearmModuleBreakpoints() {
 function loadSymbols(file) {
     symbols.clear(); addrSym.clear(); addrSource.clear(); symSource.clear();
     lineTable = []; zpSymbols = [];
+    filesWithLines = new Set();
+    warnedNoCLineInfo = new Set();   // new symbol load → re-allow the -g1 warning per file
     typeDefs.clear(); varTypes.clear(); localDefs.clear();
     evalFailCache.clear(); varRefs.clear(); refByKey.clear(); nextVarRef = 100;
 
@@ -1209,11 +1219,13 @@ function loadSymbols(file) {
                 const lm = trimmed.match(/^([0-9a-fA-F]{4})\s+(\d+):(\d+)$/);
                 if (lm) {
                     const fi = parseInt(lm[2], 10);
+                    const fpath = fileIndex[fi] || ('file#' + fi);
                     cur.lineTable.push({
                         addr: parseInt(lm[1], 16),
-                        file: fileIndex[fi] || ('file#' + fi),
+                        file: fpath,
                         line: parseInt(lm[3], 10)
                     });
+                    filesWithLines.add(canonPath(fpath));
                 }
                 continue;
             }
@@ -1376,7 +1388,17 @@ function loadSymbols(file) {
 
         const modNote = moduleNames.size > 0
             ? (' [' + moduleNames.size + ' modules, active=' + (activeModuleId !== null ? moduleNames.get(activeModuleId) : '(none)') + ']') : '';
-        log('Loaded ' + symbols.size + ' symbols, ' + lineTable.length + ' line entries, ' +
+        // Split line entries by source language: .c entries only exist when the
+        // project was compiled with -g1; if that count is 0, C-source breakpoints
+        // can't bind (the file has no line info). Surfacing the split here makes a
+        // missing -g1 visible at load time, before any breakpoint is set.
+        let cLines = 0;
+        for (const e of lineTable) if (/\.c$/i.test(e.file)) cLines++;
+        const nonCLines = lineTable.length - cLines;
+        const lineNote = cLines > 0
+            ? (lineTable.length + ' line entries')
+            : (lineTable.length + ' line entries (0 from .c — rebuild with -g1 to enable C breakpoints; ' + nonCLines + ' from assembly)');
+        log('Loaded ' + symbols.size + ' symbols, ' + lineNote + ', ' +
             typeDefs.size + ' types, ' + varTypes.size + ' typed vars, ' +
             localDefs.size + ' funcs with locals, ' +
             annBySymbol.size + ' annot-symbols, ' + annByField.size + ' annot-fields from ' + file + modNote);
@@ -4863,7 +4885,39 @@ const handlers = {
 
             const id = bpId++;
             if (!bindings.length) {
-                result.push({ id, verified: false, message: 'No code at this line' });
+                // A workspace .c file with ZERO line entries almost always means the
+                // project was built without -g1: the compiler then emits no .csource
+                // markers, so the .c file never appears in #FILES and gets no #LINES
+                // entries (only assembly .s files do). Distinguish that from a genuinely
+                // empty line so the user gets an actionable hint rather than the generic
+                // "No code at this line". Gates:
+                //   - resolverInstance loaded: avoid false positives during the
+                //     pre-launch pass where every bp trivially fails.
+                //   - .c under the workspaceFolder: avoid firing on unrelated files.
+                //   - not in filesWithLines: the file genuinely has no line info.
+                let msg = 'No code at this line';
+                // config.workspaceFolder is only set if the user declared it; cwd
+                // (always set in practice, to ${workspaceFolder}) is the reliable
+                // workspace anchor.
+                const wfRaw = config.workspaceFolder || config.cwd || (config.build && config.build.cwd);
+                const wf = wfRaw ? canonPath(wfRaw) : '';
+                const underWs = wf && (norm === wf || norm.startsWith(wf + path.sep));
+                if (resolverInstance && /\.c$/i.test(srcPath) && underWs
+                    && !filesWithLines.has(norm)) {
+                    msg = 'No source-line info for this C file — rebuild with -g1 '
+                        + '(set OSDKCOMP=-O1 -g1 in osdk_config.bat) so C breakpoints '
+                        + 'can bind. Assembly (.s) breakpoints are unaffected.';
+                    if (!warnedNoCLineInfo.has(norm)) {
+                        warnedNoCLineInfo.add(norm);
+                        const fn = srcPath.split(/[\\/]/).pop();
+                        evt('output', { category: 'important', output:
+                            '⚠ Breakpoints in ' + fn + " won't bind: the project was built "
+                            + 'without -g1, so no C source-line info is present. Add '
+                            + '-g1 to OSDKCOMP in osdk_config.bat and rebuild. '
+                            + '(Assembly breakpoints are unaffected.)\n' });
+                    }
+                }
+                result.push({ id, verified: false, message: msg });
                 continue;
             }
             // Arm bindings for the active/resident module now; others arm on switch
