@@ -845,11 +845,14 @@ function checkStale(outputPath, sourceDirs, opts) {
 
     for (const entry of sourceDirs) {
         // Each entry is a literal file or directory (typically under
-        // ${workspaceFolder}). extensions/exclude filter the walk below.
+        // ${workspaceFolder}). extensions/exclude filter the directory WALK below,
+        // NOT a literal file the user listed explicitly — so adding osdk_config.bat
+        // (or a .sh) to sources works even when extensions is set to source suffixes
+        // only. Explicit user choices aren't second-guessed by the filters.
         let stat;
         try { stat = fs.statSync(entry); } catch (e) { continue; }
         if (stat.isFile()) {
-            if (!underOutDir(entry) && wanted(entry) && stat.mtimeMs > outMtime) return true;
+            if (!underOutDir(entry) && stat.mtimeMs > outMtime) return true;
             continue;
         }
         for (const f of readdirRecursive(entry)) {
@@ -3919,7 +3922,13 @@ async function relaunchEmulator(req) {
         runner.on('error', err => log('Relaunch script failed to start: ' + err.message));
         scriptLaunched = true;
     } else if (config.emulatorPath) {
-        const emuArgs = [resolvedDiskMedia(), '--gdb_port', String(port), '-s', 'symbols', ...(config.emulatorArgs || [])];
+        const relaunchMedia = resolvedDiskMedia();
+        if (!relaunchMedia) {
+            respond(req, {}, false, 'No disk image to load on relaunch: "diskImage" is unset and no .dsk was found under build/. ' +
+                'Build the project, or set "diskImage" in launch.json.');
+            return;
+        }
+        const emuArgs = [relaunchMedia, '--gdb_port', String(port), '-s', 'symbols', ...(config.emulatorArgs || [])];
         const emuCwd = config.emulatorCwd || path.dirname(config.emulatorPath);
         log('Relaunching: ' + config.emulatorPath + ' ' + emuArgs.join(' '));
         launchedProcess = child_process.spawn(config.emulatorPath, emuArgs, { cwd: emuCwd, detached: false, windowsHide: false });
@@ -4132,9 +4141,19 @@ const handlers = {
                     return;
                 }
             }
+            // Guard: direct-launch (emulatorPath) needs media to load. If neither
+            // diskImage nor an auto-detected .dsk resolved, don't launch Oricutron with
+            // 'undefined' as the media arg — report a clear error instead. (Tape projects
+            // use the launchScript path, not this branch.)
+            const loadMedia = resolvedDiskMedia();
+            if (!loadMedia) {
+                respond(req, {}, false, 'No disk image to load: "diskImage" is unset and no .dsk was found under build/. ' +
+                    'Build the project, or set "diskImage" in launch.json.');
+                return;
+            }
             const emuArgs = isNoDebug
-                ? [resolvedDiskMedia(), '-s', 'symbols', ...(config.emulatorArgs || [])]
-                : [resolvedDiskMedia(), '--gdb_port', String(port), '-s', 'symbols', ...(config.emulatorArgs || [])];
+                ? [loadMedia, '-s', 'symbols', ...(config.emulatorArgs || [])]
+                : [loadMedia, '--gdb_port', String(port), '-s', 'symbols', ...(config.emulatorArgs || [])];
             const emuCwd = config.emulatorCwd || path.dirname(config.emulatorPath);
 
             log('Launching: ' + config.emulatorPath + ' ' + emuArgs.join(' '));

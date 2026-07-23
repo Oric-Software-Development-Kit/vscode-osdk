@@ -6119,11 +6119,13 @@ function activate(context) {
                                 'Launch config is missing "emulatorPath" (or "launchScript"). Set it to the Oricutron executable path.');
                             return undefined; // abort launch
                         }
-                        if (!config.diskImage) {
-                            vscode.window.showErrorMessage(
-                                'Launch config is missing "diskImage". Set it to the .dsk or .tap file.');
-                            return undefined;
-                        }
+                        // diskImage is optional: if unset, the debug adapter auto-detects
+                        // the build output (newest .dsk, else newest .tap under build/).
+                        // Don't pre-check here — variable substitution (e.g.
+                        // ${workspaceFolder}) hasn't fully resolved at this point, so a
+                        // host-side build/ scan would look in the wrong place. Let the
+                        // launch proceed; the DA resolves paths correctly and reports if it
+                        // genuinely can't find any media.
                     }
                 }
                 // Auto-pick a free GDB port when none is configured (missing or 0).
