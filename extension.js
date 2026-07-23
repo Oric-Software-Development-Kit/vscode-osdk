@@ -6174,6 +6174,26 @@ function activate(context) {
     // Map<filePath, Map<lineNumber, { cycles, symbol }>>
     const cycleAnnotations = new Map();
 
+    // --- Unverified-breakpoint gutter badge ---
+    // VS Code's native red gutter dot is DA-driven and reverts to red when no
+    // session asserts verified:false. The host can't change the dot, but it CAN
+    // layer a decoration icon on top — this warning badge marks a breakpoint that
+    // won't bind (e.g. a .c line built without -g1) while keeping the red dot
+    // visible. Fed from rebuildBpTree's daVerified signal.
+    const unverifiedBpDecoType = vscode.window.createTextEditorDecorationType({
+        // Yellow ! in the glyph margin marks a breakpoint that won't bind (e.g. a .c
+        // line built without -g1). VS Code's own red dot sits in the line-number
+        // column and can't be host-controlled (its tooltip is DA/session-only, and
+        // glyph-margin hovers are shadowed — VS Code issue #5923), so the ! is the
+        // host-side visual signal. Explanation is in the ORIC panel tooltip + the
+        // debug-console warning on F5.
+        gutterIconPath: vscode.Uri.file(context.asAbsolutePath('images/bp-unverified.svg')),
+        gutterIconSize: 'contain',
+        isWholeLine: true
+    });
+    // canonPath(filePath) -> Set(requestedLine) for breakpoints that won't bind.
+    const unverifiedBpLines = new Map();
+
     function applyCycleDecorations() {
         for (const editor of vscode.window.visibleTextEditors) {
             const filePath = editor.document.uri.fsPath;
@@ -6205,9 +6225,32 @@ function activate(context) {
         }
     }
 
+    // Apply the unverified-bp gutter badge to every visible editor whose file has
+    // unverified breakpoint lines. Passing [] clears the badge when a file has none
+    // (so re-enabling -g1 and rebuilding removes the badges). Mirrors applyCycleDecorations.
+    // Shared explanation for breakpoints that won't bind (used by the gutter hover
+    // message and kept in sync with the DA's warning + the ORIC panel tooltip).
+    const UNVERIFIED_BP_HOVER = 'This breakpoint won\'t bind: the project was built without -g1, ' +
+        'so no C source-line info is present. Add -g1 to OSDKCOMP in osdk_config.bat and rebuild. ' +
+        '(Assembly breakpoints are unaffected.)';
+
+    function applyUnverifiedBpDecorations() {
+        for (const editor of vscode.window.visibleTextEditors) {
+            const lines = unverifiedBpLines.get(canonPath(editor.document.uri.fsPath));
+            if (!lines || lines.size === 0) { editor.setDecorations(unverifiedBpDecoType, []); continue; }
+            const decos = [];
+            for (const ln of lines) {
+                if (ln < 1 || ln > editor.document.lineCount) continue;
+                decos.push({ range: new vscode.Range(ln - 1, 0, ln - 1, 0), hoverMessage: UNVERIFIED_BP_HOVER });
+            }
+            editor.setDecorations(unverifiedBpDecoType, decos);
+        }
+    }
+
     context.subscriptions.push(
         cycleDecorationType,
-        vscode.window.onDidChangeVisibleTextEditors(() => { applyCycleDecorations(); })
+        unverifiedBpDecoType,
+        vscode.window.onDidChangeVisibleTextEditors(() => { applyCycleDecorations(); applyUnverifiedBpDecorations(); })
     );
 
     // --- Current-instruction view (bottom-panel webview) ---------------------
@@ -6716,6 +6759,11 @@ function activate(context) {
         await editBpProp(L, pick.prop);
     }
 
+    // Declared here (before rebuildBpTree, which is called during activate before the
+    // parser functions below are defined) so the first rebuild doesn't hit the temporal
+    // dead zone. null = not yet parsed; Set(canonPath) once parsed.
+    let hostFilesWithLines = null;
+
     async function rebuildBpTree() {
         const gen = ++bpTreeGen;
         const all = vscode.debug.breakpoints.filter(b => b instanceof vscode.SourceBreakpoint);
@@ -6723,6 +6771,7 @@ function activate(context) {
         let modulesMeta = [{ id: 'R', name: 'Resident' }];
         let byFile = {};
         let snaps = {};   // "<fsPath>:<reqLine>" -> bound line (when a requested line has no code of its own)
+        let bpVerified = {};   // "<fsPath>:<reqLine>" -> bool (DA-authoritative: false when the line can't bind)
         if (session && session.type === 'oric-debug' && all.length) {
             const files = [...new Set(all.map(b => b.location.uri.fsPath))];
             const locs = all.map(b => ({ file: b.location.uri.fsPath, line: b.location.range.start.line + 1 }));
@@ -6731,6 +6780,7 @@ function activate(context) {
                 if (r && r.modules) modulesMeta = r.modules;
                 if (r && r.byFile) byFile = r.byFile;
                 if (r && r.snaps) snaps = r.snaps;
+                if (r && r.bpVerified) bpVerified = r.bpVerified;
             } catch (e) { /* adapter unavailable: fall back to a flat list */ }
         }
         // Adapter-owned ADDRESS breakpoints (ROM / no-source, e.g. $238) — their own
@@ -6762,6 +6812,23 @@ function activate(context) {
             // Show the BOUND line (where the bp actually binds) so the panel matches
             // VS Code's gutter/native view when the requested line has no code.
             const line = snaps[fsPath + ':' + reqLine] || reqLine;
+            // Bind-state: false when the line can't bind. The DA's per-line map is
+            // authoritative during a session; when it has no entry (no session, or the
+            // DA hasn't assessed this bp), fall back to the host-side filesWithLines
+            // parse of symbols_ext — which is what makes startup, post-stop, and
+            // post-rebuild all show the correct state without a DA running. Only .c
+            // files are at risk (assembly .s always has line info), so restrict the
+            // host fallback to .c to avoid false-positives on unrelated files.
+            // Wrapped so a parse/path failure can never abort the panel render.
+            let daVerified = bpVerified[fsPath + ':' + reqLine];
+            if (daVerified === undefined) {
+                try {
+                    const bindable = hostBpBindableFiles();
+                    if (bindable && /\.c$/i.test(fsPath) && !bindable.has(canonPath(fsPath))) {
+                        daVerified = false;
+                    }
+                } catch (_) { /* host parse unavailable → leave daVerified undefined (verified) */ }
+            }
             const col = b.location.range.start.character;
             const locKey = line + ':' + col;
             const name = b.location.uri.path.split('/').pop();
@@ -6770,7 +6837,9 @@ function activate(context) {
                 let F = M.files.get(fsPath);
                 if (!F) { F = { uri: b.location.uri, name, lines: new Map() }; M.files.set(fsPath, F); }
                 let L = F.lines.get(locKey);
-                if (!L) { L = { line, col, uri: b.location.uri, bps: [] }; F.lines.set(locKey, L); }
+                if (!L) { L = { line, col, uri: b.location.uri, bps: [], daVerified }; F.lines.set(locKey, L); }
+                // Keep daVerified in sync if multiple bps land here (they share a reqLine).
+                if (daVerified !== undefined) L.daVerified = daVerified;
                 L.bps.push(b);   // >1 = duplicate/column-distinct bps at one location
             }
         }
@@ -6784,6 +6853,17 @@ function activate(context) {
         // hide or delay them (that async work is exactly what let rebuilds race).
         bpTreeModel = { modules: modArr, grouped: modArr.length > 1, addrBps: addrBpList };
         bpTreeEmitter.fire();
+        // Refresh the unverified-bp gutter badges from the same daVerified signal.
+        // Group unverified requested lines by file, then apply to visible editors.
+        unverifiedBpLines.clear();
+        for (const M of modArr) for (const F of M.fileArr) for (const L of F.lineArr) {
+            if (L.daVerified === false) {
+                const key = canonPath(F.uri.fsPath);
+                if (!unverifiedBpLines.has(key)) unverifiedBpLines.set(key, new Set());
+                unverifiedBpLines.get(key).add(L.line);
+            }
+        }
+        applyUnverifiedBpDecorations();
 
         // Enrich each line with its trimmed source ("236:  if (SetupColors(..."),
         // then refresh again. Bail if a newer rebuild has superseded us.
@@ -6958,12 +7038,24 @@ function activate(context) {
             }
             const L = el.ln, rep = L.bps[0];
             const enabled = L.bps.some(b => b.enabled);
+            // Bind-state: false when the line can't bind (e.g. a .c file built without
+            // -g1). Computed either by the DA (during a session, per-line) or by the
+            // host's symbols_ext parse (startup/post-stop/post-rebuild, per-file).
+            const verified = L.daVerified !== false;
+            let unverifiedMsg = L.bps.map(b => b.message).filter(Boolean).join(' / ');
+            // When the host detected unverified (no DA message available), supply the
+            // actionable hint so the tooltip explains why even without a session.
+            if (!verified && !unverifiedMsg) {
+                unverifiedMsg = 'No source-line info for this C file — rebuild with -g1 '
+                    + '(set OSDKCOMP=-O1 -g1 in osdk_config.bat) so C breakpoints can bind.';
+            }
             const here = oricDebugStopped && currentStopLoc && currentStopLoc.line === L.line
                 && canonPath(currentStopLoc.path) === canonPath(L.uri.fsPath);
             const lineTag = L.line + (L.col ? ':' + L.col : '');
             const marks = [];
             if (here) marks.push('▶ stopped here');
             if (L.bps.length > 1) marks.push(L.bps.length + ' bps');
+            if (!verified) marks.push('⚠ unverified');   // can't bind — see tooltip
             // Condition/hit-count/log-message are NOT put here — they get their own
             // child rows (see lineDetails) so long text is fully visible on its own line.
             const details = lineDetails(L);
@@ -6973,13 +7065,20 @@ function activate(context) {
             const it = new vscode.TreeItem(L.text ? (lineTag + ':  ' + L.text) : ('Line ' + lineTag),
                 details.length ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
             it.description = marks.join('  ');
+            it.tooltip = unverifiedMsg || undefined;
             it.contextValue = 'oricBp';
             it.checkboxState = enabled ? vscode.TreeItemCheckboxState.Checked : vscode.TreeItemCheckboxState.Unchecked;
-            const base = rep.logMessage ? 'debug-breakpoint-log' : (rep.condition ? 'debug-breakpoint-conditional' : 'debug-breakpoint');
-            it.iconPath = here
-                ? new vscode.ThemeIcon('debug-stackframe', new vscode.ThemeColor('debugIcon.breakpointCurrentStackframeForeground'))
-                : new vscode.ThemeIcon(enabled ? base : base + '-disabled',
-                    new vscode.ThemeColor(enabled ? 'debugIcon.breakpointForeground' : 'debugIcon.breakpointDisabledForeground'));
+            // Unverified bps get the hollow grey glyph regardless of enabled/log/conditional
+            // variant — "can't bind" is the dominant state and should read at a glance.
+            if (!verified) {
+                it.iconPath = new vscode.ThemeIcon('debug-breakpoint-unverified');
+            } else {
+                const base = rep.logMessage ? 'debug-breakpoint-log' : (rep.condition ? 'debug-breakpoint-conditional' : 'debug-breakpoint');
+                it.iconPath = here
+                    ? new vscode.ThemeIcon('debug-stackframe', new vscode.ThemeColor('debugIcon.breakpointCurrentStackframeForeground'))
+                    : new vscode.ThemeIcon(enabled ? base : base + '-disabled',
+                        new vscode.ThemeColor(enabled ? 'debugIcon.breakpointForeground' : 'debugIcon.breakpointDisabledForeground'));
+            }
             it.id = 'line:' + el.mod.key + ':' + el.file.uri.fsPath + ':' + L.line + ':' + L.col;
             it.command = { command: 'vscode.open', title: 'Reveal',
                 arguments: [L.uri, { selection: new vscode.Range(L.line - 1, L.col, L.line - 1, L.col) }] };
@@ -7053,7 +7152,7 @@ function activate(context) {
         vscode.commands.registerCommand('oric-debug.removeWatchpoint', node => removeWatchpoint(node)),
         vscode.commands.registerCommand('oric-debug.editWatchpoint', node => editWatchpoint(node)),
         vscode.commands.registerCommand('oric-debug.editWatchProp', node => { if (node && node.w && node.prop) editWatchProp(watchBpList.find(x => x.id === node.w.id), node.prop); }),
-        vscode.debug.onDidTerminateDebugSession(() => { activeOricModuleId = null; activeOricModuleName = null; rebuildBpTree(); }),
+        vscode.debug.onDidTerminateDebugSession(() => { activeOricModuleId = null; activeOricModuleName = null; hostFilesWithLines = null; rebuildBpTree(); }),
         vscode.commands.registerCommand('oric-debug.bpEnableModule', node => { if (node && node.mod) setBpsEnabled(modBps(node.mod), true); }),
         vscode.commands.registerCommand('oric-debug.bpDisableModule', node => { if (node && node.mod) setBpsEnabled(modBps(node.mod), false); }),
         vscode.commands.registerCommand('oric-debug.bpEnableFile', node => { if (node && node.file) setBpsEnabled(fileBps(node.file), true); }),
@@ -7116,6 +7215,16 @@ function activate(context) {
     );
     rebuildBpTree();
 
+    // Watch symbols_ext for changes so breakpoint bind-state refreshes immediately
+    // after any rebuild (CTRL-B task, launch build.command, external shell, make) —
+    // not just on the next F5. The glob covers the conventional build/ location;
+    // the handler invalidates the host parse cache and rebuilds the bp panel.
+    const symWatcher = vscode.workspace.createFileSystemWatcher('**/build/symbols_ext');
+    const onSymChange = () => { hostFilesWithLines = null; rebuildBpTree(); };
+    symWatcher.onDidChange(onSymChange);
+    symWatcher.onDidCreate(onSymChange);
+    context.subscriptions.push(symWatcher);
+
     // ---- Oric Snapshots panel (TreeView) --------------------------------------
     // Lists the project's snapshots (from the adapter). Restore on click, inline
     // restore/delete/rename; refreshes on the adapter's oricSnapshotsChanged event
@@ -7143,6 +7252,76 @@ function activate(context) {
         for (const f of (vscode.workspace.workspaceFolders || [])) bases.push(f.uri.fsPath);
         for (const b of bases) { const d = nodePath.join(b, '.oric-snapshots'); try { if (fsx.existsSync(d)) return d; } catch (_) {} }
         return null;
+    }
+    // --- Host-side breakpoint bind-state (no debug session required) ---
+    // The bindability of a .c breakpoint is a property of build/symbols_ext on disk,
+    // not of the debug session. When built without -g1, .c files are absent from the
+    // symbol file's #FILES/#LINES (only a temp TMP\main appears), so .c breakpoints
+    // can't bind. We read symbols_ext directly so the ORIC BREAKPOINTS panel shows the
+    // correct state at startup, after a rebuild, and after the debugger stops — none
+    // of which have a DA running to supply the (session-only) getBreakpointModules map.
+    // (hostFilesWithLines is declared above rebuildBpTree to avoid a TDZ on first call.)
+    function symbolsExtPath() {
+        const fsx = require('fs');
+        const s = vscode.debug.activeDebugSession;
+        const cfg = s && s.configuration;
+        const candidates = [];
+        // 1. Active session's symbolFile (authoritative during a session).
+        if (cfg && cfg.symbolFile) candidates.push(cfg.symbolFile);
+        // 2. launch.json oric-debug configs across all workspace folders.
+        for (const f of (vscode.workspace.workspaceFolders || [])) {
+            const cfgs = vscode.workspace.getConfiguration('launch', f.uri).get('configurations') || [];
+            for (const c of cfgs) if (c && c.type === 'oric-debug' && c.symbolFile) {
+                candidates.push(c.symbolFile.replace(/\$\{workspaceFolder\}/g, f.uri.fsPath));
+            }
+        }
+        // 3. Conventional fallbacks per workspace folder.
+        for (const f of (vscode.workspace.workspaceFolders || [])) {
+            candidates.push(nodePath.join(f.uri.fsPath, 'build', 'symbols_ext'));
+            candidates.push(nodePath.join(f.uri.fsPath, 'build', 'symbols'));
+        }
+        for (const c of candidates) { try { if (c && fsx.existsSync(c) && fsx.statSync(c).isFile()) return c; } catch (_) {} }
+        return null;
+    }
+    // Parse symbols_ext's #FILES/#LINES into a Set of canonPaths that have >=1 line
+    // entry (the bindability predicate the DA uses as `filesWithLines`). Returns null
+    // if the file can't be read. Ported from debug_adapter.js's loadSymbols (#FILES/#LINES
+    // section only — #SYM/#TYPES are irrelevant here).
+    function parseHostFilesWithLines() {
+        const fsx = require('fs');
+        const p = symbolsExtPath();
+        if (!p) return null;
+        let text;
+        try { text = fsx.readFileSync(p, 'utf8'); } catch (_) { return null; }
+        const result = new Set();
+        let section = null;
+        const fileIndex = [];
+        for (const raw of text.split(/\r?\n/)) {
+            const t = raw.trim();
+            if (t === '#FILES') { section = 'files'; continue; }
+            if (t === '#LINES') { section = 'lines'; continue; }
+            if (t.startsWith('#') || !section) {
+                if (t.startsWith('#')) { section = null; }
+                continue;
+            }
+            if (section === 'files') {
+                const fm = t.match(/^(\d+)\s+(.+)$/);
+                if (fm) fileIndex[parseInt(fm[1], 10)] = fm[2];
+            } else if (section === 'lines') {
+                const lm = t.match(/^([0-9a-fA-F]{4})\s+(\d+):(\d+)$/);
+                if (lm) {
+                    const fi = parseInt(lm[2], 10);
+                    const fpath = fileIndex[fi];
+                    if (fpath) result.add(canonPath(fpath));
+                }
+            }
+        }
+        return result;
+    }
+    // Returns the cached host filesWithLines, parsing lazily on first use.
+    function hostBpBindableFiles() {
+        if (hostFilesWithLines === null) hostFilesWithLines = parseHostFilesWithLines();
+        return hostFilesWithLines;
     }
     function listSnapshotsOnDisk() {
         const fsx = require('fs');

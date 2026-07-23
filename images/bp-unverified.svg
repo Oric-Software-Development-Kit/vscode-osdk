@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Yellow exclamation mark marking a breakpoint that won't bind (e.g. a .c
+       line built without -g1). Rendered in the glyph margin, beside VS Code's
+       native red dot. Yellow = "needs attention"; sized to match the dot. -->
+  <text x="8" y="13" text-anchor="middle" font-family="sans-serif" font-size="15"
+        font-weight="bold" fill="#f0a020">!</text>
+</svg>
