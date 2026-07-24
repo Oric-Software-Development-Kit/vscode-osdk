@@ -186,7 +186,16 @@ class RegistersWebviewProvider {
     resolveWebviewView(webviewView) {
         this._view = webviewView;
         webviewView.webview.options = { enableScripts: false };
-        this.markStale();
+        // Fetch current registers immediately if an oric-debug session is active
+        // and stopped (so the panel isn't empty on open — matches the native VS
+        // Code Registers view, which populates proactively). Without this the
+        // panel shows nothing until the next stop event triggers refreshAll().
+        const session = vscode.debug.activeDebugSession;
+        if (session && session.type === 'oric-debug' && oricDebugStopped) {
+            this.refresh(session);
+        } else {
+            this.markStale();
+        }
     }
 
     refresh(session) {
@@ -305,7 +314,15 @@ class PeripheralsWebviewProvider {
     resolveWebviewView(webviewView) {
         this._view = webviewView;
         webviewView.webview.options = { enableScripts: false };
-        this.markStale();
+        // Fetch current peripherals immediately if an oric-debug session is active
+        // and stopped (same fix as RegistersWebviewProvider — without this the
+        // panel is empty until the next stop).
+        const session = vscode.debug.activeDebugSession;
+        if (session && session.type === 'oric-debug' && oricDebugStopped) {
+            this.refresh(session);
+        } else {
+            this.markStale();
+        }
     }
 
     refresh(session) {
