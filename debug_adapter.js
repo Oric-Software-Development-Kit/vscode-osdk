@@ -631,6 +631,10 @@ let addrSym    = new Map();   // address -> name
 let addrSource = new Map();   // address -> { file, line } (from symbol defs)
 let symSource  = new Map();   // name  -> { file, line } (per-symbol source)
 let lineTable  = [];          // [{addr, file, line}] sorted by addr (from #LINES)
+let filesWithLines = new Set();   // canonPath of every file that has >=1 #LINES entry
+                              // (used to warn when a .c breakpoint can't bind because the
+                              // project was built without -g1: a workspace .c file absent
+                              // from this set has no source-line info)
 let regs       = null;        // { a, x, y, sp, pc, f }
 let running    = false;
 let bpPollTimer = null;       // interval that reconciles monitor-set breakpoints while stopped
@@ -736,6 +740,9 @@ let displayHex = true;        // true = hex primary, false = decimal primary
 let configDone = false;
 let pendingStop = null;       // deferred stopped event body
 let srcBps     = new Map();   // file -> [{id, line, source, bindings:[{addr,module,armed}]}] — one binding per owning overlay (shared files span several)
+// Per-session set of files for which we've already emitted the "no C line info"
+// warning, so a flapping/re-sent setBreakpoints doesn't spam the console.
+let warnedNoCLineInfo = new Set();
 let dataBps    = new Map();   // id -> { addr, accessType, gdbType } (plain DAP data breakpoints)
 // Extension-owned WATCHPOINT EVENTS (access-triggered breakpoints with exec-bp parity:
 // module scope, condition, and log/[save]/[stop] actions). The extension owns the list
@@ -959,6 +966,7 @@ function applyActiveModule(id) {
     symbols.clear(); addrSym.clear(); addrSource.clear(); symSource.clear();
     typeDefs.clear(); varTypes.clear(); localDefs.clear(); enumDefs.clear();
     lineTable = []; zpSymbols = [];
+    filesWithLines = new Set();
 
     const order = [];
     if (moduleBuckets.has('R')) order.push(moduleBuckets.get('R'));
@@ -983,7 +991,7 @@ function applyActiveModule(id) {
         for (const [k, v] of b.varTypes)   varTypes.set(k, v);
         for (const [k, v] of b.localDefs)  localDefs.set(k, v);
         for (const [k, v] of b.enumDefs)   enumDefs.set(k, v);
-        for (const e of b.lineTable)       lineTable.push(e);
+        for (const e of b.lineTable)       { lineTable.push(e); filesWithLines.add(canonPath(e.file)); }
     }
     activeModuleId = id;
     if (resolverInstance) resolverInstance.setActiveModule(id); // keep the resolver's composed view in sync
@@ -1188,6 +1196,35 @@ async function checkModuleSwitch(force) {
     }
 }
 
+// Message for a source breakpoint that failed to bind. Returns the actionable
+// -g1 hint when the cause is a workspace .c file with no line info (project built
+// without -g1), else the generic "No code at this line". Shared by setBreakpoints
+// and revalidateBreakpointsAfterSymbolLoad so both surfaces stay identical.
+// `emitWarn` (default true) also fires the one-shot 'important' console warning.
+function unboundBpMessage(srcPath, norm, emitWarn) {
+    if (emitWarn === undefined) emitWarn = true;
+    let msg = 'No code at this line';
+    const wfRaw = config.workspaceFolder || config.cwd || (config.build && config.build.cwd);
+    const wf = wfRaw ? canonPath(wfRaw) : '';
+    const underWs = wf && (norm === wf || norm.startsWith(wf + path.sep));
+    if (resolverInstance && /\.c$/i.test(srcPath) && underWs
+        && !filesWithLines.has(norm)) {
+        msg = 'No source-line info for this C file — rebuild with -g1 '
+            + '(set OSDKCOMP=-O1 -g1 in osdk_config.bat) so C breakpoints '
+            + 'can bind. Assembly (.s) breakpoints are unaffected.';
+        if (emitWarn && !warnedNoCLineInfo.has(norm)) {
+            warnedNoCLineInfo.add(norm);
+            const fn = srcPath.split(/[\\/]/).pop();
+            evt('output', { category: 'important', output:
+                '⚠ Breakpoints in ' + fn + " won't bind: the project was built "
+                + 'without -g1, so no C source-line info is present. Add '
+                + '-g1 to OSDKCOMP in osdk_config.bat and rebuild. '
+                + '(Assembly breakpoints are unaffected.)\n' });
+        }
+    }
+    return msg;
+}
+
 // Sync source-breakpoint arming to the active module: (re)arm resident + active-
 // module breakpoints in the stub, disarm the rest. Called after the active module
 // changes so a breakpoint in an overlay only fires while that overlay is loaded.
@@ -1233,9 +1270,76 @@ async function rearmModuleBreakpoints() {
   });
 }
 
+// Re-resolve every source breakpoint against the freshly-loaded symbols and
+// emit 'breakpoint' events with the new verified/message state. This is the fix
+// for stale srcBps bindings: without it, a rebuild that removes line info for a
+// .c file (e.g. toggling off -g1) leaves the old bindings armed and the UI shows
+// verified breakpoints that can never fire. VS Code does not re-send
+// setBreakpoints on a fresh F5 launch for unchanged breakpoints, so the DA must
+// self-heal here. Mirrors rearmModuleBreakpoints' locking/event shape but, rather
+// than reusing frozen b.addr, calls addrForLine again. Called after loadSymbols
+// in both launch and restart. (Idempotent: re-resolving a still-valid bp against
+// the same symbols yields the same address.)
+async function revalidateBreakpointsAfterSymbolLoad() {
+    return withBpLock(async () => {
+        for (const [, arr] of srcBps) {
+            for (const bp of arr) {
+                const srcPath = (bp.source && bp.source.path) ? bp.source.path : '';
+                const norm = canonPath(srcPath);
+                const owners = fileToModules.get(norm) || ['R'];
+
+                // Re-resolve each owning module against the new symbols.
+                const newBindings = [];
+                for (const mod of owners) {
+                    const snap = resolverInstance ? resolverInstance.addrForLine(srcPath, bp.line, mod) : null;
+                    if (snap) {
+                        newBindings.push({ addr: snap.addr, module: mod, armed: false });
+                    }
+                }
+
+                // Disarm any old binding whose address is no longer present (the
+                // symbol mapping changed or vanished). armAddr is ref-counted, so
+                // addresses that survive (re-resolved identically) are unaffected.
+                const liveAddrs = new Set(newBindings.map(b => b.addr));
+                for (const b of bp.bindings) {
+                    if (b.armed && !liveAddrs.has(b.addr)) { await disarmAddr(b.addr); b.armed = false; }
+                }
+
+                if (!newBindings.length) {
+                    // No longer binds — report unverified with the actionable message.
+                    bp.bindings = [];
+                    evt('breakpoint', { reason: 'changed', breakpoint:
+                        { id: bp.id, verified: false, line: bp.line, source: bp.source,
+                          message: unboundBpMessage(srcPath, norm) } });
+                    continue;
+                }
+
+                // Bindings resolved — arm the active/resident ones (same rule as
+                // setBreakpoints) and report verified.
+                bp.bindings = newBindings;
+                let anyArmed = false;
+                for (const b of bp.bindings) {
+                    if (b.module === 'R' || b.module === activeModuleId) {
+                        b.armed = await armAddr(b.addr);
+                        if (b.armed) { anyArmed = true; await sendCond(b.addr, bp.condExpr, bp.hitTarget); }
+                    }
+                }
+                const dispBind = bp.bindings.find(b => b.module === 'R' || b.module === activeModuleId) || bp.bindings[0];
+                const hex = '$' + (dispBind.addr & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
+                const lbl = labelFor(dispBind.addr);
+                const where = (lbl === hex ? hex : lbl + ' (' + hex + ')');
+                evt('breakpoint', { reason: 'changed', breakpoint:
+                    { id: bp.id, verified: anyArmed, line: bp.line, source: bp.source, message: where } });
+            }
+        }
+    });
+}
+
 function loadSymbols(file) {
     symbols.clear(); addrSym.clear(); addrSource.clear(); symSource.clear();
     lineTable = []; zpSymbols = [];
+    filesWithLines = new Set();
+    warnedNoCLineInfo = new Set();   // new symbol load → re-allow the -g1 warning per file
     typeDefs.clear(); varTypes.clear(); localDefs.clear();
     evalFailCache.clear(); varRefs.clear(); refByKey.clear(); nextVarRef = 100;
 
@@ -1284,11 +1388,13 @@ function loadSymbols(file) {
                 const lm = trimmed.match(/^([0-9a-fA-F]{4})\s+(\d+):(\d+)$/);
                 if (lm) {
                     const fi = parseInt(lm[2], 10);
+                    const fpath = fileIndex[fi] || ('file#' + fi);
                     cur.lineTable.push({
                         addr: parseInt(lm[1], 16),
-                        file: fileIndex[fi] || ('file#' + fi),
+                        file: fpath,
                         line: parseInt(lm[3], 10)
                     });
+                    filesWithLines.add(canonPath(fpath));
                 }
                 continue;
             }
@@ -1451,7 +1557,17 @@ function loadSymbols(file) {
 
         const modNote = moduleNames.size > 0
             ? (' [' + moduleNames.size + ' modules, active=' + (activeModuleId !== null ? moduleNames.get(activeModuleId) : '(none)') + ']') : '';
-        log('Loaded ' + symbols.size + ' symbols, ' + lineTable.length + ' line entries, ' +
+        // Split line entries by source language: .c entries only exist when the
+        // project was compiled with -g1; if that count is 0, C-source breakpoints
+        // can't bind (the file has no line info). Surfacing the split here makes a
+        // missing -g1 visible at load time, before any breakpoint is set.
+        let cLines = 0;
+        for (const e of lineTable) if (/\.c$/i.test(e.file)) cLines++;
+        const nonCLines = lineTable.length - cLines;
+        const lineNote = cLines > 0
+            ? (lineTable.length + ' line entries')
+            : (lineTable.length + ' line entries (0 from .c — rebuild with -g1 to enable C breakpoints; ' + nonCLines + ' from assembly)');
+        log('Loaded ' + symbols.size + ' symbols, ' + lineNote + ', ' +
             typeDefs.size + ' types, ' + varTypes.size + ' typed vars, ' +
             localDefs.size + ' funcs with locals, ' +
             annBySymbol.size + ' annot-symbols, ' + annByField.size + ' annot-fields from ' + file + modNote);
@@ -4020,6 +4136,11 @@ const handlers = {
         reclaimOrphanEmulator();
 
         if (config.symbolFile) loadSymbols(config.symbolFile);
+        // Re-resolve existing breakpoints against the freshly-loaded symbols so a
+        // rebuild that changed line info (e.g. toggling -g1) is reflected in the UI
+        // and in which addresses are actually armed. (VS Code does not re-send
+        // setBreakpoints on a fresh launch for unchanged breakpoints.)
+        if (config.symbolFile) await revalidateBreakpointsAfterSymbolLoad();
 
         // Hash the disk image now, so a later `reloadsymbols` can tell a
         // byte-identical rebuild (safe to reload symbols in place) from a real
@@ -4333,6 +4454,9 @@ const handlers = {
         // --- Step 2: Reload symbols ---
         if (config.symbolFile) {
             loadSymbols(config.symbolFile);
+            // Re-resolve existing breakpoints against the new symbols (same reason
+            // as launch: a rebuild may have changed what can bind).
+            await revalidateBreakpointsAfterSymbolLoad();
         }
 
         configDone = false;
@@ -5002,7 +5126,12 @@ const handlers = {
 
             const id = bpId++;
             if (!bindings.length) {
-                result.push({ id, verified: false, message: 'No code at this line' });
+                // A workspace .c file with ZERO line entries almost always means the
+                // project was built without -g1: the compiler then emits no .csource
+                // markers, so the .c file never appears in #FILES and gets no #LINES
+                // entries (only assembly .s files do). The shared helper distinguishes
+                // that from a genuinely empty line so the user gets an actionable hint.
+                result.push({ id, verified: false, message: unboundBpMessage(srcPath, norm) });
                 continue;
             }
             // Arm bindings for the active/resident module now; others arm on switch
@@ -5841,14 +5970,21 @@ const handlers = {
         // its own (e.g. an assignment folded into adjacent statements) binds to the
         // next line that has code. Returned so the panel shows the same line VS Code
         // does instead of the requested one.
+        // Also a per-location verified flag: false when the line can't bind (e.g. a
+        // .c file built without -g1). The panel uses this to grey out unverified bps;
+        // it's more reliable than SourceBreakpoint.verified (whose propagation from a
+        // verified:false DAP response is inconsistent across VS Code versions).
         const snaps = {};
+        const bpVerified = {};
         if (resolverInstance) {
             for (const loc of locs) {
                 const s = resolverInstance.addrForLine(loc.file, loc.line);
-                if (s && s.line && s.line !== loc.line) snaps[loc.file + ':' + loc.line] = s.line;
+                const key = loc.file + ':' + loc.line;
+                bpVerified[key] = !!s;
+                if (s && s.line && s.line !== loc.line) snaps[key] = s.line;
             }
         }
-        respond(req, { modules, byFile, snaps });
+        respond(req, { modules, byFile, snaps, bpVerified });
     },
 
     async setActiveModule(req) {
