@@ -6220,6 +6220,25 @@ function activate(context) {
     // canonPath(filePath) -> Set(requestedLine) for breakpoints that won't bind.
     const unverifiedBpLines = new Map();
 
+    // PAL Oric timing: 64 cyc/raster \u00D7 312 rasters = 19,968 cycles/frame at 50 Hz
+    // \u2192 998,400 Hz CPU clock (from Oricutron ula.c). Oric-1/Atmos are PAL. (NTSC
+    // would be 16,896 cyc/frame at 60 Hz; if NTSC support is ever needed the clock
+    // should come from the emulator rather than being assumed here.)
+    const ORIC_CPU_HZ = 998400, ORIC_CYC_PER_FRAME = 19968;
+    // Build the inline label: cycle count \u00B7 real-time duration \u00B7 frame count. The
+    // duration auto-scales (\u00B5s / ms / s) and frames are fractional (0.71 fr tells you
+    // a step took ~71% of a frame \u2014 useful for demo/raster timing).
+    function cycleLabel(cycles) {
+        const seconds = cycles / ORIC_CPU_HZ;
+        let t;
+        if (seconds < 1e-3)      t = (seconds * 1e6).toFixed(1) + ' \u00B5s';
+        else if (seconds < 1)    t = (seconds * 1e3).toFixed(2) + ' ms';
+        else                     t = seconds.toFixed(3) + ' s';
+        const fr = cycles / ORIC_CYC_PER_FRAME;
+        const frStr = fr >= 10 ? fr.toFixed(0) : fr.toFixed(2);
+        return '\u23F1 ' + cycles.toLocaleString() + ' cyc \u00B7 ' + t + ' \u00B7 ' + frStr + ' fr';
+    }
+
     function applyCycleDecorations() {
         for (const editor of vscode.window.visibleTextEditors) {
             const filePath = editor.document.uri.fsPath;
@@ -6232,11 +6251,10 @@ function activate(context) {
             for (const [line, info] of fileAnnotations) {
                 if (line < 1 || line > editor.document.lineCount) continue;
                 const range = new vscode.Range(line - 1, 0, line - 1, 0);
-                const cyclesStr = info.cycles.toLocaleString();
                 decorations.push({
                     range,
                     renderOptions: {
-                        after: { contentText: '\u23F1 ' + cyclesStr + ' cycles' }
+                        after: { contentText: cycleLabel(info.cycles) }
                     }
                 });
             }

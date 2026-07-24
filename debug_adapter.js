@@ -768,7 +768,17 @@ let moduleWatchPending = false; // true between the module-watch stop and the do
 let moduleByteTrusted = false; // false until we KNOW _osdk_dbg_module is meaningful (a write was observed, or we attached to a running program). At cold boot the byte is uninitialized RAM — its value must not be believed.
 let resumeMode = 'run';       // 'run' | 'step' — how execution was last resumed (for transparent module switches)
 let gotoTargetMap = new Map(); // targetId -> address (for goto/setNextStatement)
-let lastCycleAnnotation = null; // { pc, cycles } from last step-over
+let lastCycleAnnotation = null; // { pc, cycles } from last step-over/step-out
+// Absolute cpu.cycles / frame counters + starting PC captured just before a step
+// resumed (read via qOricCpuExtra). The stop handler subtracts to get the elapsed
+// cycles and attributes the annotation to stepStartPc (the line stepped over) —
+// works on every step path, no OricCycles: dependence, no pc-3 JSR guess.
+let stepCyclesBefore = null;
+let stepStartPc = null;
+// true for run-type resumes (run-to-cursor / continue / turbo): attribute the
+// annotation to the DESTINATION line we land on (where the user is looking) when it
+// resolves to source, else the start line. Steps keep start attribution (the line executed).
+let stepPreferDest = false;
 let launchedProcess = null;     // child_process handle if we launched Oricutron
 let sourceLineCache = {};       // filePath -> string[] (lazy-loaded source, 0-based)
 let tempStepBp = -1;           // address of temp breakpoint for source-level stepping (-1 = none)
@@ -1704,6 +1714,41 @@ function parseStopRegs(payload) {
     return r;
 }
 
+// Read Oricutron's extra CPU/machine state via the qOricCpuExtra query. The reply
+// is  L:<lastpc 2B>;C:<cycles 4B>;F:<frames 4B>;R:<raster 2B>;N:..;T:..;I:..  with
+// every value little-endian, 2 hex chars/byte. C: is the 32-bit ABSOLUTE, monotonic
+// cpu.cycles counter (NOT a delta); F: is the 32-bit video-frame counter. Returns
+// { cycles, frames } or null (old stub with no qOricCpuExtra, or an error reply) so
+// callers degrade to "no annotation" rather than crashing. See DESIGN-cycle-counting.md.
+async function readCpuExtra() {
+    let r;
+    try { r = await gdbCmd('qOricCpuExtra'); } catch (e) { return null; }
+    if (!r || r.indexOf('C:') < 0) return null;
+    const out = {};
+    for (const part of r.split(';')) {
+        const c = part.indexOf(':');
+        if (c < 0) continue;
+        const tag = part.substring(0, c), hex = part.substring(c + 1);
+        if (tag !== 'C' && tag !== 'F') continue;
+        let v = 0;
+        // little-endian; multiply (not <<) so the top byte can't go negative past bit 31
+        for (let i = 0; i + 1 < hex.length; i += 2) v += parseInt(hex.substr(i, 2), 16) * Math.pow(256, i / 2);
+        if (tag === 'C') out.cycles = v >>> 0; else out.frames = v >>> 0;
+    }
+    return (out.cycles !== undefined) ? out : null;
+}
+
+// Capture the absolute cycle/frame counters + PC while stopped, just before a step
+// resumes. Called at the top of the step-over / step-out handlers so the annotation
+// works regardless of which resume command follows. Clears the snapshot if the stub
+// can't answer qOricCpuExtra (→ the stop handler skips the annotation).
+async function snapshotStepStart(preferDest) {
+    const pcNow = regs ? regs.pc : null;
+    const ex = await readCpuExtra();
+    if (ex) { stepStartPc = pcNow; stepCyclesBefore = ex.cycles; stepPreferDest = !!preferDest; }
+    else    { stepStartPc = null;  stepCyclesBefore = null; stepPreferDest = false; }
+}
+
 // ----------------------------------------------------------------
 // Register type tags — "close the type-matching loop when tracing asm"
 // (user feature 2026-07-15). A/X/Y can carry an enum tag so the Registers
@@ -2148,10 +2193,34 @@ async function onStopReply(payload) {
         disarmAddr(addr); // release temp BP asynchronously
     }
 
-    // Handle cycle annotation from step-over
-    // The annotation belongs on the JSR instruction line (PC-3), not the return address
+    // Cycle-count annotation. Prefer the qOricCpuExtra before/after delta captured
+    // around the step (see readCpuExtra + the next/stepOut snapshots): it works on
+    // EVERY step path and is attributed to stepStartPc — the line the user stepped
+    // over — with no pc-3 JSR guess. Fall back to the stub's OricCycles: field
+    // (step-over 'N' only, attributed to pc-3) when no snapshot is available, e.g.
+    // an old stub without qOricCpuExtra.
     lastCycleAnnotation = null;
-    if (cyclesDelta !== null && regs && regs.pc !== undefined) {
+    if (stepCyclesBefore !== null) {
+        const after = await readCpuExtra();
+        const delta = after ? ((after.cycles - stepCyclesBefore) >>> 0)
+                            : (cyclesDelta !== null ? cyclesDelta : null);
+        // Attribute to the destination we landed on for run-type resumes (where the
+        // user is looking) when it resolves to source; else the start line (always
+        // resolvable). Steps use the start line (the line executed).
+        let attribPc = stepStartPc;
+        if (stepPreferDest && regs && regs.pc !== undefined && sourceFor(regs.pc)) attribPc = regs.pc & 0xFFFF;
+        const src = (delta !== null && attribPc !== null) ? sourceFor(attribPc) : null;
+        if (delta !== null && src) {
+            lastCycleAnnotation = {
+                pc: attribPc,
+                cycles: delta,
+                symbol: symbolAt(attribPc),
+                file: src.file,
+                line: src.line
+            };
+        }
+        stepCyclesBefore = null; stepStartPc = null; stepPreferDest = false;
+    } else if (cyclesDelta !== null && regs && regs.pc !== undefined) {
         const jsrPc = (regs.pc - 3) & 0xFFFF;
         const src = sourceFor(jsrPc);
         lastCycleAnnotation = {
@@ -4964,6 +5033,10 @@ const handlers = {
     async continue(req) {
         resumeMode = 'run';
         await histPush();   // record the state we're leaving (and diverge the future if parked)
+        // Cycle annotation for a run→stop (native Run-to-Cursor and F5-to-breakpoint both
+        // land here). Snapshot the counter unless a step/turbo already did — the next stop
+        // then shows how many cycles the run took, attributed to the line we land on.
+        if (stepCyclesBefore === null) await snapshotStepStart(true);
         // If PC is sitting on a breakpoint, single-step past it first,
         // then continue via the continueAfterStep flag in onStopReply
         if (regs && regs.pc !== undefined) {
@@ -4988,6 +5061,7 @@ const handlers = {
     async next(req) {
         resumeMode = 'step';
         await histPush();
+        await snapshotStepStart();   // cycle-count annotation: record before-state while stopped
         const granularity = (req.arguments && req.arguments.granularity) || 'statement';
         logVerbose('next: granularity=' + granularity);
         const src = regs ? sourceFor(regs.pc) : null;
@@ -5051,6 +5125,7 @@ const handlers = {
     async stepOut(req) {
         resumeMode = 'step';
         await histPush();
+        await snapshotStepStart();   // annotate the cycles spent finishing this function
         regs = null;
         respond(req);
         running = true;
@@ -5945,6 +6020,14 @@ const handlers = {
             }
         }
         if ((a.symbol || a.file) && addr < 0) { respond(req, {}, false, 'Turbo target not found'); return; }
+        // Cycle-count annotation for "Run to Here": snapshot the counter now and
+        // attribute the elapsed cycles to the line we're running FROM (the current PC),
+        // same as step-over. The current PC always resolves to a source line (we're
+        // stopped on it); the target address may not (e.g. a disassembly instruction
+        // with no #LINES entry), which would silently drop the annotation. Cycles count
+        // identically under warp. continue() below preserves this snapshot; the stop
+        // handler consumes it.
+        await snapshotStepStart(true);   // run-type: attribute to the destination line
         await armTurbo(addr, a.warp !== false); // warp:false = run-to-target at normal speed
         return handlers.continue(req); // responds + issues continue (handles PC-on-BP)
     },
