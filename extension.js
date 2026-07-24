@@ -3874,15 +3874,15 @@ let stopped = true, active = false, canRewind = false, canForward = false, warp 
 document.body.addEventListener('click', e => {
     const b = e.target.closest('button.dbg-btn');
     if (!b || b.disabled) return;
-    // The play/pause button resolves to continue (when halted) or pause (when running).
+    // The play/pause button is tri-state: Start (no session) / Continue (halted) / Pause (running).
     let act = b.dataset.act;
-    if (act === 'playpause') act = stopped ? 'continue' : 'pause';
+    if (act === 'playpause') act = !active ? 'start' : (stopped ? 'continue' : 'pause');
     vscode.postMessage({ type: 'debugAction', action: act });
 });
 // Hover help: show each button's purpose + shortcut in the status bar (a visible
 // alternative to tooltips, which a large cursor tends to cover).
 const HELP = {
-    playpause: 'Continue (F5) / Pause (F6) execution',
+    playpause: 'Start / Continue (F5) · Pause (F6) — launch a session, resume, or pause execution',
     stop: 'Stop the debug session  (Shift+F5)',
     restart: 'Restart the debug session  (Ctrl+Shift+F5)',
     stepOver: 'Step Over — execute one statement  (F10)',
@@ -3908,11 +3908,13 @@ function apply() {
     set('replayRewind',  active && stopped && canRewind);
     set('replayForward', active && stopped && canForward);
     set('replayToHead',  active && stopped && canForward);
-    // One button: Continue (green ▶) when halted, Pause (‖) when running; live whenever a session is.
+    // Tri-state button: Start (green ▶, no session) / Continue (green ▶, halted) / Pause (‖, running).
+    // Unlike the other controls it stays live with NO session, so F5 can launch from here.
     const pp = document.getElementById('playpause');
     if (pp) {
-        pp.disabled = !active;
-        if (stopped) { pp.classList.add('go'); document.getElementById('ppIcon').innerHTML = '&#9654;'; document.getElementById('ppLbl').textContent = 'Continue'; }
+        pp.disabled = false;
+        if (!active) { pp.classList.add('go'); document.getElementById('ppIcon').innerHTML = '&#9654;'; document.getElementById('ppLbl').textContent = 'Start'; }
+        else if (stopped) { pp.classList.add('go'); document.getElementById('ppIcon').innerHTML = '&#9654;'; document.getElementById('ppLbl').textContent = 'Continue'; }
         else { pp.classList.remove('go'); document.getElementById('ppIcon').innerHTML = '&#9208;'; document.getElementById('ppLbl').textContent = 'Pause'; }
     }
     set('restart', active);
@@ -3959,6 +3961,7 @@ class DebugControlsWebviewProvider {
             if (msg.type === 'hoverEnd') { showHoverHelp(null); return; }
             if (msg.type !== 'debugAction') return;
             const CMD = {
+                start: 'workbench.action.debug.start',
                 continue: 'workbench.action.debug.continue',
                 stepOver: 'workbench.action.debug.stepOver',
                 stepInto: 'workbench.action.debug.stepInto',
