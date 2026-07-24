@@ -6371,17 +6371,24 @@ const handlers = {
         let off = 0;
         const m = name.match(/^(.*?)\s*([+-])\s*\$?([0-9a-fA-F]+)$/);
         if (m) { name = m[1].trim(); off = (m[2] === '-' ? -1 : 1) * parseInt(m[3], 16); }
+        // Try the name as typed, then the C<->asm underscore variants: a C symbol
+        // (System_RestoreIRQ_SimpleVbl) is exported with a leading '_' in the symbol
+        // table (_System_...), and vice-versa. So try "name", then "_name", then a
+        // '_'-stripped form — first hit wins.
+        const lookOne = (n) => {
+            if (symbols.has(n)) return symbols.get(n);
+            const lower = n.toLowerCase();
+            for (const [k, v] of symbols) { if (k.toLowerCase() === lower) return v; }
+            if (Array.isArray(romSymbols)) {
+                for (const s of romSymbols) { if (s.name === n || s.name.toLowerCase() === lower) return s.addr; }
+            }
+            return undefined;
+        };
         let addr;
         if (name) {
-            if (symbols.has(name)) addr = symbols.get(name);
-            else {
-                const lower = name.toLowerCase();
-                for (const [k, v] of symbols) { if (k.toLowerCase() === lower) { addr = v; break; } }
-            }
-            if (addr === undefined && Array.isArray(romSymbols)) {
-                const lower = name.toLowerCase();
-                for (const s of romSymbols) { if (s.name === name || s.name.toLowerCase() === lower) { addr = s.addr; break; } }
-            }
+            const cands = [name];
+            if (name[0] === '_') cands.push(name.slice(1)); else cands.push('_' + name);
+            for (const c of cands) { addr = lookOne(c); if (addr !== undefined) break; }
         }
         respond(req, { addr: addr !== undefined ? ((addr + off) & 0xFFFF) : null });
     },

@@ -4626,6 +4626,23 @@ function setupDisasmMessageHandler(panel) {
                 disasmCenterAddr = addr & 0xFFFF;
                 if (session && session.type === 'oric-debug') refreshDisasmPanel(session);
             }
+        } else if (msg.type === 'gotoSymbolName' && msg.name) {
+            // Resolve a symbol name (module symbols, ROM symbols, or "_sym+$off") to an
+            // address via the adapter, then centre on it. Works while running too (the
+            // adapter reads its symbol table, no CPU query). Reports failure to the webview.
+            if (session && session.type === 'oric-debug') {
+                session.customRequest('addrForSymbol', { name: msg.name }).then(r => {
+                    if (r && typeof r.addr === 'number') {
+                        disasmCenterAddr = r.addr & 0xFFFF;
+                        refreshDisasmPanel(session);
+                        panel.webview.postMessage({ type: 'gotoResult', ok: true });
+                    } else {
+                        panel.webview.postMessage({ type: 'gotoResult', ok: false, name: msg.name });
+                    }
+                }, () => panel.webview.postMessage({ type: 'gotoResult', ok: false, name: msg.name }));
+            } else {
+                panel.webview.postMessage({ type: 'gotoResult', ok: false, name: msg.name });
+            }
         } else if (msg.type === 'followPc') {
             disasmCenterAddr = null;
             if (session && session.type === 'oric-debug') refreshDisasmPanel(session);
@@ -4801,7 +4818,7 @@ body.dbg-stopped .dheader { display: block; }
     border: 1px solid var(--vscode-input-border, #555);
     padding: 3px 6px;
     font-family: inherit; font-size: inherit;
-    width: 80px;
+    width: 240px;   /* wide enough for a symbol name (was 80px, sized for a bare $addr) */
 }
 .toolbar button {
     background: var(--vscode-button-background, #0e639c);
@@ -4890,10 +4907,11 @@ td.operand .act:hover { color: var(--vscode-foreground); }
 <div class="toolbar">
     <span class="status" id="statusText"></span>
     <span style="color:var(--vscode-descriptionForeground,#888)">Go to:</span>
-    <input type="text" id="gotoInput" placeholder="$XXXX" spellcheck="false">
+    <input type="text" id="gotoInput" placeholder="$XXXX or symbol" spellcheck="false">
     <button id="gotoBtn">Go</button>
     <button id="followBtn">Follow PC</button>
 </div>
+<div id="gotoMsg" style="color:var(--vscode-errorForeground,#f48771);font-size:0.9em;padding:0 8px;"></div>
 <div id="histLine"></div>
 </div>
 <div id="content"><div class="no-session">No debug session active</div></div>
@@ -4937,11 +4955,13 @@ document.getElementById('gotoInput').addEventListener('input', updateHeaderButto
 document.getElementById('followBtn').addEventListener('click', () => vscode.postMessage({ type: 'followPc' }));
 
 let following = true;   // true = view is tracking the PC (extension: disasmCenterAddr === null)
-// Go: only meaningful with a valid $addr typed. Follow PC: only when NOT already following.
+function setGotoMsg(t) { const m = document.getElementById('gotoMsg'); if (m) m.textContent = t || ''; }
+// Go: live for a valid $addr OR any non-empty symbol name (the adapter resolves the name).
+// Follow PC: only when NOT already following.
 function updateHeaderButtons() {
-    const v = document.getElementById('gotoInput').value.trim().replace(/^\\$/, '');
-    document.getElementById('gotoBtn').disabled = !/^[0-9a-fA-F]{1,4}$/.test(v);
+    document.getElementById('gotoBtn').disabled = document.getElementById('gotoInput').value.trim().length === 0;
     document.getElementById('followBtn').disabled = following;
+    setGotoMsg('');   // typing clears any previous "not found"
 }
 updateHeaderButtons();
 
@@ -5017,9 +5037,15 @@ document.getElementById('content').addEventListener('contextmenu', e => {
 document.addEventListener('contextmenu', e => e.preventDefault());
 
 function doGoto() {
-    let v = document.getElementById('gotoInput').value.trim().replace(/^\\$/, '');
+    const raw = document.getElementById('gotoInput').value.trim();
+    const v = raw.replace(/^\\$/, '');
     if (/^[0-9a-fA-F]{1,4}$/.test(v)) {
-        vscode.postMessage({ type: 'gotoAddress', address: v });
+        vscode.postMessage({ type: 'gotoAddress', address: v });   // bare/$-prefixed hex → address
+    } else if (raw) {
+        // Otherwise treat it as a symbol name (optionally "_sym+$off" / "_sym-$off");
+        // the adapter resolves it and centres the view, or reports it wasn't found.
+        setGotoMsg('');
+        vscode.postMessage({ type: 'gotoSymbolName', name: raw });
     }
 }
 
@@ -5035,6 +5061,10 @@ window.addEventListener('message', e => {
         debugStopped = !!e.data.stopped;
         document.body.classList.toggle('dbg-stopped', debugStopped);
         if (!debugStopped) closeCtxMenu();
+    } else if (e.data.type === 'gotoResult') {
+        // Symbol goto outcome: clear on success (the disasm refresh follows),
+        // show a visible "no symbol" note on failure (no tooltip — see UI rules).
+        setGotoMsg(e.data.ok ? '' : ('no symbol: ' + (e.data.name || '')));
     }
 });
 
