@@ -645,25 +645,32 @@ const PALETTE = [[0,0,0],[255,0,0],[0,255,0],[255,255,0],[0,0,255],[255,0,255],[
 // mode ignored for a still image). Else 6 pixels from c & 0x3f (bit 5 = leftmost), inverse
 // = c & 0x80 (swap ink/paper). ink/paper reset per row — a future pass adds an override for
 // pixel-only buffers copied in attribute-preserve mode.
-function hiresDecode(hex, w, h, stride) {
+function hiresDecode(hex, w, h, stride) 
+{
     const out = new Uint8Array(w * h);
-    for (let row = 0; row < h; row++) {
+    for (let row = 0; row < h; row++) 
+    {
         let fg = 7, bg = 0, x = 0;
-        for (let col = 0; col < stride && x < w; col++) {
+        for (let col = 0; col < stride && x < w; col++) 
+        {
             const idx = (row * stride + col) * 2;
             if (idx + 1 >= hex.length) break;
             const c = parseInt(hex.substring(idx, idx + 2), 16);
-            if ((c & 0x60) === 0) {
+            const inv = (c & 0x80) !== 0;
+            let data = c & 0x3f;
+            if ((c & 0x60) === 0)
+            {  
+                // Attribute
                 const a = c & 0x18;
                 if (a === 0x00) fg = c & 7; else if (a === 0x10) bg = c & 7;
-                const blank = (c & 0x80) ? fg : bg;
-                for (let p = 0; p < 6 && x < w; p++) out[row * w + x++] = blank;
-            } else {
-                const inv = (c & 0x80) !== 0, data = c & 0x3f;
-                for (let p = 0; p < 6 && x < w; p++) {
-                    const bit = (data >> (5 - p)) & 1;
-                    out[row * w + x++] = (inv ? !bit : bit) ? fg : bg;
-                }
+                data = 0;                
+            } 
+            // Graphics
+            for (let p = 0; p < 6 && x < w; p++) 
+            {
+                const bit = (data >> (5 - p)) & 1;
+                const color = bit ? fg : bg;
+                out[row * w + x++] = inv ? (7-color) : color;
             }
         }
     }
