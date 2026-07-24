@@ -46,12 +46,14 @@ const CONTROL_REQUESTS = new Set([
     'setBreakpoints', 'setFunctionBreakpoints', 'setDataBreakpoints', 'setInstructionBreakpoints',
     'setAddressBreakpoints', 'oricSetWatchpoints', 'oricArmValueWatch', 'oricClearValueWatch',
     'turboRun', 'setWarp', 'writeMemory', 'setVariable', 'setExpression',
+    // Snapshots that mutate the running machine or the snapshot set — gated on control.
+    'restoreSnapshot', 'saveSnapshot', 'renameSnapshot', 'deleteSnapshot',
 ]);
 // Reads — safe to allow regardless of who holds control.
 const OBSERVE_REQUESTS = new Set([
     'readMemory', 'evaluate', 'stackTrace', 'scopes', 'variables', 'threads',
     'getModules', 'oricResolve', 'dataBreakpointInfo', 'source', 'modules', 'loadedSources',
-    'exceptionInfo', 'gotoTargets',
+    'exceptionInfo', 'gotoTargets', 'listSnapshots',
 ]);
 function classify(cmd) {
     if (CONTROL_REQUESTS.has(cmd)) return 'control';

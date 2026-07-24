@@ -163,6 +163,7 @@ const CONTROL_TOOLS = new Set([
     'oric_step_back', 'oric_reverse', 'oric_set_breakpoint', 'oric_clear_breakpoints',
     'oric_watch_memory', 'oric_clear_watchpoints', 'oric_send_keys', 'oric_press',
     'oric_warp', 'oric_wait_for', 'oric_run_to', 'oric_run_frames', 'oric_wait_module',
+    'oric_restore_snapshot', 'oric_save_snapshot',
 ]);
 
 const TOOLS = {
@@ -207,6 +208,35 @@ const TOOLS = {
     oric_step_out:      cmd('stepOut',         () => ({ threadId: 1 }), 'Run until the current function returns.'),
     oric_step_back:     cmd('stepBack',        () => ({ threadId: 1 }), 'Reverse one step (time-travel history).'),
     oric_reverse:       cmd('reverseContinue', () => ({ threadId: 1 }), 'Run backwards to the previous stop.'),
+
+    oric_list_snapshots: {
+        description: 'List saved machine-state snapshots (name + save time), newest first. Observe-only — works whether or not you hold control.',
+        schema: { type: 'object', properties: {} },
+        run: async () => {
+            requireSession();
+            const r = await session.dap.request('listSnapshots', {});
+            const list = (r && r.snapshots) || [];
+            return T(list.length ? ('Snapshots:\n' + list.map(s => '• ' + s.name).join('\n')) : 'No snapshots saved.');
+        },
+    },
+    oric_restore_snapshot: {
+        description: 'Restore (reload) a saved snapshot by name, rewinding the whole machine to that state, then stop. Requires control — during a collaborative session the human\'s snapshot controls are locked while you pilot, so restoring is your job.',
+        schema: { type: 'object', properties: { name: { type: 'string', description: 'snapshot name (see oric_list_snapshots)' } }, required: ['name'] },
+        run: async a => {
+            requireSession();
+            await session.dap.request('restoreSnapshot', { name: a.name });
+            return T('Restored snapshot "' + a.name + '". ' + await whereString());
+        },
+    },
+    oric_save_snapshot: {
+        description: 'Save the current machine state as a named snapshot (checkpoint you can roll back to with oric_restore_snapshot). Requires control.',
+        schema: { type: 'object', properties: { name: { type: 'string', description: 'name for the snapshot' } }, required: ['name'] },
+        run: async a => {
+            requireSession();
+            const r = await session.dap.request('saveSnapshot', { name: a.name });
+            return T('Saved snapshot "' + ((r && r.name) || a.name) + '".');
+        },
+    },
 
     oric_set_breakpoint: {
         description: 'Set a source breakpoint at file:line, with an optional native condition expression (e.g. "X == 30" or "e->hp < 0"). Returns whether it bound (verified).',

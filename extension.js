@@ -3830,6 +3830,16 @@ body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size
 }
 .dbg-btn:hover:not(:disabled) { background: var(--vscode-button-secondaryHoverBackground, #45494e); }
 .dbg-btn:disabled { opacity: 0.35; cursor: default; }
+/* AI piloting: control buttons aren't yours to click — show them in the same gold
+   as the "AI bridge: AI piloting" status-bar badge (not faded grey), so it reads as
+   "locked by the AI" rather than "unavailable". Overrides the disabled fade. */
+.dbg-btn.ai-locked, .dbg-btn.ai-locked:disabled {
+    opacity: 1; cursor: not-allowed;
+    background: var(--vscode-statusBarItem-warningBackground, #bf8803);
+    color: var(--vscode-statusBarItem-warningForeground, #000);
+    border-color: var(--vscode-statusBarItem-warningBackground, #bf8803);
+}
+.dbg-btn.ai-locked .ic { color: inherit; }
 .dbg-btn .ic { font-size: 1.1em; line-height: 1; }
 .dbg-btn.go .ic   { color: var(--vscode-debugIcon-continueForeground, #89d185); }
 .dbg-btn.stop .ic { color: var(--vscode-debugIcon-stopForeground, #f48771); }
@@ -3860,7 +3870,7 @@ body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size
 </div>
 <script>
 const vscode = acquireVsCodeApi();
-let stopped = true, active = false, canRewind = false, canForward = false, warp = false;
+let stopped = true, active = false, canRewind = false, canForward = false, warp = false, aiPiloting = false;
 document.body.addEventListener('click', e => {
     const b = e.target.closest('button.dbg-btn');
     if (!b || b.disabled) return;
@@ -3886,7 +3896,8 @@ const HELP = {
 document.querySelectorAll('button.dbg-btn').forEach(b => {
     const help = HELP[b.dataset.act];
     if (!help) return;
-    b.addEventListener('mouseenter', () => vscode.postMessage({ type: 'hover', text: help }));
+    b.addEventListener('mouseenter', () => vscode.postMessage({ type: 'hover',
+        text: aiPiloting ? 'AI is piloting — click “AI bridge: AI piloting” in the status bar to take control.' : help }));
     b.addEventListener('mouseleave', () => vscode.postMessage({ type: 'hoverEnd' }));
 });
 function apply() {
@@ -3913,8 +3924,15 @@ function apply() {
         wb.classList.toggle('warpon', warp);
         document.getElementById('warpLbl').textContent = warp ? 'Warp: On' : 'Warp: Off';
     }
+    // AI piloting: every button here is a control action, so lock them all — disabled
+    // (the click handler already ignores disabled) and gold-tinted instead of faded,
+    // so it reads as "the AI holds control" rather than "nothing to do".
+    document.querySelectorAll('button.dbg-btn').forEach(b => {
+        if (aiPiloting) { b.disabled = true; b.classList.add('ai-locked'); }
+        else { b.classList.remove('ai-locked'); }
+    });
 }
-window.addEventListener('message', e => { if (e.data && e.data.type === 'state') { active = !!e.data.active; stopped = !!e.data.stopped; canRewind = !!e.data.canRewind; canForward = !!e.data.canForward; warp = !!e.data.warp; apply(); } });
+window.addEventListener('message', e => { if (e.data && e.data.type === 'state') { active = !!e.data.active; stopped = !!e.data.stopped; canRewind = !!e.data.canRewind; canForward = !!e.data.canForward; warp = !!e.data.warp; aiPiloting = !!e.data.aiPiloting; apply(); } });
 apply();
 </script>
 </body></html>`;
@@ -3962,7 +3980,8 @@ class DebugControlsWebviewProvider {
         if (!this._view) return;
         // Use the tracked flag, not activeDebugSession — the latter can still be set
         // during onDidTerminateDebugSession, leaving Stop looking enabled after the end.
-        this._view.webview.postMessage({ type: 'state', active: oricSessionActive, stopped: oricDebugStopped, canRewind: replayCanRewind, canForward: replayCanForward, warp: oricWarpOn });
+        this._view.webview.postMessage({ type: 'state', active: oricSessionActive, stopped: oricDebugStopped, canRewind: replayCanRewind, canForward: replayCanForward, warp: oricWarpOn,
+            aiPiloting: !!bridgeServer && bridgeControl === BRIDGE_CONTROL.AI });
     }
 }
 function setInstrStepMode(on) {
@@ -5842,11 +5861,21 @@ function bridgeUpdateStatusBar() {
     bridgeStatusBar.show();
 }
 
+// True when the collaboration bridge is up AND the AI currently holds debug control,
+// so the human's execution/snapshot controls are locked. Single source of truth for
+// the toolbar lock, the snapshot-row graying, and the restore-command gate.
+function aiIsPiloting() { return !!bridgeServer && bridgeControl === BRIDGE_CONTROL.AI; }
+// Set in activate() to refresh the snapshot panel's decorations when control flips
+// (setBridgeControl is module-scope; the emitter lives inside activate()).
+let refreshSnapshotDeco = () => {};
+
 // Flip control ownership + reflect it everywhere (status bar, Screen View OSD, connected clients).
 function setBridgeControl(owner) {
     bridgeControl = (owner === BRIDGE_CONTROL.AI) ? BRIDGE_CONTROL.AI : BRIDGE_CONTROL.HUMAN;
     bridgeUpdateStatusBar();
     postScreenRunState();
+    if (debugControlsProvider) debugControlsProvider.pushState();   // gold-lock / unlock the debug buttons
+    refreshSnapshotDeco();                                          // gray / ungray the snapshot rows
     if (bridgeServer) bridgeServer.broadcast('control', { control: bridgeControl });
 }
 
@@ -7223,6 +7252,7 @@ function activate(context) {
             catch (e) { vscode.window.showErrorMessage('Snapshot save failed: ' + (e && e.message ? e.message : e)); }
         }),
         vscode.commands.registerCommand('oric-debug.snapshotRestore', async () => {
+            if (aiIsPiloting()) { vscode.window.showInformationMessage('The AI is piloting — it restores snapshots. Click “AI bridge: AI piloting” in the status bar to take control first.'); return; }
             const s = vscode.debug.activeDebugSession;
             if (!s || s.type !== 'oric-debug') { vscode.window.showInformationMessage('Oric: start a debug session first.'); return; }
             let list; try { list = await s.customRequest('listSnapshots'); } catch (e) { vscode.window.showErrorMessage('List failed: ' + (e && e.message ? e.message : e)); return; }
@@ -7280,10 +7310,16 @@ function activate(context) {
     const snapDecoProvider = {
         onDidChangeFileDecorations: snapDecoEmitter.event,
         provideFileDecoration(uri) {
-            if (uri.scheme !== 'oric-snapshot' || oricSessionActive) return undefined;
-            return { color: new vscode.ThemeColor('disabledForeground') };
+            if (uri.scheme !== 'oric-snapshot') return undefined;
+            // AI piloting: restoring is the AI's job (the human's is locked), so gray the
+            // rows and flag why. Same dimming as "no session", with an explanatory badge.
+            if (aiIsPiloting()) return { color: new vscode.ThemeColor('disabledForeground'), badge: 'AI', tooltip: 'AI is piloting — it restores snapshots; take control (status bar) to restore yourself.' };
+            if (!oricSessionActive) return { color: new vscode.ThemeColor('disabledForeground') };
+            return undefined;
         }
     };
+    // Let setBridgeControl (module scope) refresh these decorations when control flips.
+    refreshSnapshotDeco = () => snapDecoEmitter.fire();
     // The .oric-snapshots directory is the source of truth — read it directly so snapshots show
     // even with NO active session (you can then start one FROM a snapshot). mtime = save time.
     function snapshotsFolder() {
@@ -7422,6 +7458,7 @@ function activate(context) {
         vscode.commands.registerCommand('oric-debug.snapshotRefresh', () => refreshSnapshots()),
         vscode.commands.registerCommand('oric-debug.snapshotRestoreItem', async node => {
             if (!node || !node.snap) return;
+            if (aiIsPiloting()) { vscode.window.showInformationMessage('The AI is piloting — it restores snapshots. Click “AI bridge: AI piloting” in the status bar to take control first.'); return; }
             const name = node.snap.name;
             let s = snapSession();
             const starting = !s;
