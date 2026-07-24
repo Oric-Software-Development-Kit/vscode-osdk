@@ -7327,17 +7327,36 @@ function activate(context) {
     // TreeView recolour label/description text, but icon tints via ThemeColor are supported and
     // adapt to light/dark themes — enough to give the panel some colour.
     const docsItems = [
+        { sep: true, label: '— documentation —' },
         { label: 'Extension manual', icon: 'book', color: 'charts.blue', desc: 'This extension’s page & README', cmd: 'oric-debug.openManual' },
         { label: 'XA assembler reference', icon: 'symbol-keyword', color: 'charts.purple', desc: 'Internal quick reference', cmd: 'osdk.xaReference' },
         { label: '6502 opcode reference', icon: 'symbol-numeric', color: 'charts.green', desc: 'Internal quick reference', cmd: 'osdk.6502Reference' },
+        { sep: true, label: '— useful links —' },
         { label: 'OSDK website', icon: 'globe', color: 'charts.orange', desc: 'osdk.org (external)', cmd: 'vscode.open', args: [vscode.Uri.parse('http://www.osdk.org')] },
-        { label: 'Defence Force forum', icon: 'comment-discussion', color: 'charts.yellow', desc: 'forum.defence-force.org (external)', cmd: 'vscode.open', args: [vscode.Uri.parse('https://forum.defence-force.org')] }
+        { label: 'Defence Force forum', icon: 'comment-discussion', color: 'charts.yellow', desc: 'forum.defence-force.org (external)', cmd: 'vscode.open', args: [vscode.Uri.parse('https://forum.defence-force.org')] },
+        // Quick shortcuts to the UI tabs — avoids CTRL+SHIFT+P to find and run them.
+        // iconFile reuses the same panel SVG as the tab itself, for visual consistency.
+        { sep: true, label: '— debugger panels —' },
+        { label: 'Disassembly', iconFile: 'panel-disasm-v2', desc: 'Open the disassembly view', cmd: 'oric-debug.openDisassembly' },
+        { label: 'Screen View', iconFile: 'panel-screen-v2', desc: 'Open the screen view', cmd: 'oric-debug.openScreenView' },
+        { label: 'Memory Map', iconFile: 'panel-memory-v2', desc: 'Open the memory map', cmd: 'oric-debug.openMemoryMap' },
+        { label: 'Memory Heatmap', iconFile: 'panel-heatmap-v2', desc: 'Open the memory heatmap', cmd: 'oric-debug.openHeatmap' },
+        { label: 'Memory View', iconFile: 'panel-memory-v2', desc: 'Open the memory view', cmd: 'oric-debug.openMemoryView' },
+        { label: 'Symbol Browser', iconFile: 'panel-symbols-v2', desc: 'Open the symbol browser', cmd: 'oric-debug.openSymbols' }
     ];
     const docsProvider = {
         getChildren: () => docsItems,
         getTreeItem: (it) => {
+            // Separator rows: a header-like label, no icon, no command (click does nothing).
+            if (it.sep) {
+                const t = new vscode.TreeItem(it.label, vscode.TreeItemCollapsibleState.None);
+                t.contextValue = 'oricDocSep';   // no row commands bound to this contextValue
+                return t;
+            }
             const t = new vscode.TreeItem(it.label);
-            t.iconPath = new vscode.ThemeIcon(it.icon, it.color ? new vscode.ThemeColor(it.color) : undefined);
+            t.iconPath = it.iconFile
+                ? panelIcon(it.iconFile)                                          // same SVG as the panel tab
+                : new vscode.ThemeIcon(it.icon, it.color ? new vscode.ThemeColor(it.color) : undefined);
             t.description = it.desc;
             t.tooltip = it.desc;
             t.command = { command: it.cmd, title: it.label, arguments: it.args || [] };
