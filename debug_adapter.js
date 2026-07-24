@@ -4324,8 +4324,11 @@ const handlers = {
                 }
             }
         }
-        // Keep the artifact hash in step with the (possibly rebuilt) target.
+        // Keep the artifact path AND hash in step with the (possibly rebuilt)
+        // target — otherwise a later reloadsymbols compares against the previous
+        // build's hash and misjudges a real rebuild as byte-identical.
         launchArtifactPath = resolvedTarget;
+        launchArtifactHash = launchArtifactPath ? hashFile(launchArtifactPath) : null;
 
         // --- Step 2: Reload symbols ---
         if (config.symbolFile) {
