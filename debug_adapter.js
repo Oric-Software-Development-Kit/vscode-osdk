@@ -792,6 +792,14 @@ let stepInInProgress = false;  // true while a source-level Step Into is single-
 let stepInStartFile = null;    // source file/line where the current Step Into began (compared to detect arrival)
 let stepInStartLine = -1;
 let stepInBudget = 0;          // instruction-step budget so a step into source-less code can't run away
+// Source-level Step Over (F10): single-step to the next source line, stepping OVER JSRs
+// (run to their return) rather than descending. Follows real execution, so it's immune to
+// -O1 basic-block reordering that breaks any "next line = next address" prediction.
+let stepOverInProgress = false;
+let stepOverStartFile = null;
+let stepOverStartLine = -1;
+let stepOverStartSp = -1;       // hw SP at start: sp > start = returned from this fn; sp < start = inside a call
+let stepOverBudget = 0;
 let turboWarpActive = false;   // true while a "Turbo Run" is warping toward a stop
 let turboPrevWarp = false;     // warp state to restore when the turbo run stops
 let scriptLaunched = false;    // true when Oricutron was started via a launch script (detached; kill by port)
@@ -2201,6 +2209,25 @@ async function onStopReply(payload) {
         disarmAddr(addr); // release temp BP asynchronously
     }
 
+    // Source-level Step Over (F10) loop: keep single-stepping (JSRs stepped over above)
+    // until we land on a different source line at the SAME call depth, or we return from
+    // the function we started in. sp > start = returned; sp < start = inside a call we
+    // haven't returned from yet (don't stop there). Runs AFTER the temp-BP cleanup so a
+    // JSR step-over's return BP is released before the next move.
+    if (stepOverInProgress) {
+        const here = regs ? sourceFor(regs.pc) : null;
+        const sp = (regs && regs.sp !== undefined) ? regs.sp : -1;
+        const returned = stepOverStartSp >= 0 && sp >= 0 && sp > stepOverStartSp;
+        const sameDepth = stepOverStartSp < 0 || sp < 0 || sp === stepOverStartSp;
+        const arrived = sameDepth && here && here.file === stepOverStartFile && here.line !== stepOverStartLine;
+        if (!returned && !arrived && stepOverBudget-- > 0) {
+            await stepOverMove();
+            return;
+        }
+        stepOverInProgress = false;
+        // fall through to the normal stop (cycle annotation + stopped event)
+    }
+
     // Cycle-count annotation. Prefer the qOricCpuExtra before/after delta captured
     // around the step (see readCpuExtra + the next/stepOut snapshots): it works on
     // EVERY step path and is attributed to stepStartPc — the line the user stepped
@@ -3347,6 +3374,30 @@ function isBuildArtifact(filePath) {
 // instruction stepping).
 function findNextSourceLineAddr(pc, file, line) {
     return resolverInstance ? resolverInstance.nextLineAddr(pc, file, line) : -1;
+}
+
+// One move of a source-level Step Over: if the instruction at PC is a JSR ($20), step
+// OVER the call by setting a temp breakpoint at the return address (PC+3) and continuing;
+// otherwise single-step. Branches/JMP just move the PC and are handled by the single-step.
+// Reads the opcode live (one round-trip/step) — a step over usually spans few instructions.
+async function stepOverMove() {
+    const pc = (regs && regs.pc !== undefined) ? (regs.pc & 0xFFFF) : -1;
+    let op = -1;
+    if (pc >= 0) { try { const b = await readMem(pc, 1); if (b && b.length) op = b[0]; } catch (e) { /* fall back to single-step */ } }
+    // Continuing from a PC that holds a user breakpoint re-triggers it in this stub, so
+    // don't 'c' over a JSR that is itself breakpointed — single-step into it instead; the
+    // sp-depth check in the loop then keeps stepping until we return, so it's still a step OVER.
+    const canSkip = op === 0x20 && pc >= 0 && !isBreakpointAt(pc);
+    running = true;
+    regs = null;
+    if (canSkip) {                          // JSR abs → run the call, stop at its return
+        const ret = (pc + 3) & 0xFFFF;
+        await armAddr(ret);
+        tempStepBp = ret;
+        gdbWrite('c');
+    } else {
+        gdbWrite('s');
+    }
 }
 
 // Arm an execution breakpoint (Z0) in the stub, ref-counted so that N logical
@@ -5174,27 +5225,21 @@ const handlers = {
         const granularity = (req.arguments && req.arguments.granularity) || 'statement';
         logVerbose('next: granularity=' + granularity);
         const src = regs ? sourceFor(regs.pc) : null;
-        // Source-level step-over: set temp breakpoint on next C line, then continue
+        // Source-level step-over: single-step (stepping OVER JSRs) until the source line
+        // changes or we return from this function. onStopReply drives the loop. This follows
+        // real execution, so it works with -O1 block reordering — unlike the old "set a temp
+        // bp at the predicted next-line address" approach, which overshot to the function
+        // exit when the next source line's code wasn't at the next-higher address.
         if (granularity === 'statement' && src && /\.[cC]$/i.test(src.file)) {
-            const nextAddr = findNextSourceLineAddr(regs.pc, src.file, src.line);
-            if (nextAddr >= 0) {
-                await armAddr(nextAddr); // ref-counted; released on the next stop
-                tempStepBp = nextAddr;
-                // If PC is on a breakpoint, step past it first (onStopReply will 'c')
-                const onBp = isBreakpointAt(regs.pc);
-                regs = null;
-                respond(req);
-                running = true;
-                if (onBp) {
-                    continueAfterStep = true;
-                    gdbWrite('s'); // step past BP; onStopReply issues 'c'
-                } else {
-                    gdbWrite('c');
-                }
-                evt('continued', { threadId: 1, allThreadsContinued: true });
-                return;
-            }
-            // Fallback: no next line found, do normal step-over
+            stepOverInProgress = true;
+            stepOverStartFile = src.file;
+            stepOverStartLine = src.line;
+            stepOverStartSp = (regs && regs.sp !== undefined) ? regs.sp : -1;
+            stepOverBudget = 20000;   // step over can traverse a whole statement (incl. skipped calls)
+            respond(req);
+            await stepOverMove();     // reads regs.pc for the first move, then nulls regs + resumes
+            evt('continued', { threadId: 1, allThreadsContinued: true });
+            return;
         }
         regs = null;
         respond(req);
@@ -6316,6 +6361,29 @@ const handlers = {
     // Map, which only needs the static layout (name + co-located aliases + source).
     symbolTableLite(req) {
         respond(req, { symbols: assembleSymbols() });
+    },
+
+    // Resolve a symbol name to its address, for "Go to: <symbol>" in the disassembly.
+    // Accepts an optional "+/-<hexoffset>" suffix (e.g. "_InputDelete+3"). Exact match
+    // first, then case-insensitive, then ROM symbols. Returns { addr } or { addr: null }.
+    addrForSymbol(req) {
+        let name = String((req.arguments && req.arguments.name) || '').trim();
+        let off = 0;
+        const m = name.match(/^(.*?)\s*([+-])\s*\$?([0-9a-fA-F]+)$/);
+        if (m) { name = m[1].trim(); off = (m[2] === '-' ? -1 : 1) * parseInt(m[3], 16); }
+        let addr;
+        if (name) {
+            if (symbols.has(name)) addr = symbols.get(name);
+            else {
+                const lower = name.toLowerCase();
+                for (const [k, v] of symbols) { if (k.toLowerCase() === lower) { addr = v; break; } }
+            }
+            if (addr === undefined && Array.isArray(romSymbols)) {
+                const lower = name.toLowerCase();
+                for (const s of romSymbols) { if (s.name === name || s.name.toLowerCase() === lower) { addr = s.addr; break; } }
+            }
+        }
+        respond(req, { addr: addr !== undefined ? ((addr + off) & 0xFFFF) : null });
     },
 
     // -- Read all symbols with current values (custom request) ---------
