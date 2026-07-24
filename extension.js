@@ -5869,6 +5869,16 @@ function aiIsPiloting() { return !!bridgeServer && bridgeControl === BRIDGE_CONT
 // (setBridgeControl is module-scope; the emitter lives inside activate()).
 let refreshSnapshotDeco = () => {};
 
+// Flag AI-bot piloting in the emulator window title so the OS window itself shows
+// who's in control. The adapter owns the program-name base (resolved on connect) and
+// just appends/removes the marker, so there's no folder-vs-program-name drift here.
+// No-op without a session; tolerant of an older stub.
+function applyEmulatorTitle() {
+    const s = vscode.debug.activeDebugSession;
+    if (!s || s.type !== 'oric-debug') return;
+    s.customRequest('setEmulatorPiloting', { ai: aiIsPiloting() }).then(() => {}, () => {});
+}
+
 // Flip control ownership + reflect it everywhere (status bar, Screen View OSD, connected clients).
 function setBridgeControl(owner) {
     bridgeControl = (owner === BRIDGE_CONTROL.AI) ? BRIDGE_CONTROL.AI : BRIDGE_CONTROL.HUMAN;
@@ -5876,6 +5886,7 @@ function setBridgeControl(owner) {
     postScreenRunState();
     if (debugControlsProvider) debugControlsProvider.pushState();   // gold-lock / unlock the debug buttons
     refreshSnapshotDeco();                                          // gray / ungray the snapshot rows
+    applyEmulatorTitle();                                          // reflect AI/you piloting in the OS window title
     if (bridgeServer) bridgeServer.broadcast('control', { control: bridgeControl });
 }
 

@@ -3991,6 +3991,26 @@ function handleDap(msg) {
 // then respond to `req` and fire 'initialized'. Shared by launch/attach/relaunch.
 // Returns true on success; on failure returns false WITHOUT responding, so each
 // caller can add its own cleanup + failure message.
+// Base name shown in the emulator window title. Set on connect; the AI-piloting
+// overlay (setEmulatorPiloting) appends to it, so the base lives in one place.
+let emuBaseTitle = 'Oricutron';
+
+// The program name to show in the emulator window title. Prefers the built
+// program's name — the disk/tap basename, which for OSDK is OSDKNAME (e.g. DBGZOO) —
+// else an explicit diskImage, else the project-dir basename. Applied post-connect
+// via qOricTitle, so it works for both launch paths (OSDK script + direct emulatorPath).
+function projectTitle() {
+    const artifact = resolvedTarget || launchArtifactPath || config.diskImage;
+    if (artifact) {
+        const b = path.basename(String(artifact), path.extname(String(artifact)));
+        if (b) return b;
+    }
+    const dir = config.cwd || (config.build && config.build.cwd) || config.workspaceFolder ||
+                (config.symbolFile && path.dirname(config.symbolFile)) || process.cwd();
+    const name = path.basename(String(dir).replace(/[\\/]+$/, ''));
+    return name || 'Oricutron';
+}
+
 async function connectAndHandshake(req) {
     const host = config.host || 'localhost';
     const port = config.port || 6502;
@@ -4015,6 +4035,10 @@ async function connectAndHandshake(req) {
             histBudgetKB = ((config.historyBudgetMB != null ? config.historyBudgetMB : 64) * 1024) | 0;
             histEnabled = histBudgetKB > 0;
             try { await gdbCmd('qOricHistConfig,' + histBudgetKB); } catch (e) { /* old stub: no history */ }
+            // Put the debugged program's name (e.g. DBGZOO) in the emulator window
+            // title/taskbar. No-op on an older stub (qOricTitle unknown).
+            emuBaseTitle = projectTitle();
+            try { await gdbCmd('qOricTitle,' + Buffer.from(emuBaseTitle, 'utf8').toString('hex')); } catch (e) { /* old stub: no title cmd */ }
             respond(req);
             evt('initialized');
             // NOTE: we deliberately do NOT advertise supportsStepBack. VS Code's native
@@ -6125,6 +6149,24 @@ const handlers = {
     async resetCycles(req) {
         const reply = await gdbCmd('qOricResetCycles');
         respond(req, { result: reply === 'OK' ? 'Cycles reset' : 'Failed' });
+    },
+
+    // Set the emulator window title at runtime (qOricTitle) to an explicit string.
+    // Tolerant of an older stub that doesn't know the command.
+    async setEmulatorTitle(req) {
+        const t = (req.arguments && req.arguments.title) || '';
+        try { await gdbCmd('qOricTitle,' + Buffer.from(t, 'utf8').toString('hex')); } catch (e) { /* old stub: no title cmd */ }
+        respond(req, {});
+    },
+
+    // Flag AI-bot piloting in the window title: keeps the program-name base the DA
+    // resolved on connect and just appends/removes the marker, so the base stays
+    // authoritative in one place (no folder-vs-program-name drift with the extension).
+    async setEmulatorPiloting(req) {
+        const ai = !!(req.arguments && req.arguments.ai);
+        const t = ai ? (emuBaseTitle + '  ● AI piloting') : emuBaseTitle;
+        try { await gdbCmd('qOricTitle,' + Buffer.from(t, 'utf8').toString('hex')); } catch (e) { /* old stub: no title cmd */ }
+        respond(req, {});
     },
 
     // -- Snapshots: save / restore / list (custom requests) -----------
