@@ -743,6 +743,9 @@ let srcBps     = new Map();   // file -> [{id, line, source, bindings:[{addr,mod
 // Per-session set of files for which we've already emitted the "no C line info"
 // warning, so a flapping/re-sent setBreakpoints doesn't spam the console.
 let warnedNoCLineInfo = new Set();
+// One-shot-per-PC guard for the symbol/binary mismatch warning (multi-overlay or
+// link-layout bugs where the loaded code doesn't match the symbols at an address).
+let warnedMismatchPCs = new Set();
 let dataBps    = new Map();   // id -> { addr, accessType, gdbType } (plain DAP data breakpoints)
 // Extension-owned WATCHPOINT EVENTS (access-triggered breakpoints with exec-bp parity:
 // module scope, condition, and log/[save]/[stop] actions). The extension owns the list
@@ -977,6 +980,7 @@ function applyActiveModule(id) {
     typeDefs.clear(); varTypes.clear(); localDefs.clear(); enumDefs.clear();
     lineTable = []; zpSymbols = [];
     filesWithLines = new Set();
+    warnedMismatchPCs = new Set();   // new module view → re-check PCs against its symbols
 
     const order = [];
     if (moduleBuckets.has('R')) order.push(moduleBuckets.get('R'));
@@ -1350,6 +1354,7 @@ function loadSymbols(file) {
     lineTable = []; zpSymbols = [];
     filesWithLines = new Set();
     warnedNoCLineInfo = new Set();   // new symbol load → re-allow the -g1 warning per file
+    warnedMismatchPCs = new Set();   // and re-allow the symbol/binary mismatch warning
     typeDefs.clear(); varTypes.clear(); localDefs.clear();
     evalFailCache.clear(); varRefs.clear(); refByKey.clear(); nextVarRef = 100;
 
@@ -2237,6 +2242,11 @@ async function onStopReply(payload) {
     // Guarded so single-module sessions keep a fully synchronous stop path.
     if (moduleNames.size > 0) await checkModuleSwitch();
 
+    // Stopgap: warn if the loaded code at the PC doesn't match the symbols (multi-
+    // overlay / link-layout mismatch). Runs after module resolution so it judges
+    // against the active module's symbols.
+    await checkSymbolBinaryMismatch();
+
     // Sync any by-hand monitor breakpoint edits into VS Code's model.
     await reconcileMonitorBreakpoints();
 
@@ -2540,6 +2550,58 @@ function fmtOp(mode, lo, hi, pc) {
         }
     }
     return '';
+}
+
+// Valid 6502 mnemonics (from the OPS table above) — used to find the instruction
+// mnemonic at the start of an assembly source line.
+const MNEMONICS = new Set(OPS.filter(Boolean).map(s => s.substring(0, 3)));
+
+// Pull the instruction mnemonic from an assembly source line, or null if the line
+// isn't a plain instruction (label-only, directive, scope, macro, comment). Scans
+// tokens and returns the first real 6502 mnemonic: "label lda #0"->LDA, "delete_word"
+// ->null, ".byt 0"->null, "SET_SKIP_POINT(0)"->null. Conservative: null = don't judge.
+function leadingMnemonic(lineText) {
+    const t = String(lineText).split(';')[0].replace(/\t/g, ' ').trim();
+    if (!t) return null;
+    for (const tok of t.split(/[\s(]+/)) {
+        if (!tok) continue;
+        const u = tok.toUpperCase();
+        if (MNEMONICS.has(u)) return u;
+        if (tok[0] === '.' || tok[0] === '*' || tok[0] === '#') return null;  // directive/origin/immediate → not an instruction leader
+    }
+    return null;
+}
+
+// Stopgap for the multi-overlay / link-layout mismatch class (see the Encounter
+// input_utils-vs-bytestream overlap): if the live opcode at the stopped PC doesn't
+// match the instruction the mapped .s source line implies, the symbols don't
+// describe the loaded binary here — warn once (per PC) so wrong labels/lines don't
+// silently mislead. Assembly source only (C lines aren't 6502 mnemonics); any doubt
+// (illegal opcode, non-instruction line, unreadable memory) skips silently.
+async function checkSymbolBinaryMismatch() {
+    try {
+        if (!regs || regs.pc === undefined) return;
+        const pc = regs.pc & 0xFFFF;
+        if (warnedMismatchPCs.has(pc)) return;
+        const src = sourceFor(pc);
+        if (!src || !src.file || !/\.(s|asm)$/i.test(src.file)) return;
+        const lineText = getSourceLine(src.file, src.line);
+        const srcMnem = lineText ? leadingMnemonic(lineText) : null;
+        if (!srcMnem) return;
+        const mem = await readMem(pc, 1);
+        if (!mem || mem.length < 1) return;
+        const entry = OPS[mem[0]];
+        if (!entry) return;                          // illegal opcode → can't judge
+        const liveMnem = entry.substring(0, 3).toUpperCase();
+        if (liveMnem === srcMnem) return;            // matches → symbols fit the code here
+        warnedMismatchPCs.add(pc);
+        const fn = src.file.split(/[\\/]/).pop();
+        evt('output', { category: 'important', output:
+            '⚠ Symbols may not match the loaded binary at $' + pc.toString(16).toUpperCase().padStart(4, '0') +
+            ': the CPU is at a `' + liveMnem + '` instruction, but the mapped source (' + fn + ':' + src.line +
+            ') is `' + String(lineText).replace(/\s+/g, ' ').trim() + '`. Labels and line info around here are ' +
+            'likely wrong (multi-overlay address clash or a link-layout mismatch) — verify against raw bytes.\n' });
+    } catch (e) { /* a diagnostic must never disrupt a stop */ }
 }
 
 // ----------------------------------------------------------------
