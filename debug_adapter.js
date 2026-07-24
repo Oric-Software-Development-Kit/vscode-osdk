@@ -786,6 +786,8 @@ let launchedProcess = null;     // child_process handle if we launched Oricutron
 let sourceLineCache = {};       // filePath -> string[] (lazy-loaded source, 0-based)
 let tempStepBp = -1;           // address of temp breakpoint for source-level stepping (-1 = none)
 let continueAfterStep = false; // true when single-stepping past a BP before continuing (F5)
+let stoppedOnWatch = false;    // true when the last stop was a data-watchpoint ACCESS: continue must
+                               // step off the accessing instruction first, else 'c' re-fires on it (F5 stuck)
 let stepInInProgress = false;  // true while a source-level Step Into is single-stepping toward a new source line (descends into callees)
 let stepInStartFile = null;    // source file/line where the current Step Into began (compared to detect arrival)
 let stepInStartLine = -1;
@@ -2067,6 +2069,7 @@ function stoppingBpAt(pc) {
 
 async function onStopReply(payload) {
     running = false;
+    stoppedOnWatch = false;   // re-evaluated below; set true only if a watch causes this stop
     regs = parseStopRegs(payload);
     // Register tag tracking — BEFORE any early return so internal step loops
     // (source-level step-into, module-watch commits) keep the chain coherent.
@@ -2289,6 +2292,11 @@ async function onStopReply(payload) {
                 return;                     // logged and resumed — no 'stopped' event
             }
         }
+        // Reached here with a watch address = the watch is STOPPING (plain stop watch, a
+        // [stop] tag, or a plain data breakpoint with no event). Mark it so `continue`
+        // steps off the accessing instruction first — otherwise a bare 'c' re-fires on the
+        // same access and F5 appears stuck on the current instruction.
+        stoppedOnWatch = true;
     }
 
     // Logpoints: a source breakpoint with a logMessage prints instead of stopping.
@@ -5123,6 +5131,21 @@ const handlers = {
         // land here). Snapshot the counter unless a step/turbo already did — the next stop
         // then shows how many cycles the run took, attributed to the line we land on.
         if (stepCyclesBefore === null) await snapshotStepStart(true);
+        // A data watchpoint stops ON the instruction that accessed the watched byte(s).
+        // A bare 'c' would re-detect that same access and re-fire immediately (F5 stuck).
+        // Step off it first — the dobp=FALSE 's' step doesn't re-trigger the watch — then
+        // continue via continueAfterStep. F5 thus always advances (and may stop at the next
+        // in-range access, e.g. the high byte of a 2-byte var, which is fine).
+        if (stoppedOnWatch) {
+            stoppedOnWatch = false;
+            continueAfterStep = true;
+            regs = null;
+            respond(req, { allThreadsContinued: true });
+            running = true;
+            gdbWrite('s');
+            evt('continued', { threadId: 1, allThreadsContinued: true });
+            return;
+        }
         // If PC is sitting on a breakpoint, single-step past it first,
         // then continue via the continueAfterStep flag in onStopReply
         if (regs && regs.pc !== undefined) {
