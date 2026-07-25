@@ -2,7 +2,7 @@
     "name": "osdk-debug",
     "displayName": "OSDK",
     "description": "Oric Software Development Kit - 6502/XA assembly highlighting and Oricutron debugging",
-    "version": "0.0.54",
+    "version": "0.0.64",
     "publisher": "dbug",
     "license": "MIT",
     "icon": "images/oric-icon.png",
@@ -30,6 +30,8 @@
     ],
     "activationEvents": [
         "onDebugResolve:oric-debug",
+        "workspaceContains:osdk_config.bat",
+        "workspaceContains:osdk_build.bat",
         "onLanguage:osdk",
         "onWebviewPanel:oricHeatmap",
         "onWebviewPanel:oricScreenView",
@@ -136,34 +138,40 @@
                     "id": "oricDebugControls",
                     "name": "Oric Debug Controls",
                     "type": "webview",
-                    "icon": "images/oric.svg"
+                    "icon": "images/oric.svg",
+                    "when": "!oric-debug.osdkIncompatible"
                 },
                 {
                     "id": "oricCpuRegs",
                     "name": "Oric Registers",
                     "type": "webview",
-                    "icon": "images/oric.svg"
+                    "icon": "images/oric.svg",
+                    "when": "!oric-debug.osdkIncompatible"
                 },
                 {
                     "id": "oricPeripherals",
                     "name": "Oric Peripherals",
                     "type": "webview",
-                    "icon": "images/oric.svg"
+                    "icon": "images/oric.svg",
+                    "when": "!oric-debug.osdkIncompatible"
                 },
                 {
                     "id": "oricBreakpoints",
                     "name": "Oric Breakpoints",
-                    "icon": "images/oric.svg"
+                    "icon": "images/oric.svg",
+                    "when": "!oric-debug.osdkIncompatible"
                 },
                 {
                     "id": "oricSnapshots",
                     "name": "Oric Snapshots",
-                    "icon": "images/oric.svg"
+                    "icon": "images/oric.svg",
+                    "when": "!oric-debug.osdkIncompatible"
                 },
                 {
                     "id": "oricAutomation",
                     "name": "Oric Automation",
-                    "icon": "images/oric.svg"
+                    "icon": "images/oric.svg",
+                    "when": "!oric-debug.osdkIncompatible"
                 },
                 {
                     "id": "oricDocs",
@@ -176,11 +184,34 @@
                     "id": "oricCurrentInstr",
                     "name": "Current Instruction",
                     "type": "webview",
-                    "icon": "images/oric.svg"
+                    "icon": "images/oric.svg",
+                    "when": "!oric-debug.osdkIncompatible"
                 }
             ]
         },
+        "viewsWelcome": [
+            {
+                "view": "workbench.debug.welcome",
+                "contents": "This looks like an Oric / OSDK project.\nOpen the live checklist — it verifies %OSDK%, the OSDK version, the emulator, and your project setup, with ✓/✗ per step:\n[Getting Started](command:oric-debug.openGettingStarted)\nOr jump straight to creating the VS Code files (launch, tasks, settings):\n[Set Up Oric Debugging](command:oric-debug.setupProject)\nThen press F5 to build & debug.",
+                "when": "oric-debug.isOsdkWorkspace"
+            }
+        ],
         "commands": [
+            {
+                "command": "oric-debug.openGettingStarted",
+                "title": "Oric: Getting Started",
+                "icon": "$(rocket)"
+            },
+            {
+                "command": "oric-debug.setupProject",
+                "title": "Oric: Set Up Project for Debugging",
+                "icon": "$(gear)"
+            },
+            {
+                "command": "oric-debug.openTroubleshooting",
+                "title": "Oric: Troubleshooting & Written Guide",
+                "icon": "$(question)"
+            },
             {
                 "command": "oric-debug.bpEnableAll",
                 "title": "Oric: Enable All Breakpoints",

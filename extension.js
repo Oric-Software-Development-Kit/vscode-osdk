@@ -55,6 +55,76 @@ function warnIfStaleExtension(session) {
 // decorations never render. Case folding is applied ONLY on case-insensitive
 // filesystems (Windows, macOS) so Linux — where case matters — stays correct.
 const nodePath = require('path');
+
+// --- OSDK version gate ------------------------------------------------------
+// Oldest OSDK this extension supports. OSDKs at/above this expose a version.txt
+// (major.minor) at their root; older ones have none and are rejected loudly — a
+// missing feature means the debug session would not work, so it's a hard stop.
+const MIN_OSDK_VERSION = '2.0';
+
+// Read <OSDK>/version.txt -> "major.minor" string, or null if absent/unreadable.
+function readOsdkVersion() {
+    const root = process.env.OSDK;
+    if (!root) return null;
+    try {
+        const txt = require('fs').readFileSync(nodePath.join(root, 'version.txt'), 'utf8');
+        return (txt.split(/\r?\n/)[0] || '').trim() || null;
+    } catch (_) { return null; }
+}
+
+// Compare two "major.minor" versions numerically (patch ignored by design — OSDK
+// versions are major.minor only, and "2" must beat "12" the right way). Returns -1/0/1.
+function compareOsdkVersion(a, b) {
+    const pa = String(a).split('.'), pb = String(b).split('.');
+    for (let i = 0; i < 2; i++) {
+        const d = (parseInt(pa[i], 10) || 0) - (parseInt(pb[i], 10) || 0);
+        if (d !== 0) return d < 0 ? -1 : 1;
+    }
+    return 0;
+}
+
+// Validate the installed OSDK against MIN_OSDK_VERSION.
+// -> { ok, version, reason: 'missing' | 'old' | null }. No version.txt = too old
+// (predates the version system), which is exactly today's OSDK until it's stamped.
+function checkOsdkVersion() {
+    if (!process.env.OSDK) return { ok: false, version: null, reason: 'missing' };
+    const v = readOsdkVersion();
+    if (!v) return { ok: false, version: null, reason: 'old' };
+    if (compareOsdkVersion(v, MIN_OSDK_VERSION) < 0) return { ok: false, version: v, reason: 'old' };
+    return { ok: true, version: v, reason: null };
+}
+
+// Loud, MODAL "OSDK missing/too old" notice — modal so it can't be missed (a transient
+// toast is easy to overlook on a large screen). Reused by the launch gate, the
+// session-start safety net, and the status-bar item.
+function showOsdkIncompatibleError(chk) {
+    const msg = (chk.reason === 'missing')
+        ? 'The OSDK environment variable is not set — the Oric SDK does not appear to be ' +
+          'installed/configured. Set %OSDK% to your OSDK folder (and restart VS Code) to debug.'
+        : 'Your OSDK is too old for this extension, which requires OSDK ' + MIN_OSDK_VERSION + ' or newer. ' +
+          (chk.version
+              ? ('The installed OSDK reports version ' + chk.version + '. ')
+              : 'The installed OSDK has no version.txt, so it predates the version system. ') +
+          'Please update your OSDK — debugging is disabled until then.';
+    vscode.window.showErrorMessage(msg, { modal: true });
+}
+
+// Persistent, always-visible red status-bar item while the OSDK is incompatible — a
+// constant indicator (not just a one-shot toast). Clicking it re-shows the details.
+let osdkCompatStatusBar = null;
+function updateOsdkCompatIndicator() {
+    const incompatible = !checkOsdkVersion().ok;
+    // Drive the `when` clauses that hide EVERY Oric debug view (see package.json) so an
+    // incompatible OSDK presents no working-looking debug panels at all — not just a toast.
+    vscode.commands.executeCommand('setContext', 'oric-debug.osdkIncompatible', incompatible);
+    if (!osdkCompatStatusBar) return;   // status bar not created yet (early activation call)
+    if (!incompatible) { osdkCompatStatusBar.hide(); return; }
+    osdkCompatStatusBar.text = '$(error) OSDK incompatible';   // visible label, not tooltip-only
+    osdkCompatStatusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+    osdkCompatStatusBar.show();
+}
+// ----------------------------------------------------------------------------
+
 // The one shared Oric key-id table (also used by the automation runner). Injected into the
 // Oric Screen View webview so the page and the scripts speak identical key ids — one source.
 const { KEYS: ORIC_KEY_TABLE } = require('./mcp/oric-keys.cjs');
@@ -6115,7 +6185,192 @@ async function registerMcpServerFlow(context) {
 // Extension activation
 // ----------------------------------------------------------------
 
+// --- Project setup: scaffold the .vscode debug files for an OSDK project -----
+// Existing OSDK projects normally ship WITHOUT .vscode files, so F5 has nothing to
+// run. This copies bundled templates (templates/*.json) into the project's .vscode/,
+// never clobbering an existing file without asking.
+async function setupOricProject() {
+    const fs = require('fs');
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || !folders.length) {
+        vscode.window.showErrorMessage('Oric: open your OSDK project folder first, then run setup again.');
+        return;
+    }
+    let folder = folders[0];
+    if (folders.length > 1) {
+        const pick = await vscode.window.showWorkspaceFolderPick({ placeHolder: 'Set up which folder for Oric debugging?' });
+        if (!pick) return;
+        folder = pick;
+    }
+    const root = folder.uri.fsPath;
+    const looksOsdk = fs.existsSync(nodePath.join(root, 'osdk_build.bat')) || fs.existsSync(nodePath.join(root, 'osdk_config.bat'));
+    if (!looksOsdk) {
+        const go = await vscode.window.showWarningMessage(
+            'This folder has no osdk_build.bat / osdk_config.bat, so it may not be an OSDK project. Create the .vscode files anyway?',
+            { modal: true }, 'Create anyway');
+        if (go !== 'Create anyway') return;
+    }
+    const tmplDir = nodePath.join(nodePath.dirname(__filename), 'templates');
+    const vscodeDir = nodePath.join(root, '.vscode');
+    try { fs.mkdirSync(vscodeDir, { recursive: true }); } catch (_) { /* exists */ }
+    const summary = [];
+
+    // launch.json + tasks.json are structured files — never clobber without asking.
+    // Written with read+write (NOT copyFileSync: on Windows that preserves the template's
+    // mtime, so the fresh files look older than they are). read+write gives a current mtime.
+    for (const name of ['launch.json', 'tasks.json']) {
+        const dest = nodePath.join(vscodeDir, name);
+        if (fs.existsSync(dest)) {
+            const choice = await vscode.window.showWarningMessage(
+                '.vscode/' + name + ' already exists.', 'Skip', 'Overwrite', 'Open existing');
+            if (choice === 'Open existing') {
+                vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(dest)));
+                summary.push(name + ': kept (opened)');
+                continue;
+            }
+            if (choice !== 'Overwrite') { summary.push(name + ': skipped'); continue; }
+        }
+        try { fs.writeFileSync(dest, fs.readFileSync(nodePath.join(tmplDir, name), 'utf8'), 'utf8'); summary.push(name + ': written'); }
+        catch (e) { summary.push(name + ': FAILED (' + e.message + ')'); }
+    }
+
+    // settings.json is MERGED via the configuration API rather than copied. VS Code (and
+    // this extension's own *.h association) frequently create settings.json already, so a
+    // file-level "already exists → overwrite?" prompt is confusing. We add only keys that
+    // aren't already set, leaving any existing settings untouched.
+    const wsCfg = vscode.workspace.getConfiguration(undefined, folder.uri);
+    const desired = { 'terminal.integrated.defaultProfile.windows': 'Command Prompt' };
+    const addedKeys = [];
+    for (const [key, val] of Object.entries(desired)) {
+        const info = wsCfg.inspect(key);
+        const already = info && (info.workspaceFolderValue !== undefined || info.workspaceValue !== undefined);
+        if (!already) { try { await wsCfg.update(key, val, vscode.ConfigurationTarget.WorkspaceFolder); addedKeys.push(key); } catch (_) {} }
+    }
+    summary.push('settings.json: ' + (addedKeys.length ? ('merged ' + addedKeys.length + ' setting' + (addedKeys.length > 1 ? 's' : '')) : 'already configured'));
+    const launchPath = nodePath.join(vscodeDir, 'launch.json');
+    if (fs.existsSync(launchPath)) {
+        try { vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(launchPath))); } catch (_) {}
+    }
+    const compat = checkOsdkVersion();
+    vscode.window.showInformationMessage(
+        'Oric project setup — ' + summary.join(', ') + '. Review launch.json, then ' +
+        (compat.ok ? 'press F5 to build & debug.'
+                   : 'note your OSDK is still incompatible (see the red status-bar item).'));
+}
+
+// Open the bundled written guide (rendered markdown) — the full reference behind the
+// interactive Getting Started checklist.
+function openTroubleshooting() {
+    const uri = vscode.Uri.file(nodePath.join(nodePath.dirname(__filename), 'TROUBLESHOOTING.md'));
+    vscode.commands.executeCommand('markdown.showPreview', uri).then(undefined,
+        () => vscode.commands.executeCommand('vscode.open', uri));
+}
+
+// --- Getting Started: a LIVE, self-checking setup checklist (webview) --------
+// A static page can't tell you whether %OSDK% is set, the version is new enough, the
+// emulator is present, or the project is configured. This probes those live and shows
+// a ✓/✗ badge per step, with buttons to fix and re-check.
+function gettingStartedStatus() {
+    const fs = require('fs');
+    const osdk = process.env.OSDK || '';
+    const osdkExists = !!osdk && fs.existsSync(osdk);
+    const chk = checkOsdkVersion();
+    const oricutronPath = osdkExists ? nodePath.join(osdk, 'Oricutron', 'Oricutron.exe') : '';
+    const oricutron = !!oricutronPath && fs.existsSync(oricutronPath);
+    const folders = vscode.workspace.workspaceFolders || [];
+    let projectSetUp = false, isOsdkProject = false;
+    for (const f of folders) {
+        const r = f.uri.fsPath;
+        if (fs.existsSync(nodePath.join(r, 'osdk_config.bat')) || fs.existsSync(nodePath.join(r, 'osdk_build.bat'))) isOsdkProject = true;
+        if (fs.existsSync(nodePath.join(r, '.vscode', 'launch.json'))) projectSetUp = true;
+    }
+    const steps = [
+        { title: 'OSDK installed & %OSDK% set', ok: osdkExists,
+          detail: !osdk ? '%OSDK% is not set. Set it to your OSDK folder, then fully restart VS Code (an environment change is not picked up by Reload Window).'
+                : osdkExists ? osdk
+                : '%OSDK% is set but that folder does not exist: ' + osdk },
+        { title: 'OSDK version is recent enough', ok: chk.ok,
+          detail: chk.ok ? ('Version ' + chk.version + ' — meets the required ' + MIN_OSDK_VERSION + '+.')
+                : chk.reason === 'missing' ? 'Complete step 1 first.'
+                : chk.version ? ('Installed ' + chk.version + ', but ' + MIN_OSDK_VERSION + '+ is required. Update your OSDK.')
+                : ('No version.txt — this OSDK predates the version system. Needs ' + MIN_OSDK_VERSION + '+.') },
+        { title: 'Oricutron emulator present', ok: oricutron,
+          detail: oricutron ? oricutronPath : 'Oricutron.exe not found under %OSDK%\\Oricutron\\. Reinstall or update the OSDK.' },
+        { title: 'Project configured (.vscode files)', ok: projectSetUp,
+          detail: projectSetUp ? '.vscode/launch.json is present — press F5 to build & debug.'
+                : isOsdkProject ? 'No .vscode files yet — click “Set Up Project” below.'
+                : 'Open your OSDK project folder first, then click “Set Up Project”.' }
+    ];
+    return { steps, allOk: osdkExists && chk.ok && oricutron && projectSetUp };
+}
+
+function gettingStartedHtml() {
+    const st = gettingStartedStatus();
+    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const rows = st.steps.map((s, i) => {
+        const badge = s.ok ? '<span class="badge ok">&#10003;</span>' : '<span class="badge bad">&#10007;</span>';
+        return '<div class="step">' +
+            '<div class="num">' + (i + 1) + '</div>' + badge +
+            '<div class="body"><div class="title">' + esc(s.title) + '</div><div class="detail">' + esc(s.detail) + '</div></div>' +
+            '</div>';
+    }).join('');
+    const banner = st.allOk
+        ? '<div class="banner ok">&#10003; All set — press F5 to build &amp; debug.</div>'
+        : '<div class="banner todo">Work through the steps marked &#10007; from the top, then Re-check.</div>';
+    return '<!DOCTYPE html><html><head><meta charset="utf-8"><style>' +
+        'body{font-family:var(--vscode-font-family);color:var(--vscode-foreground);padding:14px 18px;}' +
+        'h2{margin:0 0 2px;}p.sub{color:var(--vscode-descriptionForeground,#999);margin:0 0 12px;}' +
+        '.banner{padding:8px 12px;border-radius:6px;margin:10px 0 16px;font-weight:600;}' +
+        '.banner.ok{background:rgba(35,134,54,.18);color:var(--vscode-testing-iconPassed,#89d185);}' +
+        '.banner.todo{background:rgba(191,136,3,.18);color:var(--vscode-statusBarItem-warningForeground,#e2c08d);}' +
+        '.step{display:grid;grid-template-columns:26px 22px 1fr;align-items:start;gap:8px;padding:10px 0;border-bottom:1px solid var(--vscode-widget-border,#333);}' +
+        '.num{width:22px;height:22px;border-radius:50%;background:var(--vscode-badge-background,#4d4d4d);color:var(--vscode-badge-foreground,#fff);display:flex;align-items:center;justify-content:center;font-size:12px;}' +
+        '.badge{font-size:17px;line-height:22px;font-weight:bold;}.badge.ok{color:var(--vscode-testing-iconPassed,#89d185);}.badge.bad{color:var(--vscode-testing-iconFailed,#f14c4c);}' +
+        '.title{font-weight:600;}.detail{color:var(--vscode-descriptionForeground,#999);font-size:.92em;margin-top:2px;word-break:break-word;}' +
+        '.actions{margin-top:18px;display:flex;gap:8px;flex-wrap:wrap;}' +
+        'button{background:var(--vscode-button-background,#0e639c);color:var(--vscode-button-foreground,#fff);border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:inherit;}' +
+        'button:hover{background:var(--vscode-button-hoverBackground,#1177bb);}' +
+        'button.secondary{background:var(--vscode-button-secondaryBackground,#3a3d41);color:var(--vscode-button-secondaryForeground,#ccc);}' +
+        'button.secondary:hover{background:var(--vscode-button-secondaryHoverBackground,#45494e);}' +
+        '</style></head><body>' +
+        '<h2>Oric &mdash; Getting Started</h2><p class="sub">Live checklist &mdash; each step is checked against your machine right now.</p>' +
+        banner + '<div class="steps">' + rows + '</div>' +
+        '<div class="actions">' +
+        '<button data-act="setup">Set Up Project</button>' +
+        '<button class="secondary" data-act="recheck">Re-check</button>' +
+        '<button class="secondary" data-act="guide">Full written guide &amp; troubleshooting</button>' +
+        '</div>' +
+        '<script>const vscode=acquireVsCodeApi();document.body.addEventListener("click",e=>{const b=e.target.closest("button[data-act]");if(b)vscode.postMessage({type:b.dataset.act});});</script>' +
+        '</body></html>';
+}
+
+let gettingStartedPanel = null;
+function openGettingStarted() {
+    if (gettingStartedPanel) {
+        gettingStartedPanel.webview.html = gettingStartedHtml();
+        gettingStartedPanel.reveal();
+        return;
+    }
+    gettingStartedPanel = vscode.window.createWebviewPanel(
+        'oricGettingStarted', 'Oric — Getting Started', vscode.ViewColumn.Active,
+        { enableScripts: true, retainContextWhenHidden: true });
+    gettingStartedPanel.webview.html = gettingStartedHtml();
+    gettingStartedPanel.onDidDispose(() => { gettingStartedPanel = null; });
+    gettingStartedPanel.webview.onDidReceiveMessage(async (msg) => {
+        if (!msg) return;
+        if (msg.type === 'setup') { await setupOricProject(); }
+        else if (msg.type === 'guide') { openTroubleshooting(); return; }
+        // setup / recheck: re-probe and repaint the checklist.
+        if (gettingStartedPanel) gettingStartedPanel.webview.html = gettingStartedHtml();
+    });
+}
+// ----------------------------------------------------------------------------
+
 function activate(context) {
+    // Set the OSDK-compatibility context key as early as possible, so an incompatible
+    // OSDK hides the Oric debug views (their `when` clauses) before they can flash in.
+    updateOsdkCompatIndicator();
+
     // --- Conflict detection: warn if jede.osdk is also installed ---
     const conflicting = vscode.extensions.getExtension('jede.osdk');
     if (conflicting) {
@@ -6173,6 +6428,18 @@ function activate(context) {
         cspell.update('ignoreRegExpList', [...existingPatterns, ...patternsToAdd], vscode.ConfigurationTarget.Global);
     }
 
+    // Flag OSDK workspaces so the Run & Debug welcome (viewsWelcome) can offer the setup
+    // command to new users who have no launch.json yet. Detected by the standard OSDK
+    // build scripts at a folder root (paint/bubble-sort/… all have them).
+    {
+        const fsSync = require('fs');
+        const isOsdk = (vscode.workspace.workspaceFolders || []).some(f => {
+            const r = f.uri.fsPath;
+            return fsSync.existsSync(nodePath.join(r, 'osdk_config.bat')) || fsSync.existsSync(nodePath.join(r, 'osdk_build.bat'));
+        });
+        vscode.commands.executeCommand('setContext', 'oric-debug.isOsdkWorkspace', isOsdk);
+    }
+
     // --- OSDK project detection: also claim .h files in OSDK workspaces ---
     if (vscode.workspace.workspaceFolders) {
         for (const folder of vscode.workspace.workspaceFolders) {
@@ -6200,16 +6467,20 @@ function activate(context) {
                 }
                 // Warn if launch config is missing required fields
                 if (config.request === 'launch') {
+                    // The extension's debug features require OSDK >= MIN_OSDK_VERSION, and
+                    // every launch path depends on the OSDK (launchScript uses the toolchain;
+                    // emulatorPath resolves ${env:OSDK}). So gate ALL launches up front: bail
+                    // loudly if the SDK is missing OR too old (no version.txt = predates the
+                    // version system = too old). Hard stop — a missing feature won't work.
+                    const chk = checkOsdkVersion();
+                    if (!chk.ok) {
+                        showOsdkIncompatibleError(chk);
+                        updateOsdkCompatIndicator();
+                        return undefined;
+                    }
                     if (config.launchScript) {
                         // Script-launch relies on the OSDK toolchain (osdk_execute.bat,
-                        // %OSDK%\Oricutron, libraries). Bail early with a clear message
-                        // if the SDK isn't installed/configured.
-                        if (!process.env.OSDK) {
-                            vscode.window.showErrorMessage(
-                                'The OSDK environment variable is not set — the Oric SDK does not appear to be ' +
-                                'installed/configured. Set %OSDK% to your OSDK folder (and restart VS Code) to debug.');
-                            return undefined;
-                        }
+                        // %OSDK%\Oricutron, libraries); the OSDK version gate above covers it.
                     } else {
                         if (!config.emulatorPath) {
                             vscode.window.showErrorMessage(
@@ -7605,6 +7876,10 @@ function activate(context) {
     // TreeView recolour label/description text, but icon tints via ThemeColor are supported and
     // adapt to light/dark themes — enough to give the panel some colour.
     const docsItems = [
+        { sep: true, label: '— getting started —' },
+        { label: 'Getting Started (live checklist)', icon: 'rocket', color: 'charts.green', desc: 'Checks %OSDK%, version, emulator, project', cmd: 'oric-debug.openGettingStarted' },
+        { label: 'Set up this project for debugging', icon: 'gear', color: 'charts.blue', desc: 'Create .vscode launch/tasks/settings', cmd: 'oric-debug.setupProject' },
+        { label: 'Troubleshooting & written guide', icon: 'question', color: 'charts.orange', desc: 'Install/configure steps & common fixes', cmd: 'oric-debug.openTroubleshooting' },
         { sep: true, label: '— documentation —' },
         { label: 'Extension manual', icon: 'book', color: 'charts.blue', desc: 'This extension’s page & README', cmd: 'oric-debug.openManual' },
         { label: 'XA assembler reference', icon: 'symbol-keyword', color: 'charts.purple', desc: 'Internal quick reference', cmd: 'osdk.xaReference' },
@@ -7643,6 +7918,9 @@ function activate(context) {
     };
     context.subscriptions.push(
         vscode.window.registerTreeDataProvider('oricDocs', docsProvider),
+        vscode.commands.registerCommand('oric-debug.setupProject', setupOricProject),
+        vscode.commands.registerCommand('oric-debug.openGettingStarted', openGettingStarted),
+        vscode.commands.registerCommand('oric-debug.openTroubleshooting', openTroubleshooting),
         // Open the extension's page (README rendered inside VS Code); fall back to a README preview.
         vscode.commands.registerCommand('oric-debug.openManual', async () => {
             try { await vscode.commands.executeCommand('extension.open', 'dbug.osdk-debug'); }
@@ -7882,7 +8160,21 @@ function activate(context) {
     debugControlsProvider = new DebugControlsWebviewProvider();
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider('oricDebugControls', debugControlsProvider),
-        vscode.debug.onDidStartDebugSession(s => { if (s && s.type === 'oric-debug') { oricSessionActive = true; oricWarpOn = false; } debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); bridgeUpdateStatusBar(); }),
+        vscode.debug.onDidStartDebugSession(s => {
+            if (s && s.type === 'oric-debug') {
+                // Safety net: a session RESTORED on window reload bypasses resolveDebugConfiguration,
+                // so the launch-time OSDK gate never ran. If the OSDK is incompatible, tear the
+                // session down immediately (and loudly) so no view ever shows live data from it.
+                if (s.configuration && s.configuration.request === 'launch' && !checkOsdkVersion().ok) {
+                    showOsdkIncompatibleError(checkOsdkVersion());
+                    updateOsdkCompatIndicator();
+                    vscode.debug.stopDebugging(s);
+                    return;
+                }
+                oricSessionActive = true; oricWarpOn = false;
+            }
+            debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); bridgeUpdateStatusBar();
+        }),
         vscode.debug.onDidTerminateDebugSession(() => { oricSessionActive = false; oricWarpOn = false; debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); bridgeUpdateStatusBar(); }),
         vscode.window.registerWebviewViewProvider('oricCpuRegs', regsProvider),
         vscode.window.registerWebviewViewProvider('oricPeripherals', periphProvider),
@@ -8243,6 +8535,15 @@ function activate(context) {
     hoverHelpStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, -100000);
     hoverHelpStatusBar.color = '#e3b341';   // amber accent so the help reads as a hint, not a plain white line
     context.subscriptions.push(hoverHelpStatusBar);
+
+    // OSDK compatibility indicator — a persistent red status-bar item shown whenever the
+    // installed OSDK is missing/too old (see MIN_OSDK_VERSION). Constant + clickable (re-shows
+    // the details) so an incompatible SDK is never silently ignored, even if the toast is missed.
+    osdkCompatStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 92);
+    osdkCompatStatusBar.command = 'oric-debug.showOsdkCompat';
+    context.subscriptions.push(osdkCompatStatusBar);
+    context.subscriptions.push(vscode.commands.registerCommand('oric-debug.showOsdkCompat', () => showOsdkIncompatibleError(checkOsdkVersion())));
+    updateOsdkCompatIndicator();   // reflect at activation, before any launch
 
     stepModeStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 88);
     stepModeStatusBar.command = 'oric-debug.toggleStepMode';
