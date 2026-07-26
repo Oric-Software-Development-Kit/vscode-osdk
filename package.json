@@ -2,7 +2,7 @@
     "name": "osdk-debug",
     "displayName": "OSDK",
     "description": "Oric Software Development Kit - 6502/XA assembly highlighting and Oricutron debugging",
-    "version": "0.0.64",
+    "version": "0.0.71",
     "publisher": "dbug",
     "license": "MIT",
     "icon": "images/oric-icon.png",
@@ -80,6 +80,17 @@
                     "type": "boolean",
                     "default": true,
                     "description": "Tint file-name labels (editor tabs and Explorer) by type: C source (.c) green, headers (.h) teal, assembler (.s/.asm) blue, automation scripts (.js) violet. Colors are the oric.* theme colors (override them in workbench.colorCustomizations)."
+                },
+                "oric-debug.focusOnStop": {
+                    "type": "string",
+                    "enum": ["human", "always", "never"],
+                    "enumDescriptions": [
+                        "Take focus only for stops you caused — never while an AI agent is piloting (recommended)",
+                        "Always take focus when the debugger stops (previous behavior)",
+                        "Never take focus; the source line is still revealed"
+                    ],
+                    "default": "human",
+                    "description": "Whether stopping should pull the VS Code window/editor to the foreground. An AI-driven session stops constantly, so 'human' keeps the machine usable while an agent debugs."
                 }
             }
         },

@@ -5968,6 +5968,16 @@ function bridgeUpdateStatusBar() {
 // so the human's execution/snapshot controls are locked. Single source of truth for
 // the toolbar lock, the snapshot-row graying, and the restore-command gate.
 function aiIsPiloting() { return !!bridgeServer && bridgeControl === BRIDGE_CONTROL.AI; }
+
+// Debug-console output ring, fed by the adapter tracker. Exists so output produced BEFORE a
+// collaborating client attaches (build banner, symbol-load note, early logpoints) is still
+// readable — otherwise a cold-attaching agent can never see them.
+// Entries are STAMPED WITH THE SESSION ID and filtered on read. Do NOT clear this on
+// onDidStartDebugSession: the adapter emits the banner, symbol note, build check and launch
+// lines during initialize/launch, i.e. BEFORE that event fires, so a reset there throws away
+// the current run's most valuable output (the very lines a version check needs).
+let bridgeOutputLog = [];        // [{ sid, text }]
+let bridgeOutputLastSid = null;  // newest session that produced output
 // Set in activate() to refresh the snapshot panel's decorations when control flips
 // (setBridgeControl is module-scope; the emitter lives inside activate()).
 let refreshSnapshotDeco = () => {};
@@ -5993,6 +6003,56 @@ function setBridgeControl(owner) {
     if (bridgeServer) bridgeServer.broadcast('control', { control: bridgeControl });
 }
 
+// Resolve a caller-supplied source file (absolute path, workspace-relative path, or a bare
+// basename) to a real absolute workspace file. Breakpoint binding compares FULL paths, so an
+// unresolved name yields a breakpoint that never binds — better to fail loudly here.
+// -> { ok:true, file } | { ok:false, error, candidates? }
+async function resolveWorkspaceSourceFile(file) {
+    const fs = require('fs');
+    const raw = String(file).replace(/\//g, nodePath.sep);
+    if (nodePath.isAbsolute(raw)) {
+        if (fs.existsSync(raw)) return { ok: true, file: raw };
+        return { ok: false, error: 'file not found: ' + raw };
+    }
+    // Try each workspace folder as a base (handles "code/game_main.c").
+    for (const f of (vscode.workspace.workspaceFolders || [])) {
+        const cand = nodePath.join(f.uri.fsPath, raw);
+        if (fs.existsSync(cand)) return { ok: true, file: cand };
+    }
+    // Fall back to a workspace search by basename (what an agent usually passes).
+    const base = nodePath.basename(raw);
+    let hits = [];
+    try { hits = await vscode.workspace.findFiles('**/' + base, '**/{node_modules,build,BUILD,TMP,.git}/**', 20); } catch (_) {}
+    const paths = hits.map(u => u.fsPath);
+    if (paths.length === 1) return { ok: true, file: paths[0] };
+    if (paths.length > 1) {
+        // Prefer one whose tail matches the requested relative path (e.g. "code/x.c").
+        const tail = raw.toLowerCase();
+        const exact = paths.filter(p => p.toLowerCase().endsWith(nodePath.sep + tail) || p.toLowerCase().endsWith(tail));
+        if (exact.length === 1) return { ok: true, file: exact[0] };
+        return { ok: false, error: 'ambiguous file "' + file + '" — pass a fuller path', candidates: paths.slice(0, 10) };
+    }
+    return { ok: false, error: 'no file matching "' + file + '" in the workspace' };
+}
+
+// Ask the adapter what really happened to a breakpoint (bound/armed), so callers can
+// distinguish acceptance from silent non-arming. Best-effort: never throws.
+async function bpStatusFor(file, line) {
+    const empty = { bound: false, armed: false, modules: [], activeModule: null };
+    const s = vscode.debug.activeDebugSession;
+    if (!s || s.type !== 'oric-debug') return empty;
+    try {
+        // Give VS Code a tick to push the new breakpoint down to the adapter.
+        await new Promise(r => setTimeout(r, 150));
+        const r = await s.customRequest('breakpointStatus', {});
+        const list = (r && r.breakpoints) || [];
+        const norm = (p) => String(p || '').replace(/\//g, '\\').toLowerCase();
+        const hit = list.find(b => b.line === line && (norm(b.file) === norm(file) || nodePath.basename(norm(b.file)) === nodePath.basename(norm(file))));
+        if (!hit) return Object.assign({}, empty, { activeModule: (r && r.activeModule) || null });
+        return { bound: !!hit.bound, armed: !!hit.armed, modules: hit.modules || [], activeModule: (r && r.activeModule) || null };
+    } catch (_) { return empty; }
+}
+
 // The injected surface the bridge server proxies to (everything routes through the live
 // session's customRequest + the extension's already-multiplexed viz).
 function bridgeDeps() {
@@ -6009,24 +6069,104 @@ function bridgeDeps() {
         vizInput: buf => vizSendInput(buf),
         // Breakpoints via VS Code's OWN model so the AI manages the SAME ones shown in the panel
         // (and VS Code re-syncs the adapter). Clears the panel too — not just an adapter-side set.
-        bpList: () => vscode.debug.breakpoints
-            .filter(b => b instanceof vscode.SourceBreakpoint)
-            .map(b => ({ file: b.location.uri.fsPath, line: b.location.range.start.line + 1, condition: b.condition || null, enabled: b.enabled })),
-        bpSet: (file, line, condition) => {
-            if (!file || !line) return { ok: false, error: 'file and line required' };
-            const bp = new vscode.SourceBreakpoint(new vscode.Location(vscode.Uri.file(file), new vscode.Position(line - 1, 0)), true, condition || undefined);
-            vscode.debug.addBreakpoints([bp]);
-            return { ok: true };
+        // enabled = the panel checkbox; bound/armed = what the adapter actually did with it
+        // (an enabled-but-unbound breakpoint never fires — that distinction has to be visible).
+        bpList: async () => {
+            const rows = vscode.debug.breakpoints
+                .filter(b => b instanceof vscode.SourceBreakpoint)
+                .map(b => ({ file: b.location.uri.fsPath, line: b.location.range.start.line + 1, condition: b.condition || null, enabled: b.enabled }));
+            const s = vscode.debug.activeDebugSession;
+            if (!s || s.type !== 'oric-debug') return rows;
+            try {
+                const r = await s.customRequest('breakpointStatus', {});
+                const list = (r && r.breakpoints) || [];
+                const norm = (p) => String(p || '').replace(/\//g, '\\').toLowerCase();
+                for (const row of rows) {
+                    const hit = list.find(b => b.line === row.line && norm(b.file) === norm(row.file));
+                    if (hit) { row.bound = !!hit.bound; row.armed = !!hit.armed; row.modules = hit.modules || []; }
+                    else { row.bound = false; row.armed = false; }
+                }
+            } catch (_) { /* no adapter support → leave the flags absent */ }
+            return rows;
         },
-        bpClearAll: file => {
+        bpSet: async (file, line, condition) => {
+            if (!file || !line) return { ok: false, error: 'file and line required' };
+            // Resolve to a REAL workspace file first. An agent naturally passes a bare
+            // basename ("splash_main.c"); Uri.file() would happily make that "/splash_main.c",
+            // and since breakpoint binding matches FULL paths (resolver samePathLoose), such a
+            // breakpoint silently never binds or fires while still LOOKING fine in the panel.
+            const resolved = await resolveWorkspaceSourceFile(file);
+            if (!resolved.ok) return { ok: false, error: resolved.error, candidates: resolved.candidates };
+            // (file, line) is the IDENTITY of a source breakpoint: setting the same location again
+            // must REPLACE it, not append a twin. Appending is a booby trap — the natural way to add
+            // a condition is to re-set the line, and the leftover unconditional twin then fires and
+            // makes the condition look ignored (it nearly produced a false "conditions regressed"
+            // report). Every other debugger replaces here.
+            const want = resolved.file.replace(/\//g, '\\').toLowerCase();
+            const dupes = vscode.debug.breakpoints.filter(b => b instanceof vscode.SourceBreakpoint
+                && b.location.uri.fsPath.replace(/\//g, '\\').toLowerCase() === want
+                && b.location.range.start.line + 1 === line);
+            const prevConditions = dupes.map(b => b.condition || null);
+            if (dupes.length) vscode.debug.removeBreakpoints(dupes);
+            const bp = new vscode.SourceBreakpoint(new vscode.Location(vscode.Uri.file(resolved.file), new vscode.Position(line - 1, 0)), true, condition || undefined);
+            vscode.debug.addBreakpoints([bp]);
+            // Report what the ADAPTER actually did with it (bound/armed), not just "accepted".
+            const status = await bpStatusFor(resolved.file, line);
+            return { ok: true, file: resolved.file, bound: status.bound, armed: status.armed, modules: status.modules, activeModule: status.activeModule,
+                replaced: dupes.length, prevConditions };
+        },
+        // file → that file's breakpoints; file+line → just that one (so an agent can undo its
+        // own without nuking the human's); neither → everything.
+        bpClearAll: async (file, line) => {
             const all = vscode.debug.breakpoints;
-            const target = file
-                ? all.filter(b => b instanceof vscode.SourceBreakpoint && (b.location.uri.fsPath === file || nodePath.basename(b.location.uri.fsPath) === file))
-                : all;   // no file → remove EVERYTHING (source + function breakpoints)
+            let target;
+            if (file) {
+                const resolved = await resolveWorkspaceSourceFile(file);
+                const want = resolved.ok ? resolved.file : file;
+                target = all.filter(b => b instanceof vscode.SourceBreakpoint
+                    && (b.location.uri.fsPath === want || nodePath.basename(b.location.uri.fsPath) === nodePath.basename(want))
+                    && (!line || b.location.range.start.line + 1 === line));
+            } else {
+                if (line) return { removed: 0, error: 'line given without file' };
+                target = all;   // no file → remove EVERYTHING (source + function breakpoints)
+            }
             vscode.debug.removeBreakpoints(target);
             return { removed: target.length };
         },
+        // "Press F5 for me": start the workspace's own oric-debug launch config, so an agent can
+        // bring up the SHARED session instead of resorting to oric_launch (a separate emulator,
+        // which breaks collaboration). Reuses the one tested launch path.
+        startSession: async (configName) => {
+            const s = vscode.debug.activeDebugSession;
+            if (s && s.type === 'oric-debug') return { ok: true, already: true, session: s.name };
+            // Report the PROVENANCE of the pick: with several oric-debug configs, which one ran
+            // (and why) is behaviourally significant — stopOnAttach decides whether the machine
+            // comes up halted. Gather the choices before launching.
+            const all = [];
+            for (const f of (vscode.workspace.workspaceFolders || [])) {
+                for (const c of (vscode.workspace.getConfiguration('launch', f.uri).get('configurations') || []))
+                    if (c && c.type === 'oric-debug') all.push(c);
+            }
+            const remembered = automationConfigMemento ? automationConfigMemento.get(AUTO_CFG_KEY) : null;
+            const started = await startOricDebugSession(m => vizLog('[BRIDGE] ' + m), configName || undefined);
+            if (!started) return { ok: false, error: 'could not start a session (no oric-debug launch config, or the launch failed — see the Oric output channel)' };
+            const chosen = all.find(c => (c.name || '') === started.name) || null;
+            const why = configName ? 'you asked for it by name'
+                : (all.length === 1 ? 'the only oric-debug config'
+                : (remembered && remembered === started.name ? 'remembered from the last launch' : 'picked from ' + all.length + ' configs'));
+            return { ok: true, session: started.name, why, configCount: all.length,
+                stopOnAttach: chosen ? (chosen.stopOnAttach !== false) : null,
+                available: all.map(c => c.name).filter(Boolean) };
+        },
         getState: () => ({ stopped: oricDebugStopped, userPaused: oricUserPaused, warp: oricWarpOn, module: activeOricModuleId }),
+        // Backlog of console output for the CURRENT session (replayed to a client on attach —
+        // see #12/#20). Filtered by session id so a previous run's lines are never served, while
+        // this run's pre-attach output (banner, symbol note) is preserved.
+        outputLog: () => {
+            const s = vscode.debug.activeDebugSession;
+            const sid = (s && s.type === 'oric-debug') ? s.id : bridgeOutputLastSid;
+            return bridgeOutputLog.filter(e => !sid || e.sid === sid).map(e => e.text);
+        },
         getControl: () => bridgeControl,
         setControl: o => setBridgeControl(o),
         sessionName: () => { const s = vscode.debug.activeDebugSession; return s ? s.name : null; },
@@ -8162,6 +8302,9 @@ function activate(context) {
         vscode.window.registerWebviewViewProvider('oricDebugControls', debugControlsProvider),
         vscode.debug.onDidStartDebugSession(s => {
             if (s && s.type === 'oric-debug') {
+                // NB: deliberately do NOT clear bridgeOutputLog here — this event fires AFTER the
+                // adapter has already printed the banner/symbol note, so clearing would discard
+                // them. Entries are session-stamped and filtered on read instead.
                 // Safety net: a session RESTORED on window reload bypasses resolveDebugConfiguration,
                 // so the launch-time OSDK gate never ran. If the OSDK is incompatible, tear the
                 // session down immediately (and loudly) so no view ever shows live data from it.
@@ -8172,6 +8315,10 @@ function activate(context) {
                     return;
                 }
                 oricSessionActive = true; oricWarpOn = false;
+                // Tell attached clients a NEW session exists. Without this a long-lived client
+                // keeps the `ended` flag from the previous session and reports a live session as
+                // "ended" (DOGFOODING #22).
+                if (bridgeServer) bridgeServer.broadcast('started', { session: s.name, stopped: oricDebugStopped });
             }
             debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); bridgeUpdateStatusBar();
         }),
@@ -8452,9 +8599,15 @@ function activate(context) {
                 const uri = vscode.Uri.file(topFrame.source.path);
                 const line = topFrame.line - 1; // 0-based
                 const doc = await vscode.workspace.openTextDocument(uri);
+                // Focus policy (oric-debug.focusOnStop): an AI-driven session stops constantly,
+                // and taking focus each time yanks the whole VS Code window to the foreground,
+                // making the machine unusable for anything else. Default 'human' = navigate but
+                // NEVER steal focus while the AI is piloting; the line is still revealed.
+                const focusMode = vscode.workspace.getConfiguration('oric-debug').get('focusOnStop') || 'human';
+                const steal = focusMode === 'always' ? true : (focusMode === 'never' ? false : !aiIsPiloting());
                 const editor = await vscode.window.showTextDocument(doc, {
                     preview: true,
-                    preserveFocus: false,
+                    preserveFocus: !steal,
                     viewColumn: vscode.ViewColumn.One
                 });
                 const range = new vscode.Range(line, 0, line, 0);
@@ -8628,6 +8781,25 @@ function activate(context) {
                 let addrBpsRestored = false;   // re-arm persisted address bps once per session
                 return {
                     onDidSendMessage(msg) {
+                        // Debug-console output → the collaboration bridge, so an attached agent can
+                        // read logpoints/trace/symbol notes (oric_get_output). Kept in a ring that
+                        // OUTLIVES attach: in an agent-driven flow the session is created by
+                        // oric_start_session, so load-time output happens before the client is
+                        // listening; bridge.hello replays this backlog.
+                        if (msg.type === 'event' && msg.event === 'output') {
+                            const text = (msg.body && msg.body.output) || '';
+                            if (text) {
+                                // A new session speaking for the first time retires the previous
+                                // run's entries (bounded memory) — ordering-independent, unlike a
+                                // reset tied to onDidStartDebugSession.
+                                if (bridgeOutputLastSid && bridgeOutputLastSid !== session.id)
+                                    bridgeOutputLog = bridgeOutputLog.filter(e => e.sid === session.id);
+                                bridgeOutputLastSid = session.id;
+                                bridgeOutputLog.push({ sid: session.id, text: text.replace(/\n$/, '') });
+                                if (bridgeOutputLog.length > 500) bridgeOutputLog.shift();
+                                if (bridgeServer) bridgeServer.broadcast('output', { text: text.replace(/\n$/, ''), category: (msg.body && msg.body.category) || 'console' });
+                            }
+                        }
                         // Running/stopped state for the line actions (CodeLens + disasm panel).
                         if (msg.type === 'event' && (msg.event === 'stopped' || msg.event === 'continued')) {
                             setOricDebugStopped(msg.event === 'stopped', msg.body && msg.body.reason);

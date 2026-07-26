@@ -93,6 +93,23 @@ SET OSDKCOMP=-O1 -g1
 some lines/locals have no stable home. Rebuild after changing it. (Assembly `.s`
 breakpoints work regardless.)
 
+## A breakpoint says it's armed but didn't fire
+
+**First: try again.** There is a known issue where an armed breakpoint is *occasionally* missed —
+the same breakpoint on the same line fires most times and is skipped now and then (no pattern
+identified yet; under investigation). A miss on one run does not mean the breakpoint or the line
+is wrong, so re-run before changing anything.
+
+If it *never* fires across several runs, the line itself is the suspect:
+- At `-O2`, a `return expr;` or a closing brace may map into merged/elided code. Move the
+  breakpoint to the **last real statement** before it (an assignment, a call) — a statement is
+  always the more reliable target.
+- To catch a function on the way out, use **Step Out** from inside it.
+- Building that translation unit at `-O1` keeps line records closer to the source.
+
+(A breakpoint reporting **NOT BOUND** is a different case entirely — a blank line, comment,
+declaration, or a `.c` file built without `-g1`; the message says which.)
+
 ## The build fails in the terminal
 
 - OSDK builds are Windows batch scripts. If the integrated terminal is PowerShell and

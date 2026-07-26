@@ -269,10 +269,14 @@ class BridgeDapShim extends EventEmitter {
     }
     _onEvent(p) {
         switch (p && p.event) {
-            case 'stopped': this.stopped = true; this.lastStop = p; this._frameId = null; this.emit('stopped', p); break;
-            case 'continued': this.stopped = false; this._frameId = null; this.emit('continued', p); break;
+            // Any of these is proof of a LIVE session, so they clear a stale `ended` left by a
+            // PREVIOUS session (the shim outlives sessions: nothing else reset the flag, so a new
+            // session inherited "ended" and status lied — see DOGFOODING #22).
+            case 'stopped': this.ended = false; this.stopped = true; this.lastStop = p; this._frameId = null; this.emit('stopped', p); break;
+            case 'continued': this.ended = false; this.stopped = false; this._frameId = null; this.emit('continued', p); break;
+            case 'started': this.ended = false; this.stopped = !!(p && p.stopped); this._frameId = null; this.emit('started', p); break;
             case 'signal': this.emit('dap:oricSignal', p); break;
-            case 'output': this.output.push(p.text || ''); break;
+            case 'output': this.output.push(p.text || ''); if (this.output.length > 500) this.output.shift(); break;
             case 'ended': this.ended = true; this.emit('ended', p); break;
             case 'control': this.emit('control', p); break;
             case 'closed': this.ended = true; this.emit('closed', p); break;
@@ -347,6 +351,10 @@ async function attachBridge(opts = {}) {
     await bridge.connect(host || '127.0.0.1', port);
     const hello = await bridge.call('bridge.hello', {});
     const dap = new BridgeDapShim(bridge);
+    // Seed the console buffer with output produced before we attached (symbol-load notes, early
+    // logpoints) — an agent that starts the session itself would otherwise always see nothing.
+    if (hello && Array.isArray(hello.outputBacklog) && hello.outputBacklog.length)
+        dap.output.push(...hello.outputBacklog.slice(-500));
     const state = await bridge.call('bridge.state', {}).catch(() => null);
     if (state) dap.stopped = !!state.stopped;
     const vizShim = new BridgeVizShim(bridge);

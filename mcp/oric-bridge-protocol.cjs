@@ -54,6 +54,9 @@ const OBSERVE_REQUESTS = new Set([
     'readMemory', 'evaluate', 'stackTrace', 'scopes', 'variables', 'threads',
     'getModules', 'oricResolve', 'dataBreakpointInfo', 'source', 'modules', 'loadedSources',
     'exceptionInfo', 'gotoTargets', 'listSnapshots',
+    // Pure lookups: resolve a symbol to an address, and report breakpoint bound/armed state.
+    // Both are reads — an observe-only client must not be blocked on them.
+    'addrForSymbol', 'breakpointStatus', 'symbolTableLite',
 ]);
 function classify(cmd) {
     if (CONTROL_REQUESTS.has(cmd)) return 'control';

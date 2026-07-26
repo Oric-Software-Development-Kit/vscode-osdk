@@ -1220,6 +1220,15 @@ async function checkModuleSwitch(force) {
     }
 }
 
+// Human-readable module label for a bucket id: the module's NAME when known, 'resident' for
+// 'R', '(none)' for null — never a bare internal index (an id like "0" means nothing to a
+// caller when the module is called "Splash").
+function moduleLabel(id) {
+    if (id === 'R') return 'resident';
+    if (id === null || id === undefined) return '(none)';
+    return moduleNames.get(id) || String(id);
+}
+
 // Message for a source breakpoint that failed to bind. Returns the actionable
 // -g1 hint when the cause is a workspace .c file with no line info (project built
 // without -g1), else the generic "No code at this line". Shared by setBreakpoints
@@ -1231,8 +1240,17 @@ function unboundBpMessage(srcPath, norm, emitWarn) {
     const wfRaw = config.workspaceFolder || config.cwd || (config.build && config.build.cwd);
     const wf = wfRaw ? canonPath(wfRaw) : '';
     const underWs = wf && (norm === wf || norm.startsWith(wf + path.sep));
+    // filesWithLines is the ACTIVE view only; a C file belonging to an inactive overlay has
+    // line info that simply isn't composed in right now. Claiming "-g1 missing" for it would be
+    // a false alarm, so check every module bucket before blaming the build.
+    let hasLinesAnywhere = filesWithLines.has(norm);
+    if (!hasLinesAnywhere) {
+        for (const [, b] of moduleBuckets) {
+            if (b.lineTable.some(e => canonPath(e.file) === norm)) { hasLinesAnywhere = true; break; }
+        }
+    }
     if (resolverInstance && /\.c$/i.test(srcPath) && underWs
-        && !filesWithLines.has(norm)) {
+        && !hasLinesAnywhere) {
         msg = 'No source-line info for this C file — rebuild with -g1 '
             + '(set OSDKCOMP=-O1 -g1 in osdk_config.bat) so C breakpoints '
             + 'can bind. Assembly (.s) breakpoints are unaffected.';
@@ -1261,6 +1279,20 @@ async function rearmModuleBreakpoints() {
   return withBpLock(async () => {
     for (const [, arr] of srcBps) {
         for (const bp of arr) {
+            // A breakpoint with NO bindings was never resolved — typically one restored
+            // from a previous session: VS Code re-sends it at session start, before the
+            // symbols (and so fileToModules) exist, and it does not re-send later. Without
+            // re-resolving here it stays dead for the whole session even once its overlay
+            // becomes resident, which is exactly the "saved breakpoints are dead on arrival"
+            // trap (and it contradicted the "binds when its module loads" promise).
+            if (!bp.bindings.length) {
+                const srcPath = (bp.source && bp.source.path) ? bp.source.path : '';
+                const norm = canonPath(srcPath);
+                for (const mod of (fileToModules.get(norm) || ['R'])) {
+                    const snap = resolverInstance ? resolverInstance.addrForLine(srcPath, bp.line, mod) : null;
+                    if (snap) bp.bindings.push({ addr: snap.addr, module: mod, armed: false });
+                }
+            }
             // A source breakpoint has one binding per owning module (shared files
             // span several overlays). Arm the binding whose module is now active or
             // resident; disarm the rest. The bp is verified if ANY binding is armed.
@@ -1338,14 +1370,30 @@ async function revalidateBreakpointsAfterSymbolLoad() {
                     continue;
                 }
 
-                // Bindings resolved — arm the active/resident ones (same rule as
-                // setBreakpoints) and report verified.
+                // Bindings resolved. CARRY OVER the armed state for any address that survived:
+                // armAddr is REF-COUNTED, so arming an already-armed address again pushes its
+                // count to 2 for ONE logical breakpoint — and then a single disarm (a user/agent
+                // clearing it) only drops it to 1, leaving the Z0 live in the emulator. That is a
+                // "cleared" breakpoint that still fires, and it re-registers on the next hit.
+                // (The old code discarded the armed flags with the old binding objects and re-armed
+                // unconditionally, which is precisely how the count drifted.)
+                for (const nb of newBindings) {
+                    const old = bp.bindings.find(b => b.addr === nb.addr && b.module === nb.module);
+                    if (old && old.armed) nb.armed = true;
+                }
                 bp.bindings = newBindings;
                 let anyArmed = false;
                 for (const b of bp.bindings) {
-                    if (b.module === 'R' || b.module === activeModuleId) {
-                        b.armed = await armAddr(b.addr);
-                        if (b.armed) { anyArmed = true; await sendCond(b.addr, bp.condExpr, bp.hitTarget); }
+                    const desired = (b.module === 'R' || b.module === activeModuleId);
+                    if (desired) {
+                        if (!b.armed) {
+                            b.armed = await armAddr(b.addr);
+                            if (b.armed) await sendCond(b.addr, bp.condExpr, bp.hitTarget);
+                        }
+                        if (b.armed) anyArmed = true;
+                    } else if (b.armed) {
+                        await disarmAddr(b.addr);   // module no longer active → release the ref
+                        b.armed = false;
                     }
                 }
                 const dispBind = bp.bindings.find(b => b.module === 'R' || b.module === activeModuleId) || bp.bindings[0];
@@ -1589,9 +1637,24 @@ function loadSymbols(file) {
         let cLines = 0;
         for (const e of lineTable) if (/\.c$/i.test(e.file)) cLines++;
         const nonCLines = lineTable.length - cLines;
+        // lineTable is the COMPOSED view (resident + active module only). In a multi-module
+        // overlay project the C files usually live in the overlays, so "0 .c here" is normal
+        // while no overlay is active — blaming -g1 then is plain wrong (it sent a dogfooding
+        // session hunting a non-existent build problem). Only suggest -g1 when NO module has
+        // any .c line entry; otherwise say where the C lines actually are.
+        let cLinesAnywhere = 0;
+        const cModules = [];
+        for (const [mid, b] of moduleBuckets) {
+            let n = 0;
+            for (const e of b.lineTable) if (/\.c$/i.test(e.file)) n++;
+            if (n > 0) { cLinesAnywhere += n; cModules.push((mid === 'R' ? 'resident' : (moduleNames.get(mid) || mid)) + ':' + n); }
+        }
         const lineNote = cLines > 0
             ? (lineTable.length + ' line entries')
-            : (lineTable.length + ' line entries (0 from .c — rebuild with -g1 to enable C breakpoints; ' + nonCLines + ' from assembly)');
+            : (cLinesAnywhere > 0
+                ? (lineTable.length + ' line entries in the active view (all assembly); ' + cLinesAnywhere +
+                   ' C line entries exist in other modules [' + cModules.join(', ') + '] — C breakpoints bind once that module is resident')
+                : (lineTable.length + ' line entries (0 from .c anywhere — rebuild with -g1 to enable C breakpoints; ' + nonCLines + ' from assembly)'));
         log('Loaded ' + symbols.size + ' symbols, ' + lineNote + ', ' +
             typeDefs.size + ' types, ' + varTypes.size + ' typed vars, ' +
             localDefs.size + ' funcs with locals, ' +
@@ -5605,6 +5668,30 @@ const handlers = {
         const expr = (req.arguments.expression || '').trim();
         let m;
 
+        // Address-of:  &sym  — the ADDRESS, never the bytes stored there. Essential for a code
+        // label (e.g. &_KernelEndText): a .text marker has no meaningful "value", so
+        // dereferencing it just reports whatever opcodes happen to sit at that address.
+        // Accepts the C<->asm underscore variants, like "Go to: <symbol>".
+        if ((m = expr.match(/^&\s*([A-Za-z_][A-Za-z0-9_]*)$/))) {
+            const want = m[1];
+            const lookOne = (n) => {
+                if (symbols.has(n)) return symbols.get(n);
+                const lower = n.toLowerCase();
+                for (const [k, v] of symbols) if (k.toLowerCase() === lower) return v;
+                if (Array.isArray(romSymbols)) for (const s of romSymbols) if (s.name === n || s.name.toLowerCase() === lower) return s.addr;
+                return undefined;
+            };
+            let addr = lookOne(want);
+            if (addr === undefined) addr = lookOne(want[0] === '_' ? want.slice(1) : '_' + want);
+            if (addr === undefined) { respond(req, {}, false, "Unknown symbol: '" + want + "'"); return; }
+            respond(req, {
+                result: '$' + (addr & 0xFFFF).toString(16).toUpperCase().padStart(4, '0') + ' (' + (addr & 0xFFFF) + ')  address of ' + want,
+                variablesReference: 0,
+                memoryReference: '0x' + (addr & 0xFFFF).toString(16)
+            });
+            return;
+        }
+
         // Help:  help  |  ?  |  h
         if (/^(help|\?|h)$/i.test(expr)) {
             respond(req, { result: CONSOLE_HELP, variablesReference: 0 });
@@ -6361,6 +6448,34 @@ const handlers = {
     // Map, which only needs the static layout (name + co-located aliases + source).
     symbolTableLite(req) {
         respond(req, { symbols: assembleSymbols() });
+    },
+
+    // Real bound/armed state of every source breakpoint the adapter holds, so a caller
+    // (the MCP bridge / an agent) can tell "accepted" from "actually armed" instead of
+    // trusting an optimistic message. bound = the line resolved to >=1 address in some
+    // owning module; armed = a Z0 is live in the emulator right now (the binding for the
+    // ACTIVE module — others stay pending until that overlay is resident).
+    breakpointStatus(req) {
+        const out = [];
+        for (const [norm, list] of srcBps) {
+            for (const bp of list) {
+                const bindings = bp.bindings || [];
+                out.push({
+                    file: (bp.source && bp.source.path) || norm,
+                    line: bp.line,
+                    id: bp.id,
+                    bound: bindings.length > 0,
+                    armed: bindings.some(b => b.armed),
+                    // Report module NAMES, not internal bucket ids — "module 0" is meaningless to
+                    // a caller when oric_module already says "Splash". 'R' = resident stays as-is.
+                    modules: bindings.map(b => moduleLabel(b.module)),
+                    addrs: bindings.map(b => b.addr),
+                    condition: bp.condExpr || null,
+                    hitTarget: bp.hitTarget || null,
+                });
+            }
+        }
+        respond(req, { breakpoints: out, activeModule: moduleLabel(activeModuleId) });
     },
 
     // Resolve a symbol name to its address, for "Go to: <symbol>" in the disassembly.

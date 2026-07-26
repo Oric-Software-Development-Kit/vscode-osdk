@@ -112,7 +112,17 @@ async function shutdown() {
     return { shutdown: true };
 }
 
-function requireSession() { if (!session.dap) throw new Error('no session — call oric_launch first'); }
+function requireSession() {
+    if (!session.dap) throw new Error('not connected — call oric_attach (to join the human\'s VS Code session) or oric_launch (standalone emulator) first');
+}
+
+// Is a live oric-debug session actually running on the VS Code side? Attached-but-no-session
+// is a distinct state: the bridge answers, but every read/control call fails NO_SESSION.
+async function bridgeHasSession() {
+    if (!session.attached || !session.bridge) return true;   // standalone: dap implies a session
+    try { const r = await session.bridge.call('bridge.hello', {}); return !!(r && r.hasSession); }
+    catch (_) { return false; }
+}
 
 // Re-send the full watchpoint set (DAP setDataBreakpoints replaces all). Each address
 // is resolved to a dataId via dataBreakpointInfo, then armed with its optional condition.
@@ -140,7 +150,13 @@ async function resendBreakpoints(file) {
 
 // A compact one-line "where are we" summary from the top frame.
 async function whereString() {
-    if (!session.dap.stopped) return session.dap.ended ? 'ended' : 'running';
+    // Never report 'ended' from a cached flag alone: when attached, the shim outlives sessions, so
+    // a previous run's `ended` could describe a perfectly live one. Ask the bridge (#22).
+    if (!session.dap.stopped) {
+        if (!session.dap.ended) return 'running';
+        if (session.attached && await bridgeHasSession()) { session.dap.ended = false; return 'running'; }
+        return 'ended';
+    }
     try {
         const st = await session.dap.request('stackTrace', { threadId: 1, startFrame: 0, levels: 1 });
         const f = st.stackFrames && st.stackFrames[0];
@@ -164,11 +180,12 @@ const CONTROL_TOOLS = new Set([
     'oric_watch_memory', 'oric_clear_watchpoints', 'oric_send_keys', 'oric_press',
     'oric_warp', 'oric_wait_for', 'oric_run_to', 'oric_run_frames', 'oric_wait_module',
     'oric_restore_snapshot', 'oric_save_snapshot',
+    'oric_write_memory',   // mutates machine state — same gate as stepping/breakpoints
 ]);
 
 const TOOLS = {
     oric_launch: {
-        description: 'Build (if stale) and launch Oricutron under the debugger, then connect. `config` mirrors a VS Code oric-debug launch config: { port, emulatorPath|launchScript, diskImage?, symbolFile?, cwd?, gdbBreak?, emulatorArgs?, build? }. IMPORTANT: set `port` to the human base gdb port + 1 so this agent runs its own emulator.',
+        description: 'STANDALONE mode: build (if stale) and launch your OWN Oricutron under the debugger, then connect. `config` mirrors a VS Code oric-debug launch config: { port, emulatorPath|launchScript, diskImage?, symbolFile?, cwd?, gdbBreak?, emulatorArgs?, build? }. PREFER oric_attach when collaborating with a human: this spawns a SEPARATE emulator, so you do NOT share their screen, breakpoints or CPU, and they are left looking at the bare Oricutron window. Ports: each session binds a PAIR (gdb `port` and viz at `port`+1), so offset by +2 per session — with a human on base 6510 (viz 6511) use 6512, then 6514.',
         schema: { type: 'object', properties: { config: { type: 'object' } }, required: ['config'] },
         run: async a => { const r = await launch(a.config || {}); return T('Launched. gdb ' + r.port + ', viz ' + r.vizPort + '. ' + await whereString()); },
     },
@@ -182,8 +199,34 @@ const TOOLS = {
         schema: { type: 'object', properties: { cwd: { type: 'string', description: 'project root holding .oric-bridge.json (default: server cwd)' }, host: { type: 'string' }, port: { type: 'number', description: 'override discovery' } } },
         run: async a => {
             const r = await attach(a || {});
-            return T('Attached to the live VS Code session (' + (r.session || 'oric-debug') + ')' + (r.hasSession ? '' : ' — NOTE: no oric-debug session is active yet; the human should press F5') +
-                '. Control: ' + r.control + ' (you are observe-only until you call oric_request_control). ' + (r.hasSession ? await whereString() : ''));
+            if (!r.hasSession) {
+                // Lead with the blocker: the bridge is up but there is NO debug session, so
+                // every read/control call will fail NO_SESSION until the human starts one.
+                return T('Bridge attached, but THERE IS NO DEBUG SESSION YET — ask the human to press F5 (their "Build & Debug" config), then call oric_status.\n' +
+                    'Until then only oric_screenshot works; oric_pause/oric_read_memory/etc. return NO_SESSION (that is expected, not a broken server).\n' +
+                    'Control: ' + r.control + ' (you are observe-only until you call oric_request_control).');
+            }
+            return T('Attached to the live VS Code session (' + (r.session || 'oric-debug') + ')' +
+                '. Control: ' + r.control + ' (you are observe-only until you call oric_request_control). ' + await whereString());
+        },
+    },
+    oric_start_session: {
+        description: 'Start a debug session in the human\'s VS Code using THEIR launch config — the equivalent of pressing F5 — so the shared collaborative session comes up (screen, breakpoints and CPU all shared). Use this after oric_attach reports "no debug session"; do NOT use oric_launch for that, as it spawns a separate emulator and breaks collaboration. No-op if a session is already running.',
+        schema: { type: 'object', properties: { config: { type: 'string', description: 'optional launch-config name (default: the only/remembered oric-debug config)' } } },
+        run: async a => {
+            if (!session.attached || !session.bridge) throw new Error('not attached — call oric_attach first (oric_start_session drives the human\'s VS Code)');
+            const r = await session.bridge.call('session.start', a && a.config ? { config: a.config } : {});
+            if (!r || r.ok === false) throw new Error((r && r.error) || 'could not start a debug session');
+            // A session now exists — drop any `ended` inherited from a previous one before we
+            // report state, so the result can't contradict itself with "Started … ended" (#22).
+            session.dap.ended = false;
+            if (r.already) return T('A debug session was already running (' + (r.session || 'oric-debug') + '). ' + await whereString());
+            // Name the config AND why it was picked: with several configs the choice is
+            // behaviourally significant (stopOnAttach decides whether the machine comes up halted).
+            const prov = r.why ? ' — ' + r.why + (r.configCount > 1 ? ' of ' + r.configCount + ' (' + (r.available || []).join(', ') + ')' : '') : '';
+            const halt = (r.stopOnAttach === true) ? ' The machine starts HALTED (stopOnAttach), so call oric_continue when ready.'
+                : (r.stopOnAttach === false ? ' The machine starts RUNNING (stopOnAttach: false).' : '');
+            return T('Started "' + (r.session || 'oric-debug') + '"' + prov + '.' + halt + ' ' + await whereString());
         },
     },
     oric_request_control: {
@@ -197,9 +240,18 @@ const TOOLS = {
         run: async () => { const c = await setControl('human'); return T('Control handed back — now: ' + c + '.'); },
     },
     oric_status: {
-        description: 'Current run state: running / stopped (with reason + top frame + source location) / ended.',
+        description: 'Current run state: running / stopped (with reason + top frame + source location) / ended — or "attached, no debug session" when the human has not started the debugger yet.',
         schema: { type: 'object', properties: {} },
-        run: async () => { requireSession(); return T(await whereString()); },
+        run: async () => {
+            requireSession();
+            // Attached-but-no-session is a REAL state, not "running": screenshots work while
+            // every read/control call fails with NO_SESSION. Say so plainly.
+            if (session.attached && !(await bridgeHasSession())) {
+                return T('attached to VS Code, but NO debug session is running — the human must press F5 (or run their "Build & Debug" launch config). ' +
+                    'Until then only oric_screenshot works; reads/stepping return NO_SESSION.');
+            }
+            return T(await whereString());
+        },
     },
     oric_continue:      cmd('continue',        b => ({ threadId: 1 }), 'Resume execution.'),
     oric_pause:         cmd('pause',           () => ({ threadId: 1 }), 'Halt the running emulator.'),
@@ -239,15 +291,38 @@ const TOOLS = {
     },
 
     oric_set_breakpoint: {
-        description: 'Set a source breakpoint at file:line, with an optional native condition expression (e.g. "X == 30" or "e->hp < 0"). Returns whether it bound (verified).',
-        schema: { type: 'object', properties: { file: { type: 'string' }, line: { type: 'number' }, condition: { type: 'string' } }, required: ['file', 'line'] },
+        description: 'Set a source breakpoint at file:line, with an optional native condition expression (e.g. "X == 30" or "e->hp < 0"). `file` may be an absolute path, a workspace-relative path, or a bare basename (resolved against the workspace). Reports the REAL state: bound (line resolved to an address) and armed (live in the emulator now). An overlay module\'s breakpoint stays bound-but-not-armed until that module is resident. KNOWN ISSUE: an ARMED breakpoint is occasionally MISSED (observed ~2 misses in 7 hits on the same line, no known pattern — under investigation). If one does not fire, re-run rather than assuming the breakpoint or the line is wrong; a nearby statement is a useful cross-check. At -O2 a line record for `return expr;` or a closing brace may also sit in merged/elided code, so a real statement is the more reliable choice.',
+        schema: { type: 'object', properties: { file: { type: 'string', description: 'absolute, workspace-relative, or bare filename' }, line: { type: 'number' }, condition: { type: 'string' } }, required: ['file', 'line'] },
         run: async a => {
             requireSession();
             // ATTACHED: go through VS Code's OWN breakpoint model so it lands in the human's panel
             // (and VS Code syncs the adapter) — not the MCP's private set behind VS Code's back.
             if (session.attached) {
-                await session.bridge.call('bp.set', { file: a.file, line: a.line, condition: a.condition || null });
-                return T('Breakpoint ' + a.file + ':' + a.line + (a.condition ? ' if ' + a.condition : '') + ' added to the shared panel (binds when its module is loaded).');
+                const r = await session.bridge.call('bp.set', { file: a.file, line: a.line, condition: a.condition || null });
+                if (r && r.ok === false) {
+                    throw new Error('could not set breakpoint: ' + (r.error || 'unknown') +
+                        (r.candidates && r.candidates.length ? ' (candidates: ' + r.candidates.join(', ') + ')' : ''));
+                }
+                const where = (r && r.file ? r.file : a.file) + ':' + a.line + (a.condition ? ' if ' + a.condition : '');
+                // Setting an existing location REPLACES it (see #18) — say so, and what it was,
+                // so "add a condition by re-setting the line" is never silently ambiguous.
+                let note = '';
+                if (r && r.replaced) {
+                    const prev = (r.prevConditions || []).map(c => c ? 'if ' + c : 'unconditional').join(', ');
+                    note = ' (replaced the existing breakpoint there' + (prev ? ' — was ' + prev : '') + ')';
+                }
+                if (!r || !r.bound) {
+                    return T('Breakpoint ' + where + ' added to the shared panel but NOT BOUND — it will never fire as-is. ' +
+                        'Usual causes: the line has no code (blank/comment/declaration — try a nearby statement), or a .c file built without -g1 (no C line records).' + note);
+                }
+                // Module NAMES (not internal ids) — the adapter now labels them.
+                const mods = (r.modules && r.modules.length) ? r.modules.join(', ') : null;
+                return T('Breakpoint ' + where + ' — bound' + (r.armed
+                    ? ' and ARMED (live)'
+                    : ', not yet armed: it lives in ' + (mods ? 'module ' + mods : 'another module') +
+                      (r.activeModule ? ', but the active module is ' + r.activeModule : '') +
+                      ' — it will arm automatically when that module becomes resident')
+                    + (r.armed && mods ? ' [module: ' + mods + ']' : '') + note);
             }
             if (!session.bpByFile.has(a.file)) session.bpByFile.set(a.file, new Map());
             session.bpByFile.get(a.file).set(a.line, a.condition ? { condition: a.condition } : {});
@@ -257,13 +332,16 @@ const TOOLS = {
         },
     },
     oric_clear_breakpoints: {
-        description: 'Clear breakpoints in one file (pass `file`) or ALL breakpoints (omit it). In collaborative mode this clears the human\'s VS Code Breakpoints panel too, not just this session\'s.',
-        schema: { type: 'object', properties: { file: { type: 'string' } } },
+        description: 'Remove breakpoints: pass `file` AND `line` to remove exactly one (use this to clean up only the ones YOU added), `file` alone for that file, or nothing for ALL. CAUTION in collaborative mode: the list is the human\'s own VS Code panel, so omitting `file` destroys THEIR breakpoints too — prefer file+line.',
+        schema: { type: 'object', properties: { file: { type: 'string', description: 'absolute, workspace-relative, or bare filename' }, line: { type: 'number', description: 'with `file`: remove only this one breakpoint' } } },
         run: async a => {
             requireSession();
             if (session.attached) {
-                const r = await session.bridge.call('bp.clearAll', a.file ? { file: a.file } : {});
-                return T('Cleared ' + (a.file ? a.file : 'ALL breakpoints') + ' from the shared VS Code panel (' + ((r && r.removed) || 0) + ' removed).');
+                const params = a.file ? (a.line ? { file: a.file, line: a.line } : { file: a.file }) : {};
+                const r = await session.bridge.call('bp.clearAll', params);
+                if (r && r.error) throw new Error(r.error);
+                const what = a.file ? (a.file + (a.line ? ':' + a.line : '')) : 'ALL breakpoints';
+                return T('Cleared ' + what + ' from the shared VS Code panel (' + ((r && r.removed) || 0) + ' removed).');
             }
             const files = a.file ? [a.file] : [...session.bpByFile.keys()];
             for (const f of files) { session.bpByFile.set(f, new Map()); await resendBreakpoints(f); session.bpByFile.delete(f); }
@@ -271,13 +349,43 @@ const TOOLS = {
         },
     },
     oric_list_breakpoints: {
-        description: 'List breakpoints. In collaborative mode this is the human\'s VS Code panel (the ones you both see); standalone it\'s the ones this session set.',
+        description: 'List breakpoints with their real state: enabled (panel checkbox), bound (line resolved to an address) and armed (live in the emulator). Only an ARMED breakpoint can fire. In collaborative mode this is the human\'s VS Code panel (the ones you both see); standalone it\'s the ones this session set.',
         schema: { type: 'object', properties: {} },
         run: async () => {
             requireSession();
             if (session.attached) {
                 const r = await session.bridge.call('bp.list', {});
-                const out = (r && r.breakpoints || []).map(b => path.basename(b.file) + ':' + b.line + (b.condition ? '  if ' + b.condition : '') + (b.enabled ? '' : '  (disabled)'));
+                const rows = (r && r.breakpoints) || [];
+                // Disambiguate same-basename entries: a bare basename made two DIFFERENT
+                // breakpoints render identically (that display weakness is what hid #2's root
+                // cause). When a basename repeats, show enough path to tell them apart.
+                // Key on the set of DISTINCT paths per basename — NOT the row count. Counting rows
+                // expanded every breakpoint in a busy file (4 in bytestream.s, 6 in game_utils.s),
+                // which is the common case and needs no disambiguating: the line numbers already
+                // differ and all the rows share one identical path.
+                const seen = new Map();
+                for (const b of rows) {
+                    const k = path.basename(b.file);
+                    if (!seen.has(k)) seen.set(k, new Set());
+                    seen.get(k).add(String(b.file).replace(/\//g, '\\').toLowerCase());
+                }
+                const label = (b) => {
+                    const base = path.basename(b.file);
+                    if ((seen.get(base) || { size: 0 }).size < 2) return base;
+                    const parts = String(b.file).replace(/\//g, '\\').split('\\');
+                    return parts.length > 2 ? parts.slice(-3).join('\\') : b.file;   // enough context to distinguish
+                };
+                const out = rows.map(b => {
+                    const flags = [];
+                    // A DISABLED breakpoint is never sent to the adapter, so it has no binding —
+                    // reporting "NOT BOUND — will never fire" for it reads as broken when its only
+                    // problem is the checkbox. Say the state, don't pass a verdict.
+                    if (!b.enabled) flags.push('disabled (binding not evaluated)');
+                    else if (b.bound === false) flags.push('NOT BOUND — will never fire');
+                    else if (b.armed === false) flags.push('bound, not armed (its module is not resident)');
+                    else if (b.armed) flags.push('armed');
+                    return label(b) + ':' + b.line + (b.condition ? '  if ' + b.condition : '') + (flags.length ? '  [' + flags.join('; ') + ']' : '');
+                });
                 return T(out.length ? out.join('\n') : '(none)');
             }
             const out = [];
@@ -313,6 +421,61 @@ const TOOLS = {
             const bytes = res.data ? Buffer.from(res.data, 'base64') : Buffer.alloc(0);
             const hex = [...bytes].map(b => b.toString(16).padStart(2, '0')).join(' ');
             return T('$' + addrHex + ': ' + (hex || '(no data)'));
+        },
+    },
+    oric_write_memory: {
+        description: 'WRITE bytes to memory — the counterpart to oric_read_memory, for SETTING UP state (e.g. force a bitfield so a screen renders the case you need, instead of playing the game to reach it). `address` accepts a hex address ("$BFE2"/"0xBFE2"/"BFE2") OR a symbol name ("gAchievements", "_gScore+2"). `bytes` is a hex string ("FF" / "FF FF 00" / "ffff00") or an array of byte values. Requires control. Reads the bytes back and reports a mismatch (ROM/unwritable memory silently ignores writes).',
+        schema: { type: 'object', properties: {
+            address: { type: 'string', description: 'hex address, or a symbol name — "gAchievements", "&gAchievements", "_gScore+2" (symbol-relative is safer: addresses shift between builds)' },
+            bytes: { type: ['string', 'array'], items: { type: 'number' }, description: 'hex string ("FF FF") or array of byte values ([255,255])' },
+            count: { type: 'number', description: 'optional sanity check — must equal the number of bytes decoded, else the write is refused' },
+        }, required: ['address', 'bytes'] },
+        run: async a => {
+            requireSession();
+            // Bytes: accept an array of numbers or a hex string (spaces/commas optional).
+            let buf;
+            if (Array.isArray(a.bytes)) buf = Buffer.from(a.bytes.map(n => Number(n) & 0xff));
+            else if (/^\s*\[/.test(String(a.bytes))) {
+                // An array that arrived STRINGIFIED in transit ("[3, 3]") — accept it rather than
+                // failing with a confusing "not valid hex", since the schema advertises arrays.
+                let arr;
+                try { arr = JSON.parse(String(a.bytes)); } catch (_) { arr = null; }
+                if (!Array.isArray(arr) || !arr.length || arr.some(n => !Number.isFinite(Number(n))))
+                    throw new Error('bytes looked like an array but could not be parsed: ' + a.bytes);
+                buf = Buffer.from(arr.map(n => Number(n) & 0xff));
+            } else {
+                const hex = String(a.bytes).trim().replace(/^\$|^0x/i, '').replace(/[\s,]+/g, '').replace(/\$|0x/gi, '');
+                if (!/^[0-9a-fA-F]+$/.test(hex) || hex.length % 2) throw new Error('bytes must be an even-length hex string (e.g. "FF" or "FF FF 00") or an array of byte values');
+                buf = Buffer.from(hex, 'hex');
+            }
+            if (!buf.length) throw new Error('no bytes to write');
+            // Explicit count check: catches a mis-typed hex string writing the wrong span
+            // (e.g. 7 expected but "FFFFFFFFFFFF" decodes to 6) BEFORE it touches memory.
+            if (a.count !== undefined && Number(a.count) !== buf.length)
+                throw new Error('count mismatch: you said ' + a.count + ' byte(s) but `bytes` decodes to ' + buf.length + ' — refusing the write');
+            // Address: hex, or a symbol resolved by the adapter (same resolver as "Go to: symbol",
+            // so "gAchievements" works even though the export names it "_gAchievements").
+            // Accept the address-of form too: "&gAchievements" is how you'd naturally write it
+            // after oric_evaluate "&sym", and symbol-relative beats a literal address because
+            // addresses shift between builds.
+            const rawAddr = String(a.address).trim().replace(/^&\s*/, '');
+            let addrHex;
+            if (/^(\$|0x)?[0-9a-fA-F]{1,4}$/.test(rawAddr)) {
+                addrHex = normAddr(rawAddr);                       // plain address, same rule as oric_read_memory
+            } else {
+                const r = await session.dap.request('addrForSymbol', { name: rawAddr });
+                if (!r || typeof r.addr !== 'number') throw new Error('unknown symbol or bad address: "' + rawAddr + '"');
+                addrHex = (r.addr & 0xffff).toString(16);
+            }
+            await session.dap.request('writeMemory', { memoryReference: addrHex, offset: 0, data: buf.toString('base64') });
+            // Verify: a write into ROM / unmapped space is accepted but does nothing.
+            const back = await session.dap.request('readMemory', { memoryReference: addrHex, offset: 0, count: buf.length });
+            const got = back && back.data ? Buffer.from(back.data, 'base64') : Buffer.alloc(0);
+            const hexOf = (b) => [...b].map(x => x.toString(16).padStart(2, '0')).join(' ');
+            const ok = got.length === buf.length && got.every((v, i) => v === buf[i]);
+            return T('Wrote ' + buf.length + ' byte(s) at $' + addrHex.toUpperCase() + ': ' + hexOf(buf) +
+                (ok ? '  — verified.' : '  — ⚠ READBACK MISMATCH, memory now reads ' + hexOf(got) +
+                 ' (ROM, unmapped, or overwritten by the running program — is the machine stopped?)'));
         },
     },
     oric_evaluate: {

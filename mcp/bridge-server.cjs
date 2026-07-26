@@ -42,7 +42,10 @@ function createBridgeServer(deps) {
         const { id, method, params } = msg;
         try {
             if (method === 'bridge.hello') {
-                return reply(sock, id, { ok: true, control: deps.getControl(), session: deps.sessionName(), hasSession: deps.hasSession() });
+                // Include the console-output backlog so a client that attaches AFTER the session
+                // started (or that started it itself) still sees earlier output (#12).
+                return reply(sock, id, { ok: true, control: deps.getControl(), session: deps.sessionName(), hasSession: deps.hasSession(),
+                    outputBacklog: deps.outputLog ? deps.outputLog() : [] });
             }
             if (method === 'bridge.state' || method === 'state') {
                 return reply(sock, id, Object.assign({ control: deps.getControl() }, deps.getState()));
@@ -57,11 +60,20 @@ function createBridgeServer(deps) {
             }
             // Breakpoints as VS Code OWNS them (the panel) — so the AI manages the SAME breakpoints
             // the human sees, and the panel + adapter stay in sync (unlike raw setBreakpoints).
-            if (method === 'bp.list') return reply(sock, id, { breakpoints: deps.bpList ? deps.bpList() : [] });
+            // Start the human's own launch config (the "press F5 for me" affordance). Not
+            // control-gated: it CREATES a session rather than driving an existing one, and an
+            // agent that cannot start one is stuck (see DOGFOODING #5).
+            if (method === 'session.start') {
+                if (!deps.startSession) return replyErr(sock, id, -32601, 'session.start not supported by this extension version');
+                return reply(sock, id, await deps.startSession((params || {}).config));
+            }
+            // bpList/bpSet/bpClearAll may be async (workspace file resolution + adapter
+            // bound/armed lookup), so await them.
+            if (method === 'bp.list') return reply(sock, id, { breakpoints: deps.bpList ? await deps.bpList() : [] });
             if (method === 'bp.set' || method === 'bp.clearAll') {
                 if (deps.getControl() !== CONTROL.AI) return replyErr(sock, id, 1, ERR_NO_CONTROL + ": the human holds control (can't change breakpoints)");
-                if (method === 'bp.set') { const r = deps.bpSet ? deps.bpSet((params || {}).file, (params || {}).line, (params || {}).condition) : { ok: false }; return reply(sock, id, r); }
-                const r = deps.bpClearAll ? deps.bpClearAll((params || {}).file) : { removed: 0 }; return reply(sock, id, r);
+                if (method === 'bp.set') { const r = deps.bpSet ? await deps.bpSet((params || {}).file, (params || {}).line, (params || {}).condition) : { ok: false }; return reply(sock, id, r); }
+                const r = deps.bpClearAll ? await deps.bpClearAll((params || {}).file, (params || {}).line) : { removed: 0 }; return reply(sock, id, r);
             }
             if (method === 'viz.frame') return reply(sock, id, { frame: deps.vizFrame() });
             if (method === 'viz.screen') {
