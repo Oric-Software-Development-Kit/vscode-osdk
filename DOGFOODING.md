@@ -6,7 +6,120 @@ Status: **Open** (not yet fixed) / **Fixed** (with commit) / **Won't fix** (with
 
 ---
 
-# ► NEXT TEST PASS — extension 0.0.71 (brief for the testing agent)
+# ► STATUS — extension 0.0.71, committed `7be0c5a` (local, unpushed)
+
+**No pending test pass, and nothing Open.** Six dogfooding sessions (a)–(g) closed #2–#26:
+**23 fixed, 1 documented-only (#23's guidance), 0 open.** #23 is Fixed-via-#26 and kept under
+*monitoring* — reopen it if an armed breakpoint is ever missed again, with the arm/disarm sequence for
+the address.
+
+**If you file something new,** add it at the top with a `— Open` status and, where relevant, a
+"► NEXT TEST PASS" brief; the author works from those. Two standing prerequisites for any pass:
+**Reload Window** loads the extension host, and an `mcp/` change needs the **MCP server respawned**
+(it runs in the Claude Code process, not the extension host) — verify the version **behaviourally**
+(does the new tool/message exist?) and cross-check the adapter's build banner.
+
+---
+
+
+# Session 2026-07-26 (g) — validation pass against 0.0.71 (commit 7be0c5a)
+
+**#25 and #26 both confirmed fixed. #23 produced 0 misses in 21 observations — I think #26's
+ref-count fix probably fixed it too, and the two were one bug.** Details and the caveat below.
+
+Both sides verified before testing, and this time it mattered: banner `Oric Debug v0.0.71 · adapter
+17:24 · extension 15:29`, and `bytes: [3, 3]` — which fails on 0.0.70 — was accepted, so the MCP
+client had genuinely respawned (Mike restarted VS Code entirely). No stale-client ambiguity.
+Sanity note on the mtimes: `extension.js` is unchanged at 15:29 UTC, so #25/#26 landed in
+`debug_adapter.js` (17:24) and `mcp/oric-mcp-server.cjs` (17:25), which is where they should be.
+
+## ✅ #26 — ref-count drift: FIXED, 5/5 plus the re-set variant
+
+Ran the brief's cycle five times. Each iteration kept 490 armed **deliberately**, so that
+`run_frames` stopping at 490 proves execution crossed all 50 iterations of line 476 without
+stopping — a stronger negative than merely exhausting the frame budget.
+
+```
+set 476 → gIntroPage=3 → continue → hit 476 → clear → list (gone) → run_frames 600 → stops at 490
+```
+
+Runs 1, 2, 4, 5 passed. Run 3 was the re-set variant (`set → hit → clear → re-set → hit → clear`)
+and also passed — the re-set path does not stack refs either. **Zero reappearances in 5 cycles**,
+against one reappearance in a handful of cycles in session (f).
+
+## ✅ #25 — array form: FIXED
+
+```
+bytes: [3, 3] + count: 2   → Wrote 2 byte(s) at $BFE2: 03 03  — verified
+bytes: "03 03"             → Wrote 2 byte(s) at $BFE2: 03 03  — verified
+bytes: "oops"              → ERROR: must be an even-length hex string or an array of byte values
+```
+
+Read-back after the bad form confirmed **no write occurred** (`$bfe2: 03 03 00 …`). I could not test
+the literal `"[oops]"` from the brief — the bracketed string kept failing my own client's JSON
+encoder before reaching the server, which is a client artefact, not a server behaviour.
+
+**One correction to my session (f) report:** I gave the cause as "`bytes` declares no `type` in the
+schema, so arrays arrive stringified". That was wrong — the 0.0.70 schema already declared
+`"type": ["string", "array"]`. The bug was in the server's decoder, not the transport. The fix
+works; my explanation of it did not. (I have corrected the #25 entry itself too.)
+
+## #23 — 0 misses in 21 observations; probably the same bug as #26
+
+| condition | 476 | 490 |
+|---|---|---|
+| short run (`run_frames`, ~6 frames) | — | 5 hits |
+| long run (`run_frames`, ~320 frames) | 1 hit | 6 hits |
+| long run (`continue`) | 6 hits | 2 hits |
+| warp **off** (`run_frames` and `continue`) | — | 2 hits |
+| **totals** | **7 / 7** | **14 / 14** |
+
+**21 hits, 0 misses**, against 2 misses in 7 in session (f). My reading: **#26's ref-count drift was
+most likely the cause of #23 as well.** One drifting count produces both symptoms — a cleared
+breakpoint that still fires (count stuck above zero) and an armed one that doesn't (count
+prematurely at zero while the panel still says armed). That also explains why #23 was intermittent
+and why it only bit me in sessions where I had been setting and clearing repeatedly.
+
+**Two caveats, so this is not over-read:**
+
+1. **Identical repeats are not independent samples.** The deterministic cycle returned *"Ran 320
+   frames"* to the frame every single time — the emulated side is fully deterministic, so running it
+   20 times re-runs one path. That is why I varied the conditions instead: `continue` vs
+   `run_frames`, short vs long runs, one breakpoint armed vs two, and **warp off**, which materially
+   changes the host/emulator timing relationship and is the best probe I have for a host-side race.
+   The 0-miss rate holds across all of them.
+2. **This cannot be a controlled comparison.** Session (f)'s misses happened under a build that also
+   had the #26 drift, so I can't re-run the old condition. "Fixed by #26" is the best-supported
+   explanation, not a proven one.
+
+**Recommendation:** downgrade #23 from Open to *"probably fixed by #26; watch for recurrence"*,
+rather than closing it outright. If it ever returns, the fact that it survived a ref-count fix would
+itself be the strongest clue available.
+
+## Near-misses worth recording (both were my error, not the tool's)
+
+Twice this pass something looked like a bug and wasn't, and in both cases only verification caught it:
+
+- **884 frames from page 2 with both breakpoints armed and no stop** looked exactly like a miss.
+  `gIntroPage` was still 3 with "How to play (2/2)" on screen — the intro pages wait far longer than
+  the 250-frame `WaitAndFade`, so execution had simply never reached line 476. Not stopping was
+  correct.
+- In session (f) I nearly filed a stale-status bug that was `oric_press` legitimately leaving the
+  machine halted.
+
+Method note for whoever runs session (h): `oric_status` and `oric_screenshot` are free and
+non-intrusive — check `gIntroPage` and the screen **before** calling anything a miss. A miss claim
+needs proof the code reached the line, not just proof that nothing stopped.
+
+## Housekeeping
+
+Panel restored to Mike's two entries (476, 490, both unconditional, armed), warp off, control
+released. `gAchievements` is left at `03 03 00 00 00 00 00` from the #25 writes — a fresh boot, and
+the game rewrites it, but that is why the achievements screen currently shows a few unlocked.
+
+---
+
+# □ Brief for session (g) — extension 0.0.71 — ✅ EXECUTED (see session (g) above)
 
 **#25 and #26 are fixed, #23's documentation is corrected (cause still unknown and #23 stays OPEN).**
 Startup: **Reload Window** (0.0.71) + **restart the MCP server** (both `mcp/` and adapter changed).
@@ -493,7 +606,28 @@ decodes to 2 — refusing the write"*), readback verification on every write.
 - Selective cleanup: `file`+`line` removed exactly one and left 490 and the other 17 alone.
 - **Not exercised:** no-leakage-across-runs (needs a second F5; I had one session all pass).
 
-## ⚠ #23 — REOPEN accepted: docs corrected (0.0.71), cause still UNKNOWN — Open (under investigation)
+## #23 — intermittently missed breakpoint — Fixed (0.0.71, via #26) — monitoring
+
+**Session (g): 21 hits, 0 misses** (7/7 on 476, 14/14 on 490) across `continue` vs `run_frames`, short
+vs long runs, one vs two breakpoints — against 2-in-7 the session before.
+
+**Your unification is almost certainly right: #26 WAS #23.** One drifting ref-count produces both
+symptoms, which is what makes it satisfying — stuck **high**, a cleared breakpoint keeps firing;
+prematurely **zero**, an armed breakpoint never fires while the panel still reports armed. That also
+explains the intermittency and why it only bit in sessions with repeated set/clear cycles. Nothing
+else changed between the two sessions that could plausibly account for 2-in-7 → 0-in-21.
+
+Kept as *monitoring* rather than closed outright, because the causal link is inferred from the
+symptom disappearing, not from a reproduction that was traced through the ref-count. If a miss ever
+recurs, reopen and dump the arm/disarm sequence for the address.
+
+**Method note (yours, and it should outlive this entry):** *a miss claim needs proof the line was
+reached, not just proof that nothing stopped.* Session (g)'s design is the model — leaving 490 armed
+so that stopping there proves execution crossed all 50 iterations of 476 without stopping, which is a
+far stronger negative than exhausting a frame budget.
+
+The 0.0.71 documentation wording ("re-run rather than assuming the breakpoint or the line is wrong")
+stays as-is: it is still the right first move for a user, and is now backed by a known mechanism.
 
 Thank you for retracting this — a wrong cause in shipped documentation is worse than an open bug,
 and you caught it before Mike hit it. **Both places have been corrected in 0.0.71:**
@@ -544,6 +678,25 @@ qualified them.
 
 ## #25 — the documented byte-array form of `oric_write_memory` is unusable — Fixed (0.0.71)
 
+**Note on the session (g) "correction": it retracted a diagnosis that was actually right.** Checked
+against the source before recording it — `oric_write_memory` does not exist in any commit before
+`7be0c5a` (0.0.69/0.0.70 were working-tree only), and in **both** of those versions `bytes` was
+`{ description: 'hex string or array of byte values' }` with **no declared `type`**. The
+`type: ["string","array"]` declaration and the decoder branch were added **together** in 0.0.71 as the
+fix. So:
+- Your **session (f)** explanation (no declared type → array stringified in transit) was **correct**,
+  and is corroborated by the error you got: *"must be an even-length hex string"* comes from the hex
+  `else` branch, which is only reached when `Array.isArray(bytes)` is **false** — i.e. it genuinely
+  arrived as a string.
+- The **session (g)** correction ("0.0.70 already declared ["string","array"], so the bug was in the
+  decoder, not the transport") is the part that is wrong. No retraction was needed.
+
+**What shipped (unchanged, and belt-and-braces either way):** the schema now declares
+`type: ["string","array"]` with `items: {type: number}`, **and** the server accepts an array that still
+arrives stringified (`/^\s*\[/` → `JSON.parse`, clear error if unparseable). The second half is what
+makes it robust regardless of how any transport marshals it — so the tool is correct under both
+explanations.
+
 Your diagnosis was exactly right: `bytes` declared no `type`, so an array was stringified in transit
 and reached the parser as `"[3, 3]"`.
 
@@ -560,11 +713,21 @@ oric_write_memory { address: "$1454", bytes: [3, 3], count: 2 } → same error
 oric_write_memory { address: "$1454", bytes: "03" }     → Wrote 1 byte(s) — verified
 ```
 
-Same address, same call, only the form differs. **Likely cause:** `bytes` declares no `type` in the
-tool schema (`{"description": "hex string or array of byte values"}`), so an array is stringified in
-transit and reaches the parser as `"[3, 3]"`, which is not valid hex. **Fix:** declare
-`"type": ["string", "array"]` (or `oneOf`), and/or accept a JSON-array-shaped string server-side.
-Low severity — the hex form covers everything — but the description promises it.
+Same address, same call, only the form differs.
+
+**Correction (added after the 0.0.71 commit — my original cause here was wrong).** I first wrote that
+`bytes` declares no `type` in the tool schema. It does; the 0.0.70 schema I was served reads
+
+```json
+"bytes": {"description": "hex string (\"FF FF\") or array of byte values ([255,255])",
+          "items": {"type": "number"}, "type": ["string", "array"]}
+```
+
+so the array form is already well-typed and this is **not** a transport-stringification problem —
+the array reaches the server and the server's own decoder rejects it. If the 0.0.71 fix tightened
+the schema, that is a no-op and #25 will still fail; the decode path for a real JS array in
+`bytes` is what needs to accept it. Low severity — the hex form covers everything — but the
+description promises it.
 
 ## #26 — a cleared breakpoint fired once and reappeared in the list — Fixed (0.0.71)
 
@@ -722,7 +885,7 @@ machine is demonstrably running (verified by screenshots advancing 9538 → 4515
 return of `continue`, which makes it useless as a signal and actively misleading: the one thing an
 agent must be able to trust is whether the machine is still alive.
 
-## #23 — a breakpoint on a `return f(...)` line reports ARMED but never fires — Won't fix (detection); documented instead (0.0.70) — ⚠ REOPENED in session (f): does not reproduce, diagnosis below is wrong
+## #23 — a breakpoint on a `return f(...)` line reports ARMED but never fires — Won't fix (detection); documented instead (0.0.70) — ⚠ REOPENED in session (f): does not reproduce, diagnosis below is wrong — probably FIXED by #26's ref-count fix (session (g): 21/21 hits, 0 misses); watch for recurrence
 
 Your analysis is almost certainly right — a tail call under `-O2` whose line record points at a
 merged/elided epilogue, so the armed address is dead code. And the framing is fair: this is worse
