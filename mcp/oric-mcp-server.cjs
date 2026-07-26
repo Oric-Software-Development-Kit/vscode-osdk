@@ -27,6 +27,18 @@ const path = require('path');
 const { DapClient, VizClient, screenToPng, VIZ_PORT_OFFSET, ADAPTER, setLog, makeClientOps, attachBridge } = require('./oric-debug-client.cjs');
 const { makeApi } = require('./playthrough-core.cjs');
 
+// Identity of THIS server process, captured at spawn. The MCP server runs in the client's process
+// (Claude Code), not the extension host, and its tool list is read once at startup — so after the
+// extension is updated a still-running client keeps serving the OLD tools. Nothing the extension
+// does can refresh it. Reporting the version + this file's mtime makes that skew a one-call check
+// (compare against the adapter's own build banner) instead of something to infer behaviourally.
+const SERVER_ID = (() => {
+    let ver = '?', built = '?';
+    try { ver = require('../package.json').version || '?'; } catch (_) {}
+    try { built = require('fs').statSync(__filename).mtime.toISOString().slice(0, 16).replace('T', ' '); } catch (_) {}
+    return 'MCP server v' + ver + ' (' + built + ')';
+})();
+
 // Everything that is not JSON-RPC MUST go to stderr — stdout is the MCP channel.
 function log(...a) { process.stderr.write('[oric-mcp] ' + a.join(' ') + '\n'); }
 setLog(m => log(m));   // route the shared client log through ours
@@ -202,11 +214,11 @@ const TOOLS = {
             if (!r.hasSession) {
                 // Lead with the blocker: the bridge is up but there is NO debug session, so
                 // every read/control call will fail NO_SESSION until the human starts one.
-                return T('Bridge attached, but THERE IS NO DEBUG SESSION YET — ask the human to press F5 (their "Build & Debug" config), then call oric_status.\n' +
+                return T(SERVER_ID + '. Bridge attached, but THERE IS NO DEBUG SESSION YET — ask the human to press F5 (their "Build & Debug" config), then call oric_status.\n' +
                     'Until then only oric_screenshot works; oric_pause/oric_read_memory/etc. return NO_SESSION (that is expected, not a broken server).\n' +
                     'Control: ' + r.control + ' (you are observe-only until you call oric_request_control).');
             }
-            return T('Attached to the live VS Code session (' + (r.session || 'oric-debug') + ')' +
+            return T(SERVER_ID + '. Attached to the live VS Code session (' + (r.session || 'oric-debug') + ')' +
                 '. Control: ' + r.control + ' (you are observe-only until you call oric_request_control). ' + await whereString());
         },
     },
@@ -250,7 +262,7 @@ const TOOLS = {
                 return T('attached to VS Code, but NO debug session is running — the human must press F5 (or run their "Build & Debug" launch config). ' +
                     'Until then only oric_screenshot works; reads/stepping return NO_SESSION.');
             }
-            return T(await whereString());
+            return T(await whereString() + '   [' + SERVER_ID + ']');
         },
     },
     oric_continue:      cmd('continue',        b => ({ threadId: 1 }), 'Resume execution.'),
