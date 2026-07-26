@@ -1507,7 +1507,7 @@ function postScreenConn(connected) {
 // OSD badge. `active` = an oric-debug session is live; the badge is hidden otherwise.
 function postScreenRunState() {
     if (screenPanel) screenPanel.webview.postMessage({
-        type: 'runstate', active: oricSessionActive,
+        type: 'runstate', active: sessionIsActive(),
         // "stopped" = the machine is GENUINELY halted for inspection. During automation the
         // script cycles stop/continue rapidly (the game is animating), so the pause indicator
         // must NOT track that churn — only a real USER pause counts. Outside automation it's
@@ -3478,6 +3478,20 @@ let activeOricModuleId = null; // active overlay module id (for the breakpoint t
 let activeOricModuleName = null; // active overlay module NAME (for screenshot filenames)
 let debugControlsProvider = null; // Oric Debug Controls webview view (button toolbar in the Run & Debug sidebar)
 let oricSessionActive = false; // true between an oric-debug session's start and terminate (activeDebugSession races on terminate)
+let oricEndedSessionId = null; // id of the session that just terminated, so it can't count as "live"
+
+// Is an oric-debug session running RIGHT NOW? Derived from the tracked flag OR the live API, so a
+// desync can't leave the UI dead: the flag is set in exactly one place (onDidStartDebugSession), and
+// anything that skips it — an early return in that handler, a missed or late event, an extension host
+// that reloaded mid-session — used to leave every control greyed for a session that was demonstrably
+// running (Screen View live, game playable, only "Start" enabled). activeDebugSession ALONE is also
+// wrong: it's still set while onDidTerminateDebugSession runs, which would keep Stop looking enabled
+// after the end — hence excluding the session that just terminated.
+function sessionIsActive() {
+    if (oricSessionActive) return true;
+    const s = vscode.debug.activeDebugSession;
+    return !!(s && s.type === 'oric-debug' && s.id !== oricEndedSessionId);
+}
 let oricWarpOn = false;       // current warp/turbo speed state (mirrors the toggleWarp toggle) — for the Screen View OSD
 let dimLiveViews = null;      // set in activate: greys the live-data views (regs/peripherals/…) when not stopped
 let refreshAllViews = null;   // set in activate = refreshAll; lets module-level code repaint the panels
@@ -4053,7 +4067,7 @@ class DebugControlsWebviewProvider {
         if (!this._view) return;
         // Use the tracked flag, not activeDebugSession — the latter can still be set
         // during onDidTerminateDebugSession, leaving Stop looking enabled after the end.
-        this._view.webview.postMessage({ type: 'state', active: oricSessionActive, stopped: oricDebugStopped, canRewind: replayCanRewind, canForward: replayCanForward, warp: oricWarpOn,
+        this._view.webview.postMessage({ type: 'state', active: sessionIsActive(), stopped: oricDebugStopped, canRewind: replayCanRewind, canForward: replayCanForward, warp: oricWarpOn,
             aiPiloting: !!bridgeServer && bridgeControl === BRIDGE_CONTROL.AI });
     }
 }
@@ -5947,7 +5961,7 @@ function bridgeUpdateStatusBar() {
     if (!bridgeStatusBar) return;
     // Visible whenever the bridge is up OR a session is active, so you can always SEE the state
     // (off / you-pilot / AI-pilots) — the label itself carries it (no tooltip needed).
-    if (!bridgeServer && !oricSessionActive) { bridgeStatusBar.hide(); return; }
+    if (!bridgeServer && !sessionIsActive()) { bridgeStatusBar.hide(); return; }
     if (!bridgeServer) {
         bridgeStatusBar.text = '$(broadcast) AI bridge: off';
         bridgeStatusBar.tooltip = 'AI collaboration bridge is OFF. Click to start sharing this session with an MCP assistant.';
@@ -6244,6 +6258,43 @@ function addMcpAllowRule(settingsFile, serverName) {
     return { ok: true };
 }
 
+// Keep an already-registered .mcp.json pointing at the CURRENT server file. The entry stores an
+// absolute path built from context.extensionPath, and that path changes whenever the extension is
+// reinstalled or updated under a versioned folder (a packaged install lives in
+// <publisher>.<name>-<version>/), so a once-correct entry silently rots and the project ends up with
+// no working `oric` tools. Runs on activation, only rewrites when the stored path is actually wrong,
+// and never creates a file for a project that hasn't opted in (registration stays explicit).
+// NOTE: this cannot refresh a RUNNING MCP client — the server process is owned by the Claude Code
+// session and caches the tool list, so an mcp/ change still needs the server respawned.
+function refreshStaleMcpRegistrations(context) {
+    const fs = require('fs');
+    const serverPath = nodePath.join(context.extensionPath, 'mcp', 'oric-mcp-server.cjs');
+    if (!fs.existsSync(serverPath)) return;
+    for (const folder of (vscode.workspace.workspaceFolders || [])) {
+        const mcpPath = nodePath.join(folder.uri.fsPath, '.mcp.json');
+        if (!fs.existsSync(mcpPath)) continue;              // not registered here — leave it alone
+        let cfg;
+        try { cfg = JSON.parse(fs.readFileSync(mcpPath, 'utf8')); } catch (_) { continue; }
+        const entry = cfg && cfg.mcpServers && cfg.mcpServers.oric;
+        if (!entry || !Array.isArray(entry.args) || !entry.args.length) continue;
+        const stored = String(entry.args[0]);
+        const same = stored.replace(/\\/g, '/').toLowerCase() === serverPath.replace(/\\/g, '/').toLowerCase();
+        if (same) continue;
+        // Stored path differs — only rewrite if it's genuinely dead (don't fight a user who
+        // deliberately points at another checkout of the server).
+        if (fs.existsSync(stored)) continue;
+        entry.args[0] = serverPath;
+        try {
+            fs.writeFileSync(mcpPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8');
+            vizLog('[MCP] .mcp.json in ' + folder.name + ' pointed at a missing server (' + stored +
+                   ') — updated to ' + serverPath + '. Restart the MCP server / start a fresh Claude session to pick it up.');
+            vscode.window.showInformationMessage(
+                'Oric MCP: ' + folder.name + '\'s .mcp.json pointed at an old extension path and has been updated. ' +
+                'Start a fresh Claude Code session (or restart the MCP server) to load it.');
+        } catch (e) { vizLog('[MCP] could not update ' + mcpPath + ' — ' + (e.message || e)); }
+    }
+}
+
 async function registerMcpServerFlow(context) {
     const fs = require('fs');
     const path = require('path');
@@ -6510,6 +6561,9 @@ function activate(context) {
     // Set the OSDK-compatibility context key as early as possible, so an incompatible
     // OSDK hides the Oric debug views (their `when` clauses) before they can flash in.
     updateOsdkCompatIndicator();
+
+    // Repair a .mcp.json left pointing at an old extension path (see the function's note).
+    try { refreshStaleMcpRegistrations(context); } catch (_) { /* never block activation */ }
 
     // --- Conflict detection: warn if jede.osdk is also installed ---
     const conflicting = vscode.extensions.getExtension('jede.osdk');
@@ -7769,7 +7823,7 @@ function activate(context) {
             // AI piloting: restoring is the AI's job (the human's is locked), so gray the
             // rows and flag why. Same dimming as "no session", with an explanatory badge.
             if (aiIsPiloting()) return { color: new vscode.ThemeColor('disabledForeground'), badge: 'AI', tooltip: 'AI is piloting — it restores snapshots; take control (status bar) to restore yourself.' };
-            if (!oricSessionActive) return { color: new vscode.ThemeColor('disabledForeground') };
+            if (!sessionIsActive()) return { color: new vscode.ThemeColor('disabledForeground') };
             return undefined;
         }
     };
@@ -8314,7 +8368,7 @@ function activate(context) {
                     vscode.debug.stopDebugging(s);
                     return;
                 }
-                oricSessionActive = true; oricWarpOn = false;
+                oricSessionActive = true; oricWarpOn = false; oricEndedSessionId = null;
                 // Tell attached clients a NEW session exists. Without this a long-lived client
                 // keeps the `ended` flag from the previous session and reports a live session as
                 // "ended" (DOGFOODING #22).
@@ -8322,7 +8376,7 @@ function activate(context) {
             }
             debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); bridgeUpdateStatusBar();
         }),
-        vscode.debug.onDidTerminateDebugSession(() => { oricSessionActive = false; oricWarpOn = false; debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); bridgeUpdateStatusBar(); }),
+        vscode.debug.onDidTerminateDebugSession(s => { oricEndedSessionId = s && s.id; oricSessionActive = false; oricWarpOn = false; debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); bridgeUpdateStatusBar(); }),
         vscode.window.registerWebviewViewProvider('oricCpuRegs', regsProvider),
         vscode.window.registerWebviewViewProvider('oricPeripherals', periphProvider),
         vscode.commands.registerCommand('oric-debug.openMemoryView', () => createMemoryPanel(context)),
