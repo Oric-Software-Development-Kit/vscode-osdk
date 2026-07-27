@@ -1010,7 +1010,7 @@ function applyActiveModule(id) {
             }
         }
         for (const [a, s] of b.addrSource) if (!addrSource.has(a)) addrSource.set(a, s);
-        for (const [n, s] of b.symSource)  symSource.set(n, s);
+        for (const [n, s] of b.symSource)  setSymSource(symSource, n, s);
         for (const [k, v] of b.typeDefs)   typeDefs.set(k, v);
         for (const [k, v] of b.varTypes)   varTypes.set(k, v);
         for (const [k, v] of b.localDefs)  localDefs.set(k, v);
@@ -1555,7 +1555,7 @@ function loadSymbols(file) {
                     const cm = rest.match(/^(.+):(\d+)$/);
                     if (cm) {
                         src = { file: cm[1], line: parseInt(cm[2], 10) };
-                        cur.symSource.set(n, src);
+                        setSymSource(cur.symSource, n, src);
                     }
                 }
                 // addr->name: keep the first definition, but let a real-source symbol
@@ -1731,7 +1731,7 @@ function resolveLibrarySources(fileIndex) {
             if (!needsResolve.has(sym)) continue;
 
             const src = { file: filePath, line: i + 1 };
-            symSource.set(sym, src);
+            setSymSource(symSource, sym, src);
             const addr = needsResolve.get(sym);
             if (typeof addr === 'number') {
                 const existing = addrSource.get(addr);
@@ -3429,6 +3429,18 @@ async function buildTypedVar(name, addr, fullType, size, ann, opts) {
 function isBuildArtifact(filePath) {
     const base = path.basename(filePath).toLowerCase();
     return base === 'linked.s' || base === 'linked.asm';
+}
+
+// Record name -> definition site, keeping the best source we have seen for that name.
+// A symbol can be listed several times across the symbol file: once at its real definition
+// (loader.asm:710) and again via the linked.s intermediate. Whichever is parsed LAST used to
+// win, so a real source could be replaced by an artifact — and consumers that refuse artifacts
+// (symbolDefinition, hence click-to-definition) then found nothing at all. Rule, mirroring the
+// addr->source merge: first definition wins, except that a real source displaces an artifact.
+function setSymSource(map, name, src) {
+    if (!src || !src.file) return;
+    const prev = map.get(name);
+    if (!prev || (isBuildArtifact(prev.file) && !isBuildArtifact(src.file))) map.set(name, src);
 }
 
 // Address of the next different source line after `pc` (source-level
