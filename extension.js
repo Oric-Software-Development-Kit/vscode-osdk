@@ -7234,6 +7234,19 @@ function activate(context) {
     // previously printed in both views; now "where am I / what is the machine doing" is one place,
     // and the vector addresses get resolved to symbol names, which is the part that actually tells
     // you something ($FCCC means nothing, IrqDoNothing means everything).
+    const STACK_PREVIEW_BYTES = 8;   // one compact row in a narrow sidebar
+    const STACK_PREVIEW_RETS = 3;    // deepest few frames; more would push the panel around
+    // Registers arrive from the DAP `variables` request, so every value is a DISPLAY STRING
+    // ("$FB|251"), never a number. Anything needing to compute with one has to parse it back.
+    const regNumber = (v) => {
+        if (typeof v === 'number') return v;
+        if (typeof v !== 'string') return null;
+        const dec = v.match(/\|(\d+)/);                       // "$FB|251" -> 251
+        if (dec) return parseInt(dec[1], 10);
+        const hex = v.match(/\$([0-9a-fA-F]+)/);              // "$FB" -> 251
+        if (hex) return parseInt(hex[1], 16);
+        return null;
+    };
     let lastCpuMsg = null;   // last CPU payload, replayed when the panel is (re)resolved
     postCpuToInstrPanel = async (regs, flags, extra, stale) => {
         if (!currentInstrView) return;
@@ -7269,12 +7282,55 @@ function activate(context) {
                 } catch (_) { /* address only */ }
             }
         }
+        // A few bytes of the ACTUAL stack, which is the part SP alone cannot tell you. On the 6502
+        // SP points at the next FREE slot, so what has been pushed lives at $0100+SP+1 upward.
+        // Adjacent (lo,hi) pairs that resolve to a known routine are surfaced as probable return
+        // addresses — JSR pushes target-1, hence the +1 — which makes the call chain readable right
+        // here. It IS a heuristic: any two data bytes can look like an address, so these are
+        // labelled "probable" rather than presented as fact.
+        let stack = null;
+        const sp = regs ? regNumber(regs.SP) : null;
+        if (s && s.type === 'oric-debug' && sp !== null && sp >= 0 && sp <= 0xFF) {
+            // Deliberately NOT masked to 8 bits: SP=$FF means the stack is EMPTY, and wrapping it to
+            // $0100 would display eight bytes of stale page-1 data as though they had been pushed.
+            const first = sp + 1;
+            const base = 0x0100 + first;
+            const count = first <= 0xFF ? Math.min(STACK_PREVIEW_BYTES, 0x0100 - first) : 0;
+            if (count > 0) {
+                try {
+                    const r = await s.customRequest('readMemory',
+                        { memoryReference: base.toString(16), offset: 0, count });
+                    const buf = r && r.data ? Buffer.from(r.data, 'base64') : null;
+                    if (buf && buf.length) {
+                        const bytes = [...buf];
+                        const cands = [];
+                        for (let i = 0; i + 1 < bytes.length; i++)
+                            cands.push(((bytes[i] | (bytes[i + 1] << 8)) + 1) & 0xFFFF);
+                        let labels = [];
+                        try {
+                            const lr = await s.customRequest('labelsForAddresses', { addresses: cands });
+                            labels = (lr && lr.labels) || [];
+                        } catch (_) { /* older adapter: bytes only */ }
+                        const rets = [];
+                        for (let i = 0; i < cands.length && rets.length < STACK_PREVIEW_RETS; i++) {
+                            const nm = labels[i];
+                            // labelFor() falls back to "$XXXX" when nothing owns the address; only a
+                            // real symbol name is evidence that this pair is a return address.
+                            if (!nm || nm[0] === '$') continue;
+                            if (rets.some(x => x.name === nm)) continue;   // overlapping pairs repeat
+                            rets.push({ at: (base + i) & 0xFFFF, addr: cands[i], hex: hex4(cands[i]), name: nm });
+                        }
+                        stack = { base, hex: hex4(base), bytes, rets };
+                    }
+                } catch (_) { /* stack preview is best effort — never break the CPU block for it */ }
+            }
+        }
         lastCpuMsg = {
             type: 'cpu', stale: !!stale,
             regs: regs || null, flags: flags || null,
             prev,
             cycles: extra && typeof extra.C === 'number' ? extra.C : null,
-            vectors,
+            vectors, stack,
         };
         currentInstrView.webview.postMessage(lastCpuMsg);
     };
@@ -7404,6 +7460,13 @@ function activate(context) {
             #cpu .fon { color: var(--vscode-charts-green, #89d185); font-weight: bold; }
             #cpu .foff { color: var(--vscode-descriptionForeground, #666); }
             #cpu .vecname { color: var(--vscode-charts-purple, #c586c0); }
+            /* Stack preview, attached under SP. Slightly smaller and the byte run is allowed to
+               scroll on its own rather than widen the panel — in a narrow sidebar a long row
+               otherwise drags every other row's alignment with it. */
+            #cpu .stk { white-space: nowrap; font-size: 0.85em; overflow-x: auto; }
+            #cpu .stkb { color: var(--vscode-charts-blue, #569cd6); }
+            #cpu .stkr { white-space: nowrap; font-size: 0.85em; opacity: 0.8; padding-left: 0.8em; }
+            #cpu .stkr .hint { color: var(--vscode-descriptionForeground, #808080); font-size: 0.9em; }
             /* Locals: always-visible value rows at the bottom (see refreshCurrentInstrLocals).
                Separated by a rule so it reads as its own section, not more instruction detail. */
             #vec { margin-top: 6px; border-top: 1px solid var(--vscode-widget-border, #333); padding-top: 4px; }
@@ -7541,6 +7604,22 @@ function activate(context) {
                     // SP separated from A/X/Y: it is the stack pointer rather than a data register
                     // (and it is where the stack preview will attach).
                     h += ['A','X','Y'].map(reg).join('') + '<div class="gap"></div>' + reg('SP');
+                    // The stack itself, directly under SP. One row of raw bytes (top of stack first,
+                    // i.e. most recently pushed) plus any probable return addresses, whose names are
+                    // click-to-definition like every other symbol. Marked "probable" on purpose: a
+                    // (lo,hi) byte pair can resolve to a routine by coincidence.
+                    if (d.stack && d.stack.bytes && d.stack.bytes.length){
+                        const bl = d.stack.bytes
+                            .map(b => b.toString(16).toUpperCase().padStart(2, '0')).join(' ');
+                        h += '<div class="stk"><span class="n">stack</span> ' + colorize(d.stack.hex)
+                           + ' <span class="stkb">' + esc(bl) + '</span></div>';
+                        for (const r of (d.stack.rets || [])){
+                            const bare = String(r.name).split(/[+-]/)[0];
+                            h += '<div class="stkr">↳ ' + colorize(r.hex)
+                               + ' <span class="idsym" data-sym="' + esc(bare) + '" data-addr="' + (r.addr & 0xFFFF)
+                               + '">' + esc(r.name) + '</span> <span class="hint">probable return</span></div>';
+                        }
+                    }
                     // Where we came FROM. Rendered by the SHARED pcLine() so it is byte-for-byte the
                     // same shape as the current-PC line directly beneath it (they diverged before
                     // because two different code paths built them). Dimmed, and carrying the only
