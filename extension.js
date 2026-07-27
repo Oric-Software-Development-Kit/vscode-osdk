@@ -4401,14 +4401,152 @@ const symbolCache = new Map(); // name -> { addr, size, value, group, source }
 
 // Define cache: populated by scanning workspace source files for #define directives
 const defineCache = new Map(); // name -> { value (string), numValue (number|null), file, line }
+// Enum MEMBERS with their definition site. The debug export carries an enum's members only as a
+// value<->name mapping (enumDefs = {size, byValue, isFlags}) with no source location, so a name
+// like e_ITEM_RoughPlan cannot be traced back to game_enums.h from the symbol data alone. This
+// index fills that gap by scanning the sources, which makes enum members both navigable and
+// searchable. name -> { value, enumName, comment, file, line }
+const enumMemberCache = new Map();
+// TYPE names: struct/union/enum tags and typedef aliases. The debug export describes a type's
+// LAYOUT (typeDefs: size + fields) but not where it was declared, so a token like `item` or the
+// enum type `item_id` had nothing to navigate to even though both are everywhere in the panel.
+// name -> { kind: 'struct'|'union'|'enum'|'typedef', file, line }
+const typeCache = new Map();
+
+// Index type declarations in one file: `typedef enum {...} name;`, `typedef struct {...} name;`,
+// `struct name {`, `enum name {`, and one-line `typedef <base> name;`. Records the line where the
+// declaration STARTS (for a typedef block that is the `typedef` keyword, which is what you want to
+// read), not the closing brace.
+function indexTypesIn(filePath, lines) {
+    let blockStart = -1, blockKind = null, depth = 0;
+    const put = (name, kind, line) => {
+        if (name && !typeCache.has(name)) typeCache.set(name, { kind, file: filePath, line });
+    };
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].replace(/\/\/.*$/, '');
+        if (blockStart < 0) {
+            const td = line.match(/^\s*typedef\s+(enum|struct|union)\b/);
+            if (td) { blockStart = i + 1; blockKind = td[1]; depth = (line.match(/\{/g) || []).length; continue; }
+            // Tagged declaration with a body: `struct item {` / `enum item_id {`
+            const tag = line.match(/^\s*(struct|union|enum)\s+([A-Za-z_]\w*)\s*\{/);
+            if (tag) { put(tag[2], tag[1], i + 1); continue; }
+            // Simple alias: `typedef unsigned char uchar;`
+            const al = line.match(/^\s*typedef\s+.*?\b([A-Za-z_]\w*)\s*;\s*$/);
+            if (al) put(al[1], 'typedef', i + 1);
+            continue;
+        }
+        depth += (line.match(/\{/g) || []).length;
+        depth -= (line.match(/\}/g) || []).length;
+        const close = line.match(/\}\s*([A-Za-z_]\w*)?\s*;/);
+        if (close && depth <= 0) {
+            put(close[1], blockKind, blockStart);   // the typedef line, not the closing brace
+            blockStart = -1; blockKind = null; depth = 0;
+        }
+    }
+}
+
+// Click-to-definition for an identifier seen in a panel. Resolution order reflects how specific
+// each source is: a real symbol from the build, then an enum member, then a #define. Returns
+// { file, line, what } or null. Never throws — a failed lookup just means "not navigable".
+async function resolveIdentifierDefinition(name) {
+    const clean = String(name || '').trim().replace(/^[&*]+/, '');
+    if (!clean) return null;
+    // 1. Symbols the build knows about (functions, globals, asm labels).
+    const s = vscode.debug.activeDebugSession;
+    if (s && s.type === 'oric-debug') {
+        try {
+            const r = await s.customRequest('symbolDefinition', { names: [clean] });
+            const d = r && r.defs && r.defs[0];
+            if (d && d.file && d.line > 0) return { file: d.file, line: d.line, what: 'symbol ' + d.name };
+        } catch (_) { /* older adapter */ }
+    }
+    // 2. Enum members (indexed from the sources — the debug export has no location for them).
+    const em = enumMemberCache.get(clean);
+    if (em) return { file: em.file, line: em.line, what: 'enum ' + (em.enumName || 'member') + ' ' + clean };
+    // 3. Type names: struct/union/enum tags and typedef aliases (e.g. `item`, `item_id`).
+    const ty = typeCache.get(clean);
+    if (ty) return { file: ty.file, line: ty.line, what: ty.kind + ' ' + clean };
+    // 4. Preprocessor defines.
+    const df = defineCache.get(clean);
+    if (df && df.file) return { file: df.file, line: df.line, what: '#define ' + clean };
+    return null;
+}
+
+// Open an identifier's definition, or say plainly that there isn't one to open. Used by the
+// panels' click-to-definition; a status-bar note (not a modal) because a miss is routine — many
+// tokens are types or literals with nothing to jump to.
+async function gotoIdentifierDefinition(name) {
+    const hit = await resolveIdentifierDefinition(name);
+    if (!hit) { vscode.window.setStatusBarMessage('Oric: no definition found for "' + name + '"', 4000); return; }
+    try {
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(hit.file));
+        const ln = Math.max(0, (hit.line || 1) - 1);
+        const ed = await vscode.window.showTextDocument(doc, { preview: true, viewColumn: vscode.ViewColumn.One });
+        const range = new vscode.Range(ln, 0, ln, 0);
+        ed.selection = new vscode.Selection(range.start, range.start);
+        ed.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+        vscode.window.setStatusBarMessage('Oric: ' + hit.what, 3000);
+    } catch (e) {
+        vscode.window.setStatusBarMessage('Oric: could not open ' + hit.file + ' — ' + (e.message || e), 5000);
+    }
+}
+
+// Parse `typedef enum { A = 0, B, ... } type_id;` (and plain `enum name { ... }`) out of one file,
+// tracking implicit values the way C does: no initialiser means previous + 1.
+function indexEnumMembersIn(filePath, lines) {
+    let inEnum = false, next = 0, pending = [];
+    for (let i = 0; i < lines.length; i++) {
+        const raw = lines[i];
+        const line = raw.replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, '');
+        const comment = (raw.match(/\/\/\s*(.+?)\s*$/) || [])[1] || null;
+        if (!inEnum) {
+            if (/^\s*(typedef\s+)?enum\b[^{]*\{?\s*$/.test(line) || /^\s*(typedef\s+)?enum\b.*\{/.test(line)) {
+                inEnum = true; next = 0; pending = [];
+            }
+            continue;
+        }
+        // End of the block: `} type_id;` names the enum type for every member collected.
+        const close = line.match(/^\s*\}\s*([A-Za-z_]\w*)?\s*;/);
+        if (close) {
+            const enumName = close[1] || null;
+            for (const p of pending) {
+                if (!enumMemberCache.has(p.name))
+                    enumMemberCache.set(p.name, { value: p.value, enumName, comment: p.comment, file: filePath, line: p.line });
+            }
+            inEnum = false; pending = [];
+            continue;
+        }
+        // A member, with or without an explicit value.
+        const m = line.match(/^\s*([A-Za-z_]\w*)\s*(?:=\s*([^,]+?))?\s*,?\s*$/);
+        if (!m) continue;
+        let val = next;
+        if (m[2] !== undefined) {
+            const t = m[2].trim();
+            const hx = t.match(/^0x([0-9a-fA-F]+)$/) || t.match(/^\$([0-9a-fA-F]+)$/);
+            if (hx) val = parseInt(hx[1], 16);
+            else if (/^\d+$/.test(t)) val = parseInt(t, 10);
+            else if (enumMemberCache.has(t)) val = enumMemberCache.get(t).value;   // = OTHER_MEMBER
+            else val = null;                                                       // an expression
+        }
+        next = (val == null ? next : val) + 1;
+        pending.push({ name: m[1], value: val, comment, line: i + 1 });
+    }
+}
+
 async function scanDefines() {
     defineCache.clear();
-    const files = await vscode.workspace.findFiles('**/*.{s,h,asm}', '**/node_modules/**', 500);
+    enumMemberCache.clear();
+    typeCache.clear();
+    // .c included as well: enums are frequently declared in C sources, not only headers, and the
+    // enum index is what makes e_* names navigable/searchable.
+    const files = await vscode.workspace.findFiles('**/*.{s,h,asm,c}', '**/node_modules/**', 500);
     const fs = require('fs');
     for (const uri of files) {
         try {
             const content = fs.readFileSync(uri.fsPath, 'utf8');
             const lines = content.split(/\r?\n/);
+            indexEnumMembersIn(uri.fsPath, lines);   // enum members (same pass over the file)
+            indexTypesIn(uri.fsPath, lines);         // struct/union/enum tags + typedef aliases
             for (let i = 0; i < lines.length; i++) {
                 const m = lines[i].match(/^\s*#\s*define\s+([A-Za-z_]\w*)\s+(.+?)\s*$/);
                 if (!m) continue;
@@ -7200,6 +7338,10 @@ function activate(context) {
             /* The WHOLE row is clickable when it has a location: the jump is the point of the row,
                and hunting for the file:line span is fiddly — especially for prev, which can be an
                RTI or a JSR in a completely different file. */
+            /* Identifiers are clickable, but advertised only on hover — otherwise the panel reads
+               as a wall of links, since nearly every token is an identifier. */
+            .idsym { cursor: pointer; }
+            .idsym:hover { text-decoration: underline; }
             .pcline[data-file] { cursor: pointer; }
             .pcline[data-file]:hover { background: var(--vscode-list-hoverBackground, #ffffff14); }
             .pcline .loc-link { color: var(--vscode-textLink-foreground); }
@@ -7268,7 +7410,13 @@ function activate(context) {
                     while ((m = re.exec(text)) !== null){
                         if (m.index > last) out += esc(text.slice(last, m.index));
                         if (m[1]) out += '<span class="val">' + esc(m[1]) + '</span>';
-                        else if (m[2]) out += '<span class="' + idClass(m[2]) + '">' + esc(m[2]) + '</span>';
+                        // Every IDENTIFIER is a click-to-definition target. Marking them here (the
+                        // one shared tokenizer) makes symbols, enum members and defines navigable in
+                        // every row of the panel at once — registers, the C statement, the variable
+                        // decode, locals and the interrupt vectors. Resolution happens on click, so
+                        // no lookup cost while rendering; a token with nothing to jump to just
+                        // reports that. Styled only on hover, so this does not become a wall of links.
+                        else if (m[2]) out += '<span class="' + idClass(m[2]) + ' idsym" data-sym="' + esc(m[2]) + '">' + esc(m[2]) + '</span>';
                         else if (m[3]) out += '<span class="val">' + esc(m[3]) + '</span>';
                         else out += '<span class="op">' + esc(m[4]) + '</span>';
                         last = re.lastIndex;
@@ -7405,7 +7553,11 @@ function activate(context) {
                 // Delegate from the BODY, not just the header: the prev-PC line carries a loc-link
                 // too, and a handler bound to #hdr alone would leave it dead.
                 document.body.addEventListener('click', function(e){
-                    // Either a whole location row (.pcline) or any legacy inline .loc-link.
+                    // An identifier wins over the row containing it: clicking 'itemId' inside the
+                    // current-line row should go to itemId's definition, not to that row's line.
+                    const sym = e.target.closest('[data-sym]');
+                    if (sym) { vs.postMessage({ type: 'gotoDef', name: sym.dataset.sym }); return; }
+                    // Otherwise: a whole location row (.pcline) or a legacy inline .loc-link.
                     const el = e.target.closest('[data-file][data-line]');
                     if (el) vs.postMessage({ type: 'gotoSymbol', file: el.dataset.file, line: parseInt(el.dataset.line, 10) });
                 });
@@ -7434,6 +7586,7 @@ function activate(context) {
                     }
                     return;
                 }
+                if (msg && msg.type === 'gotoDef' && msg.name) { gotoIdentifierDefinition(msg.name); return; }
                 if (msg && msg.type === 'gotoSymbol' && msg.file && msg.line > 0) {
                     const uri = vscode.Uri.file(msg.file);
                     vscode.workspace.openTextDocument(uri).then(doc => {

@@ -6450,6 +6450,26 @@ const handlers = {
         respond(req, { symbols: assembleSymbols() });
     },
 
+    // Definition site of a SYMBOL BY NAME (not by address): the file:line where it is declared.
+    // Backs click-to-definition on identifiers in the panels. Tries the name as given and the
+    // C<->asm underscore variants. Build artifacts (TMP intermediates, linked.s) are refused —
+    // they are ephemeral and jumping into them lands the user in a file that no longer matches.
+    symbolDefinition(req) {
+        const names = (req.arguments && req.arguments.names) || [];
+        const one = (n) => {
+            for (const cand of [n, (n[0] === '_' ? n.slice(1) : '_' + n)]) {
+                const src = symSource.get(cand)
+                    || (resolverInstance && resolverInstance.declOf ? resolverInstance.declOf(cand) : null);
+                // Reject linked.s AND anything under a TMP folder (compiler intermediates): both
+                // are ephemeral, so navigating there lands in a file that no longer matches.
+                if (src && src.file && !isBuildArtifact(src.file) && !/[\\/]tmp[\\/]/i.test(src.file))
+                    return { name: cand, file: src.file, line: src.line || 0 };
+            }
+            return null;
+        };
+        respond(req, { defs: names.map(n => (typeof n === 'string' ? one(n) : null)) });
+    },
+
     // Resolve addresses to their symbol labels. Used for the CPU block's interrupt vectors: a bare
     // "$FCCC" says nothing, "IrqDoNothing" says everything. Batched because a caller wants several
     // at once (NMI/RST/IRQ) and one round-trip per stop is the budget.
