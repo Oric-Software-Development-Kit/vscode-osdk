@@ -82,16 +82,21 @@ Debugging”** (*Getting Started → 4*), then press **F5**.
 
 ## Breakpoints in C source don't bind / "no C source-line info"
 
-The OSDK C compiler only emits source-line and local-variable debug info at lower
-optimization levels. In your `osdk_config.bat`:
+The OSDK C compiler only emits source-line and local-variable debug info when asked. In
+your `osdk_config.bat`:
 
 ```bat
-SET OSDKCOMP=-O1 -g1
+SET OSDKDEBUG=-g1
 ```
 
-`-g1` adds the debug info; `-O2`/`-O3` reorder and register-allocate aggressively, so
-some lines/locals have no stable home. Rebuild after changing it. (Assembly `.s`
-breakpoints work regardless.)
+`-g1` is **new in OSDK 2.0** (there was no C debug info before it), and it lives in its own
+`OSDKDEBUG` variable rather than `OSDKCOMP` — so a project setting its own optimization flags
+cannot silently drop the debug info. Set `OSDKDEBUG` and leave `OSDKCOMP` alone. This
+extension requires OSDK 2.0 or newer, so `OSDKDEBUG` is always the right place.
+
+Optimization level still matters for *quality*: `-O2`/`-O3` reorder and register-allocate
+aggressively, so some lines/locals have no stable home — `-O1` keeps them closest to the
+source. Rebuild after changing either. (Assembly `.s` breakpoints work regardless.)
 
 ## A breakpoint says it's armed but didn't fire
 

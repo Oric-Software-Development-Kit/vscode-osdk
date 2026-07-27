@@ -1252,7 +1252,7 @@ function unboundBpMessage(srcPath, norm, emitWarn) {
     if (resolverInstance && /\.c$/i.test(srcPath) && underWs
         && !hasLinesAnywhere) {
         msg = 'No source-line info for this C file — rebuild with -g1 '
-            + '(set OSDKCOMP=-O1 -g1 in osdk_config.bat) so C breakpoints '
+            + '(set OSDKDEBUG=-g1 in osdk_config.bat) so C breakpoints '
             + 'can bind. Assembly (.s) breakpoints are unaffected.';
         if (emitWarn && !warnedNoCLineInfo.has(norm)) {
             warnedNoCLineInfo.add(norm);
@@ -1260,7 +1260,7 @@ function unboundBpMessage(srcPath, norm, emitWarn) {
             evt('output', { category: 'important', output:
                 '⚠ Breakpoints in ' + fn + " won't bind: the project was built "
                 + 'without -g1, so no C source-line info is present. Add '
-                + '-g1 to OSDKCOMP in osdk_config.bat and rebuild. '
+                + 'SET OSDKDEBUG=-g1 to osdk_config.bat and rebuild. '
                 + '(Assembly breakpoints are unaffected.)\n' });
         }
     }

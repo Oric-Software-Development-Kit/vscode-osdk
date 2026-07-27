@@ -6813,7 +6813,7 @@ function activate(context) {
     // Shared explanation for breakpoints that won't bind (used by the gutter hover
     // message and kept in sync with the DA's warning + the ORIC panel tooltip).
     const UNVERIFIED_BP_HOVER = 'This breakpoint won\'t bind: the project was built without -g1, ' +
-        'so no C source-line info is present. Add -g1 to OSDKCOMP in osdk_config.bat and rebuild. ' +
+        'so no C source-line info is present. Add SET OSDKDEBUG=-g1 to osdk_config.bat and rebuild. ' +
         '(Assembly breakpoints are unaffected.)';
 
     function applyUnverifiedBpDecorations() {
@@ -7629,7 +7629,7 @@ function activate(context) {
             // actionable hint so the tooltip explains why even without a session.
             if (!verified && !unverifiedMsg) {
                 unverifiedMsg = 'No source-line info for this C file — rebuild with -g1 '
-                    + '(set OSDKCOMP=-O1 -g1 in osdk_config.bat) so C breakpoints can bind.';
+                    + '(set OSDKDEBUG=-g1 in osdk_config.bat) so C breakpoints can bind.';
             }
             const here = oricDebugStopped && currentStopLoc && currentStopLoc.line === L.line
                 && canonPath(currentStopLoc.path) === canonPath(L.uri.fsPath);

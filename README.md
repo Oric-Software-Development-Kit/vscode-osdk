@@ -578,14 +578,17 @@ For the extension to give you C-source stepping, typed variables, and inspectabl
 OSDK build must emit debug info and an enriched symbol file. Configure this once in your
 project's `osdk_config.bat` / build scripts.
 
-### Compiler settings — `OSDKCOMP=-O1 -g1`
+### Compiler settings — `OSDKDEBUG=-g1` + `OSDKCOMP=-O1`
 
 ```bat
-SET OSDKCOMP=-O1 -g1
+SET OSDKDEBUG=-g1
+SET OSDKCOMP=-O1
 ```
 
 - **`-g1`** makes the C compiler emit source-line info, struct/type records (`#TYPES`), and
   local/parameter names — the basis for source breakpoints, typed globals, and the Locals scope.
+  It is **new in OSDK 2.0** and lives in its own **`OSDKDEBUG`** variable, so a project that sets
+  its own optimization flags cannot silently drop the debug info. Put it there, not in `OSDKCOMP`.
 - **`-O1` (not `-O2`)** is required to inspect function **body locals**. At `-O2` the compiler
   register-allocates body locals off the stack, so they have no address the debugger can read
   (parameters still show at `-O2`, but in-function locals do not). Use `-O1` for full local
