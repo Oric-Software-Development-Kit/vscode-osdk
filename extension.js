@@ -4322,19 +4322,22 @@ function removeWatchedExpr(expr) {
 // adapter's variablesReference is only valid until the next resume, so the
 // webview never stores one — it just reports expand/collapse by path and
 // receives the fully-resolved tree each refresh.
-// Source {file,line} for a top-level watched symbol (from the shared symbol cache),
-// so a pinned row can be clicked to jump to its definition — like the search results.
-// Only plain symbols resolve; computed expressions (a[i].f) have no single source.
-// Resolved definition sites for watched rows, so the lookup is not repeated for every row on
-// every stop. Cleared with symbolCache — a rebuild can move a definition.
+// Source {file,line} for a top-level watched symbol, so a pinned row can be clicked to jump to its
+// definition — like the search results. Only plain symbols resolve; computed expressions (a[i].f)
+// have no single source. Resolved sites are memoised so the lookup is not repeated for every row on
+// every stop; the memo is cleared with symbolCache, since a rebuild can move a definition.
 const watchSourceMemo = new Map();   // name -> {file,line} | null (null = looked up, nothing found)
 function watchNodeSource(expr) {
-    if (watchSourceMemo.has(expr)) return watchSourceMemo.get(expr) || undefined;
+    // The LIVE CACHE IS CHECKED FIRST, deliberately. A negative memo entry must never short-circuit
+    // it: the memo can record "nothing found" at a moment when symbols were not loaded yet (no
+    // session, or the panel had never been visible), and if that answer then outranked the cache the
+    // row would stay unclickable for the rest of the window even once real symbols arrived.
     // The C<->asm underscore variants are the same symbol: a watch on `_gWordBuffer` must still
     // find `gWordBuffer` in the cache (and vice versa), or the row silently stops being clickable.
     const alt = expr[0] === '_' ? expr.slice(1) : '_' + expr;
     const c = symbolCache.get(expr) || symbolCache.get(alt);
-    return (c && c.source && c.source.file) ? { file: c.source.file, line: c.source.line } : undefined;
+    if (c && c.source && c.source.file) return { file: c.source.file, line: c.source.line };
+    return watchSourceMemo.get(expr) || undefined;   // positives only; null/absent -> undefined
 }
 // The symbol cache only knows what readAllSymbols happened to carry, so a watched row could show a
 // value yet have no definition to jump to. Fall back to the adapter's symbolDefinition — the SAME
