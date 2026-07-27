@@ -65,7 +65,7 @@ Connects VS Code to Oricutron's GDB Remote Serial Protocol (RSP) stub over TCP.
 
 ### Automation
 
-- Run **automation scripts** (`automation/*.js`) against the live session — step, read/write memory, set breakpoints, capture screenshots — from the **Oric Data** panel's *Automation* group (see *Automation Scripting*).
+- Run **automation scripts** (`automation/*.js`) against the live session — step, read/write memory, set breakpoints, capture screenshots — from the **Snapshots & Automation** panel's *Automation* group (see *Automation Scripting*).
 
 ### AI Collaboration (MCP)
 
@@ -89,7 +89,7 @@ Most dedicated panels appear in the **Run & Debug** sidebar when a session is ac
 | **Current Instruction** | The instruction about to execute, decoded with its operand values and the symbols/types they resolve to — the same annotation shown inline, in a persistent panel (globals/locals/members/subscripts/enums). **Shown in the bottom Panel area (the *Oric Debug* group), not the sidebar.** Its `file:line` header is a clickable jump to source. |
 | **Oric Registers** | CPU registers (A, X, Y, SP, PC), processor flags (N, V, B, D, I, Z, C), last PC, cycle counter, frame count, raster line, and interrupt vectors (NMI, RST, IRQ). A/X/Y show their decoded value when the register carries a type tag. |
 | **Oric Breakpoints** | All breakpoints as a tree: **module → file → line**, with a child row per condition / hit-count / watchpoint property. Enable/disable or delete at any level (all / module / file / line), and optionally *follow the active module*. |
-| **Oric Data** | Two groups in one panel: *Snapshots* — saved machine states for this project, restore/rename/delete (see *Snapshots*); *Automation* — runnable scripts (`automation/*.js`) with a **▶ Run** button each (see *Automation Scripting*). |
+| **Snapshots & Automation** | Two groups in one panel: *Snapshots* — saved machine states for this project, restore/rename/delete (see *Snapshots*); *Automation* — runnable scripts (`automation/*.js`) with a **▶ Run** button each (see *Automation Scripting*). |
 | **Oric Peripherals** | Live state of the VIA 6522, AY-3-8912 (PSG), WD1793 floppy disk controller, Microdisc interface, and ACIA 6551 serial controller. |
 | **Oric Documentation** | Quick links: the extension manual, the internal **XA** and **6502** references, and the external **OSDK website** & **Defence Force forum**. |
 
@@ -202,9 +202,9 @@ History is bounded to the recent past (it's a ring buffer, not a full recording)
 Save and restore the **entire machine state** (CPU, RAM, peripherals, and the current breakpoints) as a named snapshot, per project, under `.oric-snapshots/`.
 
 - **Save** — **Oric: Save Snapshot** (or the snapshot button in *Oric Debug Controls*). Snapshots get a **self-describing auto-name** (you can rename them later).
-- **Restore** — **Oric: Restore Snapshot**, or pick one from the **Oric Data** panel's *Snapshots* group → *Restore*. Restoring re-syncs breakpoints so the ones saved with the snapshot don't linger.
+- **Restore** — **Oric: Restore Snapshot**, or pick one from the **Snapshots & Automation** panel's *Snapshots* group → *Restore*. Restoring re-syncs breakpoints so the ones saved with the snapshot don't linger.
 - **Restart to Most Recent** — **Oric: Restart to Most Recent Snapshot** jumps straight back to your latest restore point; combined with an **entry baseline** captured at launch, "restart the program" is near-instant (no rebuild/relaunch).
-- **Rename / Delete** — from the *Snapshots* group of the **Oric Data** panel; **Oric: Delete Snapshot** / **Refresh Snapshots** are also on the palette.
+- **Rename / Delete** — from the *Snapshots* group of the **Snapshots & Automation** panel; **Oric: Delete Snapshot** / **Refresh Snapshots** are also on the palette.
 - **Auto-snapshot on hit** — add **`[save]`** to a logpoint message to snapshot every time that line is reached (see *Logpoints*), e.g. a save point at the start of each level.
 - **Build-aware** — each snapshot records a checksum of the build it was taken against; if you rebuild, stale snapshots are flagged rather than restored into mismatched code.
 
@@ -331,7 +331,7 @@ module.exports = async (t) => {
 };
 ```
 
-Run a script from the **Oric Data** panel's *Automation* group (in the Run & Debug sidebar) — it lists the
+Run a script from the **Snapshots & Automation** panel's *Automation* group (in the Run & Debug sidebar) — it lists the
 runnable scripts (top-level `automation/*.js`, *not* `lib/`), each with a **▶ Run** button;
 clicking a row opens the script, and the running one shows a spinner. Or use **Oric: Run
 Automation Script…** from the palette. Running one **starts a debug session if none is active**
@@ -545,7 +545,7 @@ VS Code settings (User or Workspace) under **Oric Debug**:
 | `oric-debug.showBinary` | boolean | `true` | Show the `%binary` column in decoded values (`$02\|2\|%00000010`). Turn off for a compact `$02\|2`. Applies live to a running session; also toggleable via **Oric: Toggle Binary Column in Values** or the `bin` console command. |
 | `oric-debug.breakpointsFollowActiveModule` | boolean | `true` | In the **Oric Breakpoints** panel, expand the active overlay module's section and collapse the others as the active module changes (multi-module/overlay projects). The active module is always highlighted regardless of this setting. |
 | `oric-debug.colorSourceFilesByType` | boolean | `true` | Tint file-name labels (editor tabs and Explorer) by type: C source `.c` green, headers `.h` teal, assembler `.s`/`.asm` blue, automation scripts `.js` violet. The colors are the `oric.*` theme colors below — override them in `workbench.colorCustomizations`. |
-| `oric-debug.wrapPanelRows` | boolean | `false` | Wrap long rows in the **Oric CPU & Current Instruction** panel instead of clipping them. Wrapping shows the whole value (long paths, wide arrays) at the cost of vertical space; clipping keeps the panel compact while stepping. Toggle it from that panel's title bar (**Oric: Wrap Long Rows In Panel** / **Stop Wrapping…**). |
+| `oric-debug.wrapPanelRows` | boolean | `false` | Wrap long rows in the **Debug Dashboard** panel instead of clipping them. Wrapping shows the whole value (long paths, wide arrays) at the cost of vertical space; clipping keeps the panel compact while stepping. Toggle it from that panel's title bar (**Oric: Wrap Long Rows In Panel** / **Stop Wrapping…**). |
 
 File-label tint colors (contributed theme colors, overridable in `workbench.colorCustomizations`):
 

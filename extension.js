@@ -270,7 +270,7 @@ class RegistersWebviewProvider {
 
     refresh(session) {
         // NOTE: this provider no longer owns a view — the CPU registers are rendered at the top of
-        // the merged "Oric CPU & Current Instruction" panel (one place for "where am I and what is
+        // the merged "Debug Dashboard" panel (one place for "where am I and what is
         // the machine doing", instead of the same PC printed in two views). It still does the
         // fetching, so it must NOT bail out just because _view is null.
         // NB: `postCpuToInstrPanel`, not `currentInstrView` — this class lives at MODULE scope while
@@ -8561,7 +8561,7 @@ function activate(context) {
     symWatcher.onDidCreate(onSymChange);
     context.subscriptions.push(symWatcher);
 
-    // ---- Snapshots: the "Snapshots" group of the Oric Data tree ---------------
+    // ---- Snapshots: the "Snapshots" group of the Snapshots & Automation tree ---------------
     // Lists the project's snapshots (from the adapter). Restore on click, inline
     // restore/delete/rename; refreshes on the adapter's oricSnapshotsChanged event
     // (covers the [save] logpoint token) and on session start/stop.
@@ -8706,7 +8706,7 @@ function activate(context) {
             return it;
         }
     };
-    // No view of its own any more: snapTreeProvider is a DELEGATE of the merged "Oric Data" tree
+    // No view of its own any more: snapTreeProvider is a DELEGATE of the merged "Snapshots & Automation" tree
     // created further down (it needs autoTreeProvider too, which is defined later).
     const snapSession = () => { const s = vscode.debug.activeDebugSession; return (s && s.type === 'oric-debug') ? s : null; };
     context.subscriptions.push(
@@ -8754,7 +8754,7 @@ function activate(context) {
     );
     if (snapSession()) refreshSnapshots();
 
-    // --- Automation: the "Automation" group of the Oric Data tree — runnable scripts, ▶ Run each.
+    // --- Automation: the "Automation" group of the Snapshots & Automation tree — ▶ Run each.
     // Folder-split convention: standalone scripts are automation/<name>.js (the glob lists only
     // the top level); utility modules go in automation/lib/ and are NOT listed. getChildren reads
     // disk so scripts show with no session; ▶ Run starts a session if needed (runAutomationScript).

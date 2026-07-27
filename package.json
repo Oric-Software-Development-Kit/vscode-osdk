@@ -84,7 +84,7 @@
                 "oric-debug.wrapPanelRows": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Wrap long rows in the Oric CPU & Current Instruction panel instead of clipping them. Wrapping shows the whole value (long paths, wide arrays) at the cost of vertical space; clipping keeps the panel compact while stepping. Toggle it from the panel's title bar."
+                    "description": "Wrap long rows in the Debug Dashboard panel instead of clipping them. Wrapping shows the whole value (long paths, wide arrays) at the cost of vertical space; clipping keeps the panel compact while stepping. Toggle it from the panel's title bar."
                 },
                 "oric-debug.focusOnStop": {
                     "type": "string",
