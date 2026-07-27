@@ -4612,15 +4612,15 @@ function createSymbolsPanel(context) {
     if (session && session.type === 'oric-debug') {
         session.customRequest('readAllSymbols').then(resp => {
             if (symbolsPanel && resp && resp.symbols) {
-                const combined = [...resp.symbols, ...buildDefineEntries()];
+                const combined = [...resp.symbols, ...buildConstantEntries()];
                 symbolsPanel.webview.postMessage({ type: 'symbols', data: combined });
             }
         }).catch(() => {});
     } else {
-        // No debug session — still show defines
-        const defines = buildDefineEntries();
-        if (defines.length > 0 && symbolsPanel) {
-            symbolsPanel.webview.postMessage({ type: 'symbols', data: defines });
+        // No debug session — still show the constants (defines + enum members)
+        const consts = buildConstantEntries();
+        if (consts.length > 0 && symbolsPanel) {
+            symbolsPanel.webview.postMessage({ type: 'symbols', data: consts });
         }
     }
     refreshWatchValues(session && session.type === 'oric-debug' ? session : null);
@@ -4702,12 +4702,46 @@ function buildDefineEntries() {
     return entries;
 }
 
+// Enum MEMBERS as searchable rows, same shape as the #define rows above: addr-less constants,
+// so the existing rendering already does the right thing (no breakpoint dot, no watch pin, em
+// dash for address/size, defineValue in the value column, name linked to its definition).
+// Without this, the one place you would naturally look for e_ITEM_CarBoot cannot find it —
+// the panel only ever listed things with an address.
+function buildEnumEntries() {
+    const entries = [];
+    for (const [name, m] of enumMemberCache) {
+        // A runtime symbol or a #define of the same name wins: those have a live value.
+        if (symbolCache.has(name) || defineCache.has(name)) continue;
+        // value is null when the member is an expression the indexer does not evaluate.
+        const val = typeof m.value === 'number'
+            ? '$' + (m.value & 0xFFFF).toString(16).toUpperCase().padStart(2, '0') + ' (' + m.value + ')'
+            : '?';
+        const tag = m.enumName ? 'enum ' + m.enumName : 'enum';
+        entries.push({
+            name, aliases: [], addr: -1,
+            size: 0, value: [], group: 'enum',
+            source: { file: m.file, line: m.line },
+            nameSources: { [name]: { file: m.file, line: m.line } },
+            defineValue: val,
+            defineComment: m.comment ? tag + ' — ' + m.comment : tag
+        });
+    }
+    return entries;
+}
+
+// The addr-less rows of the symbols panel: #defines and enum members. One helper so every feed
+// point (fresh create, no-session, refresh) lists the same thing — this was defines-only in three
+// separate places, which is exactly how enum members came to be missing from the panel.
+function buildConstantEntries() {
+    return [...buildDefineEntries(), ...buildEnumEntries()];
+}
+
 function refreshSymbolsPanel(session) {
     if (!session || session.type !== 'oric-debug') {
         if (symbolsPanel) {
-            // Even without a debug session, show defines if available
-            const defines = buildDefineEntries();
-            symbolsPanel.webview.postMessage({ type: 'symbols', data: defines.length > 0 ? defines : null });
+            // Even without a debug session, show the constants if available
+            const consts = buildConstantEntries();
+            symbolsPanel.webview.postMessage({ type: 'symbols', data: consts.length > 0 ? consts : null });
         }
         symbolCache.clear();
         return;
@@ -4739,7 +4773,7 @@ function refreshSymbolsPanel(session) {
             }
             if (panelVisible) {
                 // Merge runtime symbols with defines
-                const combined = [...resp.symbols, ...buildDefineEntries()];
+                const combined = [...resp.symbols, ...buildConstantEntries()];
                 symbolsPanel.webview.postMessage({ type: 'symbols', data: combined });
                 if (refreshSymbolBpMarks) refreshSymbolBpMarks();   // light the bp dots
             }
@@ -5742,6 +5776,7 @@ col.col-bp { width: 20px; }
         <option value="ram">RAM</option>
         <option value="high">High</option>
         <option value="define">Define</option>
+        <option value="enum">Enum</option>
     </select>
     <span class="count" id="count"></span>
 </div>
@@ -5829,6 +5864,7 @@ function groupLabel(g) {
     if (g === 'ram') return 'RAM';
     if (g === 'high') return 'High';
     if (g === 'define') return '#def';
+    if (g === 'enum') return 'enum';
     return g;
 }
 
