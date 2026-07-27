@@ -150,7 +150,7 @@
                 },
                 {
                     "id": "oricCurrentInstr",
-                    "name": "Oric CPU & Current Instruction",
+                    "name": "Debug Dashboard",
                     "type": "webview",
                     "icon": "images/oric.svg",
                     "when": "!oric-debug.osdkIncompatible"
@@ -172,7 +172,7 @@
                 {
                     "id": "oricData",
                     "visibility": "collapsed",
-                    "name": "Oric Data",
+                    "name": "Snapshots & Automation",
                     "icon": "images/oric.svg",
                     "when": "!oric-debug.osdkIncompatible"
                 },
