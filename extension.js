@@ -7738,7 +7738,7 @@ function activate(context) {
     };
     // Write at whichever scope already defines the value. Always writing Global would make the
     // button look BROKEN for anyone with a workspace-level override: the global value would change
-    // while the effective one -- and therefore the panel -- did not move at all.
+    // while the effective one — and therefore the panel — did not move at all.
     const setWrapRows = (on) => {
         const cfg = vscode.workspace.getConfiguration('oric-debug');
         const info = cfg.inspect('wrapPanelRows') || {};
@@ -8534,7 +8534,7 @@ function activate(context) {
     symWatcher.onDidCreate(onSymChange);
     context.subscriptions.push(symWatcher);
 
-    // ---- Oric Snapshots panel (TreeView) --------------------------------------
+    // ---- Snapshots: the "Snapshots" group of the Oric Data tree ---------------
     // Lists the project's snapshots (from the adapter). Restore on click, inline
     // restore/delete/rename; refreshes on the adapter's oricSnapshotsChanged event
     // (covers the [save] logpoint token) and on session start/stop.
@@ -8679,10 +8679,10 @@ function activate(context) {
             return it;
         }
     };
-    const snapTree = vscode.window.createTreeView('oricSnapshots', { treeDataProvider: snapTreeProvider });
+    // No view of its own any more: snapTreeProvider is a DELEGATE of the merged "Oric Data" tree
+    // created further down (it needs autoTreeProvider too, which is defined later).
     const snapSession = () => { const s = vscode.debug.activeDebugSession; return (s && s.type === 'oric-debug') ? s : null; };
     context.subscriptions.push(
-        snapTree,
         vscode.window.registerFileDecorationProvider(snapDecoProvider),
         vscode.debug.onDidReceiveDebugSessionCustomEvent(e => {
             if (e.event === 'oricSnapshotsChanged') refreshSnapshots();
@@ -8727,7 +8727,7 @@ function activate(context) {
     );
     if (snapSession()) refreshSnapshots();
 
-    // --- Oric Automation panel — list runnable automation scripts with a ▶ Run button.
+    // --- Automation: the "Automation" group of the Oric Data tree — runnable scripts, ▶ Run each.
     // Folder-split convention: standalone scripts are automation/<name>.js (the glob lists only
     // the top level); utility modules go in automation/lib/ and are NOT listed. getChildren reads
     // disk so scripts show with no session; ▶ Run starts a session if needed (runAutomationScript).
@@ -8773,13 +8773,53 @@ function activate(context) {
             return it;
         }
     };
-    const autoTree = vscode.window.createTreeView('oricAutomation', { treeDataProvider: autoTreeProvider });
+    // Snapshots and Automation now share ONE panel. Each used to be its own view with its own
+    // minimum height, so a project with two snapshots and one script spent most of the sidebar on
+    // empty space. Two collapsible group rows instead, with the per-group actions as inline buttons
+    // ON the group row: a single title bar cannot usefully hold all six, and two of them ("open
+    // folder") would be ambiguous once merged. Both original providers are reused unchanged as
+    // delegates, so every row, icon, tooltip, click action and context menu behaves exactly as before.
+    const dataEmitter = new vscode.EventEmitter();
+    snapEmitter.event(() => dataEmitter.fire());   // either side changing repaints the whole tree,
+    autoEmitter.event(() => dataEmitter.fire());   // which is also what keeps the group counts right
+    const dataTreeProvider = {
+        onDidChangeTreeData: dataEmitter.event,
+        async getChildren(el) {
+            if (!el) return [
+                { kind: 'group', group: 'snap', count: listSnapshotsOnDisk().length },
+                { kind: 'group', group: 'auto', count: (await listAutomationScriptFiles()).length },
+            ];
+            if (el.kind !== 'group') return [];
+            // Tag each delegate row with its origin: BOTH providers emit kind 'hint', so without
+            // this getTreeItem could not tell whose row it is being asked to render.
+            const src = el.group === 'snap' ? snapTreeProvider : autoTreeProvider;
+            const kids = await src.getChildren();
+            return (kids || []).map(k => ({ ...k, _g: el.group }));
+        },
+        getTreeItem(el) {
+            if (el.kind === 'group') {
+                const snap = el.group === 'snap';
+                const it = new vscode.TreeItem(snap ? 'Snapshots' : 'Automation',
+                    vscode.TreeItemCollapsibleState.Expanded);
+                it.description = String(el.count);   // count visible on the row, not only in a tooltip
+                it.contextValue = snap ? 'oricGroupSnap' : 'oricGroupAuto';
+                it.iconPath = new vscode.ThemeIcon(snap ? 'history' : 'run-all');
+                it.id = 'group:' + el.group;
+                return it;
+            }
+            return (el._g === 'snap' ? snapTreeProvider : autoTreeProvider).getTreeItem(el);
+        }
+    };
+    const dataTree = vscode.window.createTreeView('oricData', { treeDataProvider: dataTreeProvider });
     const autoWatcher = vscode.workspace.createFileSystemWatcher('**/automation/*.js');
     autoWatcher.onDidCreate(() => autoEmitter.fire());
     autoWatcher.onDidDelete(() => autoEmitter.fire());
     autoWatcher.onDidChange(() => autoEmitter.fire());
     context.subscriptions.push(
-        autoTree, autoWatcher,
+        dataTree, autoWatcher,
+        // One refresh for the merged panel: re-reads both sides (the snapshots folder and the
+        // automation scripts), so the single title-bar button covers what two used to.
+        vscode.commands.registerCommand('oric-debug.dataRefresh', () => { snapEmitter.fire(); autoEmitter.fire(); }),
         vscode.commands.registerCommand('oric-debug.automationRunItem', node => { if (node && node.fsPath) runAutomationScript(node.fsPath); }),
         vscode.commands.registerCommand('oric-debug.automationOpenItem', node => { if (node && node.fsPath) vscode.window.showTextDocument(vscode.Uri.file(node.fsPath)); }),
         vscode.commands.registerCommand('oric-debug.automationRefresh', () => autoEmitter.fire()),

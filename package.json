@@ -2,7 +2,7 @@
     "name": "osdk-debug",
     "displayName": "OSDK",
     "description": "Oric Software Development Kit - 6502/XA assembly highlighting and Oricutron debugging",
-    "version": "0.0.97",
+    "version": "0.0.98",
     "publisher": "DefenceForce",
     "license": "MIT",
     "icon": "images/oric-icon.png",
@@ -170,16 +170,9 @@
                     "when": "!oric-debug.osdkIncompatible"
                 },
                 {
-                    "id": "oricSnapshots",
+                    "id": "oricData",
                     "visibility": "collapsed",
-                    "name": "Oric Snapshots",
-                    "icon": "images/oric.svg",
-                    "when": "!oric-debug.osdkIncompatible"
-                },
-                {
-                    "id": "oricAutomation",
-                    "visibility": "collapsed",
-                    "name": "Oric Automation",
+                    "name": "Oric Data",
                     "icon": "images/oric.svg",
                     "when": "!oric-debug.osdkIncompatible"
                 },
@@ -430,6 +423,11 @@
                 "icon": "$(rocket)"
             },
             {
+                "command": "oric-debug.dataRefresh",
+                "title": "Oric: Refresh Snapshots & Automation",
+                "icon": "$(refresh)"
+            },
+            {
                 "command": "oric-debug.wrapOn",
                 "title": "Oric: Wrap Long Rows In Panel",
                 "icon": "$(word-wrap)"
@@ -583,26 +581,25 @@
                 { "command": "oric-debug.bpEnableAll", "when": "view == oricBreakpoints", "group": "navigation@1" },
                 { "command": "oric-debug.bpDisableAll", "when": "view == oricBreakpoints", "group": "navigation@2" },
                 { "command": "oric-debug.bpRemoveAll", "when": "view == oricBreakpoints", "group": "navigation@3" },
-                { "command": "oric-debug.snapshotSave", "when": "view == oricSnapshots", "group": "navigation@1" },
-                { "command": "oric-debug.snapshotRefresh", "when": "view == oricSnapshots", "group": "navigation@2" },
-                { "command": "oric-debug.snapshotOpenFolder", "when": "view == oricSnapshots", "group": "navigation@3" },
-                { "command": "oric-debug.stopAutomationScript", "when": "view == oricAutomation && oric-debug.automationRunning", "group": "navigation@1" },
-                { "command": "oric-debug.automationRefresh", "when": "view == oricAutomation", "group": "navigation@2" },
-                { "command": "oric-debug.automationOpenFolder", "when": "view == oricAutomation", "group": "navigation@3" },
+                { "command": "oric-debug.dataRefresh", "when": "view == oricData", "group": "navigation@1" },
                 { "command": "oric-debug.wrapOn", "when": "view == oricCurrentInstr && !oric-debug.wrapRows", "group": "navigation@1" },
                 { "command": "oric-debug.wrapOff", "when": "view == oricCurrentInstr && oric-debug.wrapRows", "group": "navigation@1" }
             ],
             "view/item/context": [
-                { "command": "oric-debug.snapshotRestoreItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "inline@1" },
-                { "command": "oric-debug.snapshotRenameItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "inline@2" },
-                { "command": "oric-debug.snapshotDeleteItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "inline@3" },
-                { "command": "oric-debug.snapshotRestoreItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "1_snap@1" },
-                { "command": "oric-debug.snapshotRenameItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "1_snap@2" },
-                { "command": "oric-debug.snapshotDeleteItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "1_snap@3" },
-                { "command": "oric-debug.automationRunItem", "when": "view == oricAutomation && viewItem == oricAutoScript", "group": "inline@1" },
-                { "command": "oric-debug.automationOpenItem", "when": "view == oricAutomation && viewItem == oricAutoScript", "group": "inline@2" },
-                { "command": "oric-debug.automationRunItem", "when": "view == oricAutomation && viewItem == oricAutoScript", "group": "1_auto@1" },
-                { "command": "oric-debug.automationOpenItem", "when": "view == oricAutomation && viewItem == oricAutoScript", "group": "1_auto@2" },
+                { "command": "oric-debug.snapshotRestoreItem", "when": "view == oricData && viewItem == oricSnap", "group": "inline@1" },
+                { "command": "oric-debug.snapshotRenameItem", "when": "view == oricData && viewItem == oricSnap", "group": "inline@2" },
+                { "command": "oric-debug.snapshotDeleteItem", "when": "view == oricData && viewItem == oricSnap", "group": "inline@3" },
+                { "command": "oric-debug.snapshotRestoreItem", "when": "view == oricData && viewItem == oricSnap", "group": "1_snap@1" },
+                { "command": "oric-debug.snapshotRenameItem", "when": "view == oricData && viewItem == oricSnap", "group": "1_snap@2" },
+                { "command": "oric-debug.snapshotDeleteItem", "when": "view == oricData && viewItem == oricSnap", "group": "1_snap@3" },
+                { "command": "oric-debug.automationRunItem", "when": "view == oricData && viewItem == oricAutoScript", "group": "inline@1" },
+                { "command": "oric-debug.automationOpenItem", "when": "view == oricData && viewItem == oricAutoScript", "group": "inline@2" },
+                { "command": "oric-debug.automationRunItem", "when": "view == oricData && viewItem == oricAutoScript", "group": "1_auto@1" },
+                { "command": "oric-debug.automationOpenItem", "when": "view == oricData && viewItem == oricAutoScript", "group": "1_auto@2" },
+                { "command": "oric-debug.snapshotSave", "when": "view == oricData && viewItem == oricGroupSnap", "group": "inline@1" },
+                { "command": "oric-debug.snapshotOpenFolder", "when": "view == oricData && viewItem == oricGroupSnap", "group": "inline@2" },
+                { "command": "oric-debug.stopAutomationScript", "when": "view == oricData && viewItem == oricGroupAuto && oric-debug.automationRunning", "group": "inline@1" },
+                { "command": "oric-debug.automationOpenFolder", "when": "view == oricData && viewItem == oricGroupAuto", "group": "inline@2" },
                 { "command": "oric-debug.bpEnableModule", "when": "view == oricBreakpoints && viewItem == oricModule", "group": "inline@1" },
                 { "command": "oric-debug.bpDisableModule", "when": "view == oricBreakpoints && viewItem == oricModule", "group": "inline@2" },
                 { "command": "oric-debug.bpEnableModule", "when": "view == oricBreakpoints && viewItem == oricModule", "group": "1_mod@1" },
