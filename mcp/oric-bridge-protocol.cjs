@@ -56,7 +56,7 @@ const OBSERVE_REQUESTS = new Set([
     'exceptionInfo', 'gotoTargets', 'listSnapshots',
     // Pure lookups: resolve a symbol to an address, and report breakpoint bound/armed state.
     // Both are reads — an observe-only client must not be blocked on them.
-    'addrForSymbol', 'breakpointStatus', 'symbolTableLite',
+    'addrForSymbol', 'breakpointStatus', 'symbolTableLite', 'labelsForAddresses',
 ]);
 function classify(cmd) {
     if (CONTROL_REQUESTS.has(cmd)) return 'control';

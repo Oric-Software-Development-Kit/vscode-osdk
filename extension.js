@@ -269,7 +269,16 @@ class RegistersWebviewProvider {
     }
 
     refresh(session) {
-        if (!this._view) return;
+        // NOTE: this provider no longer owns a view — the CPU registers are rendered at the top of
+        // the merged "Oric CPU & Current Instruction" panel (one place for "where am I and what is
+        // the machine doing", instead of the same PC printed in two views). It still does the
+        // fetching, so it must NOT bail out just because _view is null.
+        // NB: `postCpuToInstrPanel`, not `currentInstrView` — this class lives at MODULE scope while
+        // currentInstrView is a local inside activate(). Referencing it here threw a ReferenceError
+        // on every call, and because this is the FIRST statement in refreshAll() it aborted the
+        // whole refresh chain (registers, disassembly, instruction, locals) silently, inside a
+        // setTimeout. The module-scope hook is set in activate() once the panel exists.
+        if (!this._view && !postCpuToInstrPanel) return;
         if (!session || session.type !== 'oric-debug') {
             this.markStale();
             return;
@@ -286,14 +295,22 @@ class RegistersWebviewProvider {
             if (flagResp && flagResp.variables)
                 for (const v of flagResp.variables) flags[v.name] = v.value;
             const extra = extraResp && extraResp.extra;
+            // Raster is VIDEO state, so it is shown in the Screen View's status line (next to the
+            // frame counter, which the viz stream already provides live) rather than among the CPU
+            // registers. Forwarded here because it is only readable CPU-side, at a stop.
+            if (screenPanel && extra) screenPanel.webview.postMessage({ type: 'raster', raster: extra.R });
             this._last = { regs, flags, extra };
             this._updateHtml(regs, flags, extra, false);
+            if (postCpuToInstrPanel) postCpuToInstrPanel(regs, flags, extra);   // top block of the merged panel
         }).catch(() => this.markStale());
     }
 
     // No live data (no session or running): keep the last values but dimmed, so it's
     // obviously stale. Nothing ever shown yet → the plain "no session" placeholder.
     markStale() {
+        // Drop the raster from the Screen View: its frame counter keeps ticking live from the viz
+        // stream, so leaving a frozen raster beside it would read as current when it is not.
+        if (screenPanel) screenPanel.webview.postMessage({ type: 'raster', raster: null });
         if (!this._view) return;
         if (this._last) this._updateHtml(this._last.regs, this._last.flags, this._last.extra, true);
         else this._view.webview.html = '<body style="color:var(--vscode-foreground);font-family:var(--vscode-editor-font-family);font-size:var(--vscode-editor-font-size);padding:8px"><i>No debug session</i></body>';
@@ -334,12 +351,17 @@ class RegistersWebviewProvider {
         let extraHtml = '';
         if (extra) {
             const ex = (label, key, val) => {
-                const s = val !== undefined ? (typeof val === 'number' ? (key === 'CY' || key === 'FM' || key === 'RS' ? val.toString() : hex4(val)) : val) : '?';
+                // CY is a count -> decimal; the rest (LPC and the vectors) are addresses -> hex.
+                const s = val !== undefined ? (typeof val === 'number' ? (key === 'CY' ? val.toString() : hex4(val)) : val) : '?';
                 return '<span><span class="n">' + label + '</span>=<span class="' + vc('x' + key, s) + '">' + s + '</span></span>';
             };
+            // FM (frame) and RS (raster) used to sit here. They are VIDEO state, not CPU state, so
+            // they now live in the Screen View's status line — where the frame counter was already
+            // shown LIVE from the viz stream, making the register copy both misplaced and staler.
+            // Kept here: LPC (previous PC, grouped with PC below) and the cycle counter.
             extraHtml = `<div class="sep"></div>
 <div class="r">
- ${ex('LPC', 'LPC', extra.L)} ${ex('CY', 'CY', extra.C)} ${ex('FM', 'FM', extra.F)} ${ex('RS', 'RS', extra.R)}
+ ${ex('LPC', 'LPC', extra.L)} ${ex('Cycles', 'CY', extra.C)}
 </div>
 <div class="sep"></div>
 <div class="r">
@@ -2832,6 +2854,14 @@ let curVidMode = 0;
 let curVidAddr = 0;
 let curVidbases = [0, 0, 0, 0];
 let curFrameCounter = 0;
+// Status line is assembled from two sources: the live viz frame (frame/mode/video base) and the
+// raster line, which is CPU-side and only arrives at a stop. Keep them separately so neither
+// overwrites the other.
+let lastFrameStatus = '';
+let lastRaster = null;
+function paintStatus() {
+    status.textContent = lastFrameStatus + (lastRaster != null ? '  |  Raster ' + lastRaster : '');
+}
 
 // Last hover position for refreshing zoom on new frames
 let hoverPx = -1, hoverPy = -1;
@@ -2865,9 +2895,13 @@ function renderScreen(msg) {
     screenCtx.putImageData(screenImg, 0, 0);
     crt.render();   // refresh the CRT effect from the new frame (no-op when disabled)
 
-    status.textContent = 'Frame ' + msg.frameCounter +
+    // Frame/mode/video-base come live from the viz stream. The raster line arrives separately
+    // (it is CPU-side state, only meaningful at a stop) and is appended by setRasterLine() —
+    // keep whatever it last set so a new frame doesn't erase it.
+    lastFrameStatus = 'Frame ' + msg.frameCounter +
         ' | ' + ((msg.vidMode & 4) ? 'HIRES' : 'TEXT') +
         ' | Vid $' + msg.vidAddr.toString(16).toUpperCase().padStart(4, '0');
+    paintStatus();
 
     // Refresh inspector if mouse is hovering
     if (hoverPx >= 0) updateInspector(hoverPx, hoverPy);
@@ -3374,6 +3408,9 @@ window.addEventListener('message', e => {
         return;
     }
     if (e.data.type === 'screenFrame') renderScreen(e.data);
+    // Raster line: video state, so it belongs here next to the screen rather than among the CPU
+    // registers. Sent at each stop (it is read CPU-side); null clears it while running.
+    if (e.data.type === 'raster') { lastRaster = (e.data.raster == null ? null : e.data.raster); paintStatus(); }
     if (e.data.type === 'status') { status.textContent = e.data.text; errorDiv.style.display = 'none'; }
     if (e.data.type === 'error') { errorDiv.textContent = e.data.text; errorDiv.style.display = 'block'; }
     if (e.data.type === 'runstate') {
@@ -3512,6 +3549,7 @@ function sessionIsActive() {
 }
 let oricWarpOn = false;       // current warp/turbo speed state (mirrors the toggleWarp toggle) — for the Screen View OSD
 let dimLiveViews = null;      // set in activate: greys the live-data views (regs/peripherals/…) when not stopped
+let postCpuToInstrPanel = null;   // set in activate: pushes the CPU block to the merged instruction panel
 // Deferred dimming (see applyDebugStateVisuals): only grey the live views once the machine has
 // actually been running for a moment. A step re-stops long before this fires, so it is cancelled
 // and nothing ever dims for a single step.
@@ -4363,7 +4401,6 @@ const symbolCache = new Map(); // name -> { addr, size, value, group, source }
 
 // Define cache: populated by scanning workspace source files for #define directives
 const defineCache = new Map(); // name -> { value (string), numValue (number|null), file, line }
-
 async function scanDefines() {
     defineCache.clear();
     const files = await vscode.workspace.findFiles('**/*.{s,h,asm}', '**/node_modules/**', 500);
@@ -6953,11 +6990,15 @@ function activate(context) {
     let currentInstrView = null;   // WebviewView, set once the panel is resolved
 
     let lastGoodInstr = null;   // last LIVE render that had content, replayed dimmed when not stopped
-    function renderCurrentInstr(stale) {
+    function renderCurrentInstr(stale, emptyText) {
         if (!currentInstrView) return;
         const msg = {
             type: 'instr',
             stale: !!stale,   // keep the content but grey it out when not stopped
+            // Shown only when there is nothing to display. Distinguishes "no session" from
+            // "stopped but this PC has no source line" — one shared string made those two
+            // indistinguishable, which is exactly how an empty panel became a mystery.
+            emptyText: emptyText || null,
             pc: (typeof lastPcAddr === 'number') ? lastPcAddr : null,
             file: instrDecoFile,
             line: instrDecoLine,
@@ -6999,6 +7040,55 @@ function activate(context) {
         // after the session ends you generally want to read the last values, not lose them.
     }
 
+    // CPU block for the TOP of this panel (merged from the old separate Registers view). The PC was
+    // previously printed in both views; now "where am I / what is the machine doing" is one place,
+    // and the vector addresses get resolved to symbol names, which is the part that actually tells
+    // you something ($FCCC means nothing, IrqDoNothing means everything).
+    let lastCpuMsg = null;   // last CPU payload, replayed when the panel is (re)resolved
+    postCpuToInstrPanel = async (regs, flags, extra, stale) => {
+        if (!currentInstrView) return;
+        const hex4 = v => '$' + (v & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
+        const vectors = [];
+        if (extra) {
+            for (const [label, val] of [['NMI', extra.N], ['RST', extra.T], ['IRQ', extra.I]])
+                if (typeof val === 'number') vectors.push({ label, addr: val, hex: hex4(val), name: null });
+        }
+        // Resolve each vector to a label (best effort: no symbols loaded yet -> just the address).
+        const s = vscode.debug.activeDebugSession;
+        if (s && s.type === 'oric-debug' && vectors.length) {
+            try {
+                const r = await s.customRequest('labelsForAddresses', { addresses: vectors.map(v => v.addr) });
+                const names = (r && r.labels) || [];
+                vectors.forEach((v, i) => { if (names[i] && names[i] !== v.hex) v.name = names[i]; });
+            } catch (_) { /* older adapter: addresses only */ }
+        }
+        // Previous PC gets the SAME treatment as the current one — address + symbol + file:line —
+        // so "where did I come from" is as readable as "where am I", instead of a bare address.
+        let prev = null;
+        if (extra && typeof extra.L === 'number') {
+            prev = { hex: hex4(extra.L), addr: extra.L, label: null, file: null, line: 0 };
+            if (s && s.type === 'oric-debug') {
+                try {
+                    const [lbl, loc] = await Promise.all([
+                        s.customRequest('labelsForAddresses', { addresses: [extra.L] }),
+                        s.customRequest('locationForAddress', { address: extra.L & 0xFFFF }),
+                    ]);
+                    const nm = lbl && lbl.labels && lbl.labels[0];
+                    if (nm && nm !== prev.hex) prev.label = nm;
+                    if (loc && loc.location) { prev.file = loc.location.file; prev.line = loc.location.line; }
+                } catch (_) { /* address only */ }
+            }
+        }
+        lastCpuMsg = {
+            type: 'cpu', stale: !!stale,
+            regs: regs || null, flags: flags || null,
+            prev,
+            cycles: extra && typeof extra.C === 'number' ? extra.C : null,
+            vectors,
+        };
+        currentInstrView.webview.postMessage(lastCpuMsg);
+    };
+
     // Locals for the current frame, shown at the BOTTOM of this panel. They aren't the current
     // instruction, but they are what the executing code is working on — and putting them here
     // means the built-in VARIABLES view is no longer needed just to reach Locals (which sits
@@ -7038,7 +7128,11 @@ function activate(context) {
     }
 
     function refreshInstructionAnnotation(session) {
-        if (!session || session.type !== 'oric-debug') { markInstrStale(); return; }
+        if (!session || session.type !== 'oric-debug') {
+            if (lastGoodInstr) markInstrStale();                       // keep the last stop, dimmed
+            else renderCurrentInstr(true, 'No debug session — press F5 to start one');
+            return;
+        }
         refreshCurrentInstrLocals(session);
         session.customRequest('resolveInstruction').then(resp => {
             const hasVars = resp && resp.lineVars && resp.lineVars.length > 0;
@@ -7062,7 +7156,8 @@ function activate(context) {
                 // No annotation for this PC (source-less code, or the adapter hasn't caught up).
                 // Keep the last good render dimmed instead of flashing "— no instruction —";
                 // only genuinely clear when there has never been anything to show.
-                if (lastGoodInstr) markInstrStale(); else clearInstrDecoration();
+                if (lastGoodInstr) markInstrStale();
+                else renderCurrentInstr(false, 'Stopped, but this address has no source line');
             }
         }).catch(() => { markInstrStale(); });   // session dying (query threw) → keep last-good dimmed, don't clear
     }
@@ -7074,7 +7169,10 @@ function activate(context) {
             body { font-family: var(--vscode-editor-font-family, monospace);
                    font-size: var(--vscode-editor-font-size, 13px);
                    color: var(--vscode-editor-foreground); padding: 6px 10px; margin: 0; }
-            #hdr { color: var(--vscode-descriptionForeground, #808080); font-size: 0.85em; padding-bottom: 5px; margin-bottom: 6px;
+            /* NO font-size here. #hdr now holds nothing but a .pcline, which sets its own 0.85em —
+               keeping it here made the sizes COMPOUND (0.85 x 0.85 = 0.72em) so the 'current' row
+               rendered smaller than the 'prev' row it is meant to match. */
+            #hdr { color: var(--vscode-descriptionForeground, #808080); padding-bottom: 5px; margin-bottom: 6px;
                    border-bottom: 1px solid var(--vscode-panel-border, #80808040); }
             #hdr .loc-link { color: var(--vscode-textLink-foreground); cursor: pointer; }
             #hdr .loc-link:hover { text-decoration: underline; }
@@ -7086,8 +7184,36 @@ function activate(context) {
             #asm { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--vscode-panel-border, #80808040);
                    white-space: pre-wrap; word-break: break-word; }
             #asm .lbl { color: var(--vscode-descriptionForeground, #808080); font-size: 0.85em; }
+            /* CPU block (top): registers, flags, LPC/cycles and the interrupt vectors with their
+               symbol names. Merged in from the old separate Registers view so the PC is printed
+               once and everything about "where am I" sits together. */
+            /* No bottom rule: the only separator near the prev/current pair belongs ABOVE the
+               pair (see .pcline.prev), dividing it from the registers. A rule here would have cut
+               between prev and current, which are meant to read as one before/after unit. */
+            #cpu { margin-bottom: 3px; }
+            /* Shared location-line format: fixed-width label column so the addresses align. */
+            /* Both location rows share this: #hdr sets 0.85em, so without an explicit size the prev
+               row (which lives in #cpu) rendered LARGER than the current row it pairs with. */
+            .pcline { white-space: nowrap; font-size: 0.85em; }
+            .pcline .lab { display: inline-block; min-width: 4.6em; color: var(--vscode-descriptionForeground, #888); }
+            .pcline.prev { opacity: 0.65; border-top: 1px solid var(--vscode-widget-border, #333); margin-top: 4px; padding-top: 4px; }
+            /* The WHOLE row is clickable when it has a location: the jump is the point of the row,
+               and hunting for the file:line span is fiddly — especially for prev, which can be an
+               RTI or a JSR in a completely different file. */
+            .pcline[data-file] { cursor: pointer; }
+            .pcline[data-file]:hover { background: var(--vscode-list-hoverBackground, #ffffff14); }
+            .pcline .loc-link { color: var(--vscode-textLink-foreground); }
+            .pcline[data-file]:hover .loc-link { text-decoration: underline; }
+            #cpu .cr { white-space: nowrap; }
+            #cpu .gap { height: 0.55em; }
+            #cpu .n { color: var(--vscode-descriptionForeground, #888); }
+            #cpu .fon { color: var(--vscode-charts-green, #89d185); font-weight: bold; }
+            #cpu .foff { color: var(--vscode-descriptionForeground, #666); }
+            #cpu .vecname { color: var(--vscode-charts-purple, #c586c0); }
             /* Locals: always-visible value rows at the bottom (see refreshCurrentInstrLocals).
                Separated by a rule so it reads as its own section, not more instruction detail. */
+            #vec { margin-top: 6px; border-top: 1px solid var(--vscode-widget-border, #333); padding-top: 4px; }
+            #vec .lbl { color: var(--vscode-descriptionForeground, #808080); font-size: 0.85em; }
             #locals { margin-top: 6px; border-top: 1px solid var(--vscode-widget-border, #333); padding-top: 4px; }
             #locals .lbl { color: var(--vscode-descriptionForeground, #808080); font-size: 0.85em; }
             #locals .vrow.child { padding-left: 1.2em; }
@@ -7108,12 +7234,18 @@ function activate(context) {
             .op  { color: var(--vscode-descriptionForeground, #808080); }
             .mne { color: var(--vscode-symbolIcon-keywordForeground, #569cd6); }
         </style></head><body>
+            <!-- Order matters and is deliberate: CPU state, then where we are (prev/current), then
+                 the actual 6502 instruction, then the C statement it belongs to and its decoded
+                 variables, then locals. Interrupt vectors go LAST — reference state that almost
+                 never changes must not sit between things you read on every step. -->
+            <div id="cpu" style="display:none"></div>
             <div id="hdr"></div>
+            <div id="asm" style="display:none"></div>
             <div id="cmt"></div>
             <div id="src"></div>
-            <div id="ann"><span class="empty">— no instruction —</span></div>
-            <div id="asm" style="display:none"></div>
+            <div id="ann"><span class="empty">waiting for a debug session…</span></div>
             <div id="locals" style="display:none"></div>
+            <div id="vec" style="display:none"></div>
             <script>
                 const vs = acquireVsCodeApi();
                 const hdr = document.getElementById('hdr');
@@ -7164,6 +7296,68 @@ function activate(context) {
                     return esc(mm[1]) + '<span class="mne">' + esc(mm[2]) + '</span>'
                          + tokenize(text.slice(mm[0].length), function(){ return 'sym'; });
                 }
+                // CPU block (top): compact rows — A/X/Y/SP/PC, flags, PC's predecessor + cycles,
+                // then the three interrupt vectors WITH their symbol names (the useful part).
+                const cpu = document.getElementById('cpu');
+                const vec = document.getElementById('vec');
+                // ONE renderer for both the previous and the current location, so they can never
+                // drift apart in format again. The label sits in a fixed-width column so the
+                // addresses line up vertically; the extra class adds the dimming/rule for prev.
+                // (No backticks in here: this whole document is a template literal.)
+                function pcLine(label, hex, file, line, extra){
+                    let h = '<span class="lab">' + esc(label) + '</span>' + colorize(hex || '');
+                    let attrs = '';
+                    if (file && line > 0){
+                        const base = String(file).split(/[\\\\/]/).pop();
+                        h += '  ·  <span class="loc-link">' + esc(base + ':' + line) + '</span>';
+                        // Location on the ROW, not just the span, so a click anywhere in it jumps.
+                        attrs = ' data-file="' + esc(String(file)) + '" data-line="' + line + '"';
+                    }
+                    return '<div class="pcline' + (extra ? ' ' + extra : '') + '"' + attrs + '>' + h + '</div>';
+                }
+                function renderCpu(d){
+                    if (!d.regs){ cpu.style.display = 'none'; cpu.innerHTML = ''; vec.style.display = 'none'; return; }
+                    const R = d.regs, F = d.flags || {};
+                    // Layout: flags (+cycles) first, then ONE ROW PER REGISTER — the full
+                    // hex|dec|%binary|'char' annotations are wide, so packing them on one line
+                    // either wrapped or overflowed in a narrow sidebar. PC is deliberately absent:
+                    // it is shown on the location line below, where the file:line gives it meaning.
+                    const reg = (n) => R[n] === undefined ? '' :
+                        '<div class="cr"><span class="n">' + n + '</span>=' + colorize(String(R[n])) + '</div>';
+                    let h = '';
+                    const fkeys = [['N','N (Negative)'],['V','V (Overflow)'],['B','B (Break)'],['D','D (Decimal)'],
+                                   ['I','I (Interrupt)'],['Z','Z (Zero)'],['C','C (Carry)']];
+                    // UPPERCASE = set, lowercase = clear (the usual 6502-monitor convention). The
+                    // colour says the same thing, but state must not depend on colour alone.
+                    const fl = fkeys.map(([s,k]) => {
+                        const on = F[k] === '1';
+                        return '<span class="' + (on ? 'fon' : 'foff') + '">' + (on ? s : s.toLowerCase()) + '</span>';
+                    }).join(' ');
+                    // Row 1: flags + cycles.
+                    h += '<div class="cr">' + fl
+                       + (d.cycles != null ? '   <span class="n">cycles</span>=' + colorize(String(d.cycles)) : '')
+                       + '</div>';
+                    // Rows 2..n: one register each (SP kept — it is where the stack preview lands).
+                    // SP separated from A/X/Y: it is the stack pointer rather than a data register
+                    // (and it is where the stack preview will attach).
+                    h += ['A','X','Y'].map(reg).join('') + '<div class="gap"></div>' + reg('SP');
+                    // Where we came FROM. Rendered by the SHARED pcLine() so it is byte-for-byte the
+                    // same shape as the current-PC line directly beneath it (they diverged before
+                    // because two different code paths built them). Dimmed, and carrying the only
+                    // separator in the pair's vicinity: a rule ABOVE it, dividing the registers
+                    // from the prev/current pair, and nothing between prev and current themselves.
+                    if (d.prev) h += pcLine('prev', d.prev.hex, d.prev.file, d.prev.line, 'prev');
+                    cpu.innerHTML = h; cpu.style.display = '';
+                    // Vectors go BELOW the instruction, one per line: they are reference state that
+                    // rarely changes, so they must not push the live information down the panel.
+                    if (d.vectors && d.vectors.length){
+                        vec.innerHTML = '<div class="lbl">interrupt vectors</div>' + d.vectors.map(v =>
+                            '<div class="cr"><span class="n">' + esc(v.label) + '</span>=' + colorize(v.hex)
+                            + (v.name ? ' <span class="vecname">' + esc(v.name) + '</span>' : '') + '</div>'
+                        ).join('');
+                        vec.style.display = '';
+                    } else { vec.style.display = 'none'; vec.innerHTML = ''; }
+                }
                 // Locals section (bottom): name = value rows, aggregates flattened one level.
                 // Rendered here rather than in the built-in VARIABLES view so they need no
                 // expanding and sit next to the line that is using them.
@@ -7181,17 +7375,18 @@ function activate(context) {
                 }
                 window.addEventListener('message', function(e){
                     const d = e.data;
+                    if (d && d.type === 'cpu'){ renderCpu(d); return; }
                     if (d && d.type === 'locals'){ renderLocals(d.locals); return; }
                     if (!d || d.type !== 'instr') return;
                     document.body.classList.toggle('stale', !!d.stale);
                     const hasVars = d.lineVars && d.lineVars.length;
-                    if (!d.annotation && !hasVars){ hdr.style.display='none'; cmt.style.display='none'; src.style.display='none'; ann.innerHTML='<span class="empty">— no instruction —</span>'; return; }
+                    if (!d.annotation && !hasVars){ hdr.style.display='none'; cmt.style.display='none'; src.style.display='none'; ann.innerHTML='<span class="empty">' + esc(d.emptyText || '— no instruction —') + '</span>'; return; }
                     let h = '';
-                    if (typeof d.pc === 'number') h += esc('$' + (d.pc & 0xFFFF).toString(16).toUpperCase().padStart(4,'0'));
-                    if (d.file && d.line){
-                        const base = String(d.file).split(/[\\\\/]/).pop();
-                        h += (h?'  ·  ':'') + '<span class="loc-link" data-file="' + esc(String(d.file)) + '" data-line="' + d.line + '">' + esc(base + ':' + d.line) + '</span>';
-                    }
+                    // Same shared renderer as the prev line above, labelled 'current'. The register
+                    // rows deliberately omit PC: it only means something beside its source location.
+                    const pcHex = (typeof d.pc === 'number')
+                        ? '$' + (d.pc & 0xFFFF).toString(16).toUpperCase().padStart(4, '0') : '';
+                    h = pcLine('current', pcHex, d.file, d.line);
                     hdr.innerHTML = h; hdr.style.display = '';
                     cmt.textContent = d.comment || ''; cmt.style.display = d.comment ? '' : 'none';
                     // C source colorizes as C (plain identifiers); asm as a mnemonic line.
@@ -7207,8 +7402,11 @@ function activate(context) {
                         asm.innerHTML = a; asm.style.display = '';
                     } else { asm.style.display = 'none'; asm.innerHTML = ''; }
                 });
-                hdr.addEventListener('click', function(e){
-                    const el = e.target.closest('.loc-link[data-file]');
+                // Delegate from the BODY, not just the header: the prev-PC line carries a loc-link
+                // too, and a handler bound to #hdr alone would leave it dead.
+                document.body.addEventListener('click', function(e){
+                    // Either a whole location row (.pcline) or any legacy inline .loc-link.
+                    const el = e.target.closest('[data-file][data-line]');
                     if (el) vs.postMessage({ type: 'gotoSymbol', file: el.dataset.file, line: parseInt(el.dataset.line, 10) });
                 });
                 vs.postMessage({ type: 'ready' });
@@ -7221,7 +7419,21 @@ function activate(context) {
             currentInstrView = view;
             view.webview.options = { enableScripts: true };
             view.webview.onDidReceiveMessage(msg => {
-                if (msg && msg.type === 'ready') { renderCurrentInstr(); return; }
+                if (msg && msg.type === 'ready') {
+                    if (lastCpuMsg) currentInstrView.webview.postMessage(lastCpuMsg);   // replay cache
+                    const s = vscode.debug.activeDebugSession;
+                    if (s && s.type === 'oric-debug') {
+                        // FETCH NOW rather than waiting for a 'stopped' event. When the panel is
+                        // first resolved — notably after a window reload, where the session is
+                        // restored ALREADY STOPPED — that event has already happened and will never
+                        // come again, so the panel would sit empty until the user stepped. This is
+                        // what made it look permanently broken.
+                        refreshAll();
+                    } else {
+                        renderCurrentInstr(true, 'No debug session — press F5 to start one');
+                    }
+                    return;
+                }
                 if (msg && msg.type === 'gotoSymbol' && msg.file && msg.line > 0) {
                     const uri = vscode.Uri.file(msg.file);
                     vscode.workspace.openTextDocument(uri).then(doc => {
@@ -8547,11 +8759,18 @@ function activate(context) {
                 // keeps the `ended` flag from the previous session and reports a live session as
                 // "ended" (DOGFOODING #22).
                 if (bridgeServer) bridgeServer.broadcast('started', { session: s.name, stopped: oricDebugStopped });
+                // A session now exists but nothing has stopped yet, so there is no PC to show.
+                // Say that, instead of leaving "No debug session" on screen — which would be a lie
+                // for the whole build+launch window and reads as the panel being broken.
+                if (!lastGoodInstr) renderCurrentInstr(true, 'Session starting — waiting for the first stop…');
             }
             debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); bridgeUpdateStatusBar();
         }),
         vscode.debug.onDidTerminateDebugSession(s => { oricEndedSessionId = s && s.id; oricSessionActive = false; oricWarpOn = false; setSessionStarting(false); debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); bridgeUpdateStatusBar(); }),
-        vscode.window.registerWebviewViewProvider('oricCpuRegs', regsProvider),
+        // No 'oricCpuRegs' registration any more: that view was merged into
+        // 'oricCurrentInstr' (regsProvider still does the FETCHING and posts the CPU block there).
+        // Registering a provider for a view id that no longer exists in package.json is at best
+        // pointless and can abort the rest of activation.
         vscode.window.registerWebviewViewProvider('oricPeripherals', periphProvider),
         vscode.commands.registerCommand('oric-debug.openMemoryView', () => createMemoryPanel(context)),
         vscode.commands.registerCommand('oric-debug.openHeatmap', () => createHeatmapPanel()),
@@ -9056,6 +9275,7 @@ function activate(context) {
                             // repaint panels or yank the editor on each one (that's the flicker);
                             // runAutomationScript repaints once at the end. (The bp restore above
                             // still runs, once, so a cold-started automation session is armed.)
+                            if (automationRunning) vizLog('[stop] refresh SKIPPED — an automation script is registered as running (' + (automationRunningPath || '?') + '). If none is, this state is stuck and the panels will stay frozen.');
                             if (!automationRunning) {
                                 // Record the stop time so the imminent reveal-on-stop focus
                                 // change (source editor) isn't mistaken for a user click that

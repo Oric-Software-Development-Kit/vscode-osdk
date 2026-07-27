@@ -6450,6 +6450,14 @@ const handlers = {
         respond(req, { symbols: assembleSymbols() });
     },
 
+    // Resolve addresses to their symbol labels. Used for the CPU block's interrupt vectors: a bare
+    // "$FCCC" says nothing, "IrqDoNothing" says everything. Batched because a caller wants several
+    // at once (NMI/RST/IRQ) and one round-trip per stop is the budget.
+    labelsForAddresses(req) {
+        const list = (req.arguments && req.arguments.addresses) || [];
+        respond(req, { labels: list.map(a => (typeof a === 'number' ? labelFor(a & 0xFFFF) : null)) });
+    },
+
     // Real bound/armed state of every source breakpoint the adapter holds, so a caller
     // (the MCP bridge / an agent) can tell "accepted" from "actually armed" instead of
     // trusting an optimistic message. bound = the line resolved to >=1 address in some
