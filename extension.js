@@ -4325,13 +4325,39 @@ function removeWatchedExpr(expr) {
 // Source {file,line} for a top-level watched symbol (from the shared symbol cache),
 // so a pinned row can be clicked to jump to its definition — like the search results.
 // Only plain symbols resolve; computed expressions (a[i].f) have no single source.
+// Resolved definition sites for watched rows, so the lookup is not repeated for every row on
+// every stop. Cleared with symbolCache — a rebuild can move a definition.
+const watchSourceMemo = new Map();   // name -> {file,line} | null (null = looked up, nothing found)
 function watchNodeSource(expr) {
-    const c = symbolCache.get(expr);
+    if (watchSourceMemo.has(expr)) return watchSourceMemo.get(expr) || undefined;
+    // The C<->asm underscore variants are the same symbol: a watch on `_gWordBuffer` must still
+    // find `gWordBuffer` in the cache (and vice versa), or the row silently stops being clickable.
+    const alt = expr[0] === '_' ? expr.slice(1) : '_' + expr;
+    const c = symbolCache.get(expr) || symbolCache.get(alt);
     return (c && c.source && c.source.file) ? { file: c.source.file, line: c.source.line } : undefined;
+}
+// The symbol cache only knows what readAllSymbols happened to carry, so a watched row could show a
+// value yet have no definition to jump to. Fall back to the adapter's symbolDefinition — the SAME
+// resolver behind click-to-definition in the other panels, including the underscore variants and
+// the build-artifact rejection — so a name is clickable in the Watch exactly when it is elsewhere.
+async function resolveWatchSource(session, expr) {
+    const cached = watchNodeSource(expr);
+    if (cached) return cached;
+    if (watchSourceMemo.has(expr)) return undefined;         // already looked up, genuinely nothing
+    // Only a plain identifier has one definition site; a computed expression (a[i].f, *p) has none.
+    if (!session || session.type !== 'oric-debug' || !/^[A-Za-z_]\w*$/.test(expr)) return undefined;
+    let hit = null;
+    try {
+        const r = await session.customRequest('symbolDefinition', { names: [expr] });
+        const d = r && r.defs && r.defs[0];
+        if (d && d.file) hit = { file: d.file, line: d.line || 0 };
+    } catch (_) { /* older adapter: not clickable, same as before */ }
+    watchSourceMemo.set(expr, hit);
+    return hit || undefined;
 }
 async function buildWatchNode(session, path, label, value, vref, error, depth) {
     const node = { path, label, value, error: !!error, canExpand: !!vref, expanded: false, children: null };
-    if (depth === 0) { const src = watchNodeSource(label); if (src) node.source = src; }
+    if (depth === 0) { const src = await resolveWatchSource(session, label); if (src) node.source = src; }
     if (vref && watchExpanded.has(path) && depth < 8) {
         node.expanded = true;
         try {
@@ -4363,7 +4389,7 @@ async function refreshWatchValues(session) {
     for (const e of exprs) {
         try {
             const r = await session.customRequest('evaluate', { expression: e, context: 'watch' });
-            if (r && r.inactive) inactive.push({ path: e, label: e, owners: r.owners || '', source: watchNodeSource(e) });
+            if (r && r.inactive) inactive.push({ path: e, label: e, owners: r.owners || '', source: await resolveWatchSource(session, e) });
             else active.push(await buildWatchNode(session, e, e, (r && r.result) || '', r && r.variablesReference, false, 0));
         } catch (err) {
             const m = err && err.message ? err.message : 'error';
@@ -4744,6 +4770,7 @@ function refreshSymbolsPanel(session) {
             symbolsPanel.webview.postMessage({ type: 'symbols', data: consts.length > 0 ? consts : null });
         }
         symbolCache.clear();
+        watchSourceMemo.clear();   // a rebuild can move a definition
         return;
     }
     // Only fetch symbol values from memory when the symbols panel is visible
@@ -9763,6 +9790,7 @@ function activate(context) {
                         // repaints on reveal (setupSymbolsPanel's view-state hook).
                         if (msg.type === 'event' && msg.event === 'oricSymbolsChanged') {
                             symbolCache.clear();
+                            watchSourceMemo.clear();   // a rebuild can move a definition
                             refreshSymbolsPanel(session);
                             refreshWatchValues(session); // re-sort active/inactive on module switch
                             rebuildBpTree();             // module map may now be available/changed
@@ -9814,6 +9842,7 @@ function activate(context) {
             lastPcAddr = -1;
             clearHeatmapHighlight();
             symbolCache.clear();
+            watchSourceMemo.clear();   // a rebuild can move a definition
             disasmCenterAddr = null;
         })
     );
