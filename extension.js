@@ -3479,6 +3479,24 @@ let activeOricModuleName = null; // active overlay module NAME (for screenshot f
 let debugControlsProvider = null; // Oric Debug Controls webview view (button toolbar in the Run & Debug sidebar)
 let oricSessionActive = false; // true between an oric-debug session's start and terminate (activeDebugSession races on terminate)
 let oricEndedSessionId = null; // id of the session that just terminated, so it can't count as "live"
+// True from the moment a launch is resolved until the session starts (or the attempt dies). A
+// launch can take a long time — the build runs first — and during that window there is no debug
+// session, so the Start button used to still read "Start": pressing it again started a SECOND
+// instance ("... is already running. Do you want to start another instance?"). The button shows a
+// disabled "Starting…" instead.
+let oricSessionStarting = false;
+let oricStartingTimer = null;
+function setSessionStarting(on) {
+    oricSessionStarting = !!on;
+    if (oricStartingTimer) { clearTimeout(oricStartingTimer); oricStartingTimer = null; }
+    // Safety net: if a launch dies without ever producing a session (adapter failed to spawn,
+    // build aborted) there is no event to clear this, so never let the button stick forever.
+    if (oricSessionStarting) oricStartingTimer = setTimeout(() => {
+        oricStartingTimer = null; oricSessionStarting = false;
+        if (debugControlsProvider) debugControlsProvider.pushState();
+    }, 180000);
+    if (debugControlsProvider) debugControlsProvider.pushState();
+}
 
 // Is an oric-debug session running RIGHT NOW? Derived from the tracked flag OR the live API, so a
 // desync can't leave the UI dead: the flag is set in exactly one place (onDidStartDebugSession), and
@@ -3494,6 +3512,19 @@ function sessionIsActive() {
 }
 let oricWarpOn = false;       // current warp/turbo speed state (mirrors the toggleWarp toggle) — for the Screen View OSD
 let dimLiveViews = null;      // set in activate: greys the live-data views (regs/peripherals/…) when not stopped
+// Deferred dimming (see applyDebugStateVisuals): only grey the live views once the machine has
+// actually been running for a moment. A step re-stops long before this fires, so it is cancelled
+// and nothing ever dims for a single step.
+let dimTimer = null;
+const DIM_DELAY_MS = 250;
+function cancelPendingDim() { if (dimTimer) { clearTimeout(dimTimer); dimTimer = null; } }
+function scheduleDimLiveViews() {
+    cancelPendingDim();
+    dimTimer = setTimeout(() => {
+        dimTimer = null;
+        if (!oricDebugStopped && dimLiveViews) dimLiveViews();   // re-check: may have stopped meanwhile
+    }, DIM_DELAY_MS);
+}
 let refreshAllViews = null;   // set in activate = refreshAll; lets module-level code repaint the panels
 let handleSymBpAction = null; // set in activate: perform a Symbols-panel breakpoint action (exec bp / watchpoint)
 let refreshSymbolBpMarks = null; // set in activate: push the set of bp/wp addresses to the Symbols panel
@@ -3538,9 +3569,13 @@ function applyDebugStateVisuals() {
     if (bpTreeEmitter) bpTreeEmitter.fire();   // clear/redraw the "stopped here" marker
     pushDebugStateToDisasm();
     if (debugControlsProvider) debugControlsProvider.pushState();
-    // Not stopped (running or session ended) → grey the live-data views to show the
-    // values are stale. When stopped, refreshAll() re-renders them live.
-    if (!oricDebugStopped && dimLiveViews) dimLiveViews();
+    // Not stopped (running or session ended) → grey the live-data views to show the values are
+    // stale. DEFERRED, not immediate: a step resumes and re-stops within milliseconds, and
+    // greying every live view for that instant made the whole UI flash on each step — tiring to
+    // look at and useless, since the values are about to be re-read anyway. If we stop again
+    // before the delay elapses the dim is cancelled, so stepping never dims while a genuine
+    // run still does. (Same reasoning as the automation debounce above.)
+    if (!oricDebugStopped) scheduleDimLiveViews(); else cancelPendingDim();
     postScreenRunState();   // update the Screen View turbo/paused OSD
     updateReplayContext();  // enable/disable the Replay Rewind/Forward/to-Head buttons
 }
@@ -3902,14 +3937,29 @@ function debugControlsHtml() {
 <html><head><style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size, 13px); color: var(--vscode-foreground); padding: 6px; }
-.grp { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 6px; }
+/* FIXED ROWS — each group is exactly one row, at every sidebar width.
+   This panel lives in the Run & Debug sidebar, whose width the user changes constantly. With
+   flex-wrap the buttons re-wrapped at a different point on every resize, so row COUNT and
+   heights changed and the whole panel visibly jumped around (very obvious while recording).
+   nowrap makes the layout deterministic: three rows, always, in the same order. A width too
+   narrow for a row scrolls that row horizontally instead of reshuffling the panel.
+   Metrics stay compact (small padding + tight gaps) so scrolling is rarely needed, and labels
+   are always visible — never icon-only, since a tooltip is not an acceptable substitute. */
+.grp { display: flex; flex-wrap: nowrap; gap: 3px; margin-bottom: 5px; overflow: hidden; }
 .grp:last-child { margin-bottom: 0; }
+/* Too narrow for the labels -> collapse to ICONS ONLY (see fitLabels()). Preferred over
+   wrapping (which changed row count and made the panel jump) and over a scrollbar (which you
+   would have to drag to reach a button). Safe accessibility-wise because hovering a button
+   still prints its purpose + shortcut to the STATUS BAR, so no label lives only in a tooltip. */
+body.compact .dbg-btn { gap: 0; padding: 3px 7px; }
+body.compact .dbg-btn .lbl { display: none; }
+body.compact .dbg-btn .ic { font-size: 1.25em; }
 .dbg-btn {
-    display: inline-flex; align-items: center; gap: 5px;
+    display: inline-flex; align-items: center; gap: 3px;
     background: var(--vscode-button-secondaryBackground, #3a3d41);
     color: var(--vscode-button-secondaryForeground, #ccc);
     border: 1px solid var(--vscode-widget-border, #555);
-    border-radius: 4px; padding: 5px 9px; cursor: pointer;
+    border-radius: 4px; padding: 3px 5px; cursor: pointer;
     font-family: inherit; font-size: inherit; white-space: nowrap; flex: 0 0 auto;
 }
 .dbg-btn:hover:not(:disabled) { background: var(--vscode-button-secondaryHoverBackground, #45494e); }
@@ -3937,30 +3987,30 @@ body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size
 }
 </style></head><body>
 <div class="grp">
-    <button class="dbg-btn go" id="playpause" data-act="playpause"><span class="ic" id="ppIcon">&#9654;</span><span id="ppLbl">Continue</span></button>
-    <button class="dbg-btn stop" data-act="stop"><span class="ic">&#9632;</span>Stop</button>
-    <button class="dbg-btn" data-act="restart"><span class="ic">&#8635;</span>Restart</button>
-    <button class="dbg-btn warp" id="warpBtn" data-act="warp"><span class="ic">&#187;&#187;</span><span id="warpLbl">Warp: Off</span></button>
+    <button class="dbg-btn go" id="playpause" data-act="playpause"><span class="ic" id="ppIcon">&#9654;</span><span class="lbl" id="ppLbl">Continue</span></button>
+    <button class="dbg-btn stop" data-act="stop"><span class="ic">&#9632;</span><span class="lbl">Stop</span></button>
+    <button class="dbg-btn" data-act="restart"><span class="ic">&#8635;</span><span class="lbl">Restart</span></button>
+    <button class="dbg-btn warp" id="warpBtn" data-act="warp"><span class="ic">&#187;&#187;</span><span class="lbl" id="warpLbl">Warp: Off</span></button>
 </div>
 <div class="grp">
-    <button class="dbg-btn" data-act="stepOver"><span class="ic">&#8631;</span>Step Over</button>
-    <button class="dbg-btn" data-act="stepInto"><span class="ic">&#8628;</span>Step Into</button>
-    <button class="dbg-btn" data-act="stepOut"><span class="ic">&#8630;</span>Step Out</button>
+    <button class="dbg-btn" data-act="stepOver"><span class="ic">&#8631;</span><span class="lbl">Step Over</span></button>
+    <button class="dbg-btn" data-act="stepInto"><span class="ic">&#8628;</span><span class="lbl">Step Into</span></button>
+    <button class="dbg-btn" data-act="stepOut"><span class="ic">&#8630;</span><span class="lbl">Step Out</span></button>
 </div>
 <div class="grp">
-    <button class="dbg-btn rev" data-act="replayRewind"><span class="ic">&#9194;</span>Rewind</button>
-    <button class="dbg-btn rev" data-act="replayForward"><span class="ic">&#9193;</span>Forward</button>
-    <button class="dbg-btn rev" data-act="replayToHead"><span class="ic">&#9197;</span>To Head</button>
+    <button class="dbg-btn rev" data-act="replayRewind"><span class="ic">&#9194;</span><span class="lbl">Rewind</span></button>
+    <button class="dbg-btn rev" data-act="replayForward"><span class="ic">&#9193;</span><span class="lbl">Forward</span></button>
+    <button class="dbg-btn rev" data-act="replayToHead"><span class="ic">&#9197;</span><span class="lbl">To Head</span></button>
 </div>
 <script>
 const vscode = acquireVsCodeApi();
-let stopped = true, active = false, canRewind = false, canForward = false, warp = false, aiPiloting = false;
+let stopped = true, active = false, canRewind = false, canForward = false, warp = false, aiPiloting = false, starting = false;
 document.body.addEventListener('click', e => {
     const b = e.target.closest('button.dbg-btn');
     if (!b || b.disabled) return;
     // The play/pause button is tri-state: Start (no session) / Continue (halted) / Pause (running).
     let act = b.dataset.act;
-    if (act === 'playpause') act = !active ? 'start' : (stopped ? 'continue' : 'pause');
+    if (act === 'playpause') { if (starting) return; act = !active ? 'start' : (stopped ? 'continue' : 'pause'); }
     vscode.postMessage({ type: 'debugAction', action: act });
 });
 // Hover help: show each button's purpose + shortcut in the status bar (a visible
@@ -3997,7 +4047,10 @@ function apply() {
     const pp = document.getElementById('playpause');
     if (pp) {
         pp.disabled = false;
-        if (!active) { pp.classList.add('go'); document.getElementById('ppIcon').innerHTML = '&#9654;'; document.getElementById('ppLbl').textContent = 'Start'; }
+        // A launch already under way (build may be running): show it and DISABLE, otherwise a
+        // second press starts another instance ("... is already running").
+        if (starting) { pp.disabled = true; pp.classList.remove('go'); document.getElementById('ppIcon').innerHTML = '&#8987;'; document.getElementById('ppLbl').textContent = 'Starting…'; }
+        else if (!active) { pp.classList.add('go'); document.getElementById('ppIcon').innerHTML = '&#9654;'; document.getElementById('ppLbl').textContent = 'Start'; }
         else if (stopped) { pp.classList.add('go'); document.getElementById('ppIcon').innerHTML = '&#9654;'; document.getElementById('ppLbl').textContent = 'Continue'; }
         else { pp.classList.remove('go'); document.getElementById('ppIcon').innerHTML = '&#9208;'; document.getElementById('ppLbl').textContent = 'Pause'; }
     }
@@ -4018,8 +4071,52 @@ function apply() {
         else { b.classList.remove('ai-locked'); }
     });
 }
-window.addEventListener('message', e => { if (e.data && e.data.type === 'state') { active = !!e.data.active; stopped = !!e.data.stopped; canRewind = !!e.data.canRewind; canForward = !!e.data.canForward; warp = !!e.data.warp; aiPiloting = !!e.data.aiPiloting; apply(); } });
+// Show labels while they fit, icons only when they don't. Measured, not a media query: the
+// real constraint is the widest ROW, and label text changes at runtime (Continue<->Pause,
+// Warp: Off<->On), so a fixed pixel breakpoint would be wrong half the time.
+// Always measures in the LABELLED state — measuring while already collapsed would report a
+// width that fits and flip straight back, oscillating on every resize.
+let fitting = false;
+function fitLabels() {
+    if (fitting) return;
+    fitting = true;
+    try {
+        document.body.classList.remove('compact');
+        let needed = 0;
+        for (const g of document.querySelectorAll('.grp')) needed = Math.max(needed, g.scrollWidth);
+        const cs = getComputedStyle(document.body);
+        const avail = document.body.clientWidth - parseFloat(cs.paddingLeft || 0) - parseFloat(cs.paddingRight || 0);
+        if (needed > avail) document.body.classList.add('compact');
+    } finally { fitting = false; }
+}
+// Repainting the moment execution resumes made every step flash: Continue flipped to Pause and
+// the step buttons greyed for a few milliseconds before flipping straight back. So a RESUME is
+// applied only after it has lasted a moment; a STOP is applied at once (never delay showing the
+// user they are stopped). If the stop arrives first, the pending repaint is cancelled and nothing
+// visibly changed. Mirrors the deferred dimming of the live views.
+const RESUME_PAINT_DELAY_MS = 250;
+let resumePaint = null;
+function onStateMessage(d) {
+    active = !!d.active; starting = !!d.starting; canRewind = !!d.canRewind; canForward = !!d.canForward;
+    warp = !!d.warp; aiPiloting = !!d.aiPiloting;
+    const nowStopped = !!d.stopped;
+    if (nowStopped) {                       // stopped: cancel any pending resume paint, show now
+        if (resumePaint) { clearTimeout(resumePaint); resumePaint = null; }
+        stopped = true; apply(); fitLabels(); return;
+    }
+    if (stopped === false) { apply(); fitLabels(); return; }   // already showing running
+    if (!resumePaint) resumePaint = setTimeout(() => {
+        resumePaint = null;
+        stopped = false; apply(); fitLabels();
+    }, RESUME_PAINT_DELAY_MS);
+}
+window.addEventListener('message', e => { if (e.data && e.data.type === 'state') onStateMessage(e.data); });
 apply();
+fitLabels();
+// The sidebar is resized constantly; re-evaluate on every width change (the guard above keeps
+// our own class toggle from re-entering).
+if (window.ResizeObserver) new ResizeObserver(() => fitLabels()).observe(document.body);
+window.addEventListener('resize', fitLabels);
 </script>
 </body></html>`;
 }
@@ -4067,7 +4164,7 @@ class DebugControlsWebviewProvider {
         if (!this._view) return;
         // Use the tracked flag, not activeDebugSession — the latter can still be set
         // during onDidTerminateDebugSession, leaving Stop looking enabled after the end.
-        this._view.webview.postMessage({ type: 'state', active: sessionIsActive(), stopped: oricDebugStopped, canRewind: replayCanRewind, canForward: replayCanForward, warp: oricWarpOn,
+        this._view.webview.postMessage({ type: 'state', active: sessionIsActive(), starting: oricSessionStarting && !sessionIsActive(), stopped: oricDebugStopped, canRewind: replayCanRewind, canForward: replayCanForward, warp: oricWarpOn,
             aiPiloting: !!bridgeServer && bridgeControl === BRIDGE_CONTROL.AI });
     }
 }
@@ -6670,8 +6767,12 @@ function activate(context) {
                     if (!chk.ok) {
                         showOsdkIncompatibleError(chk);
                         updateOsdkCompatIndicator();
+                        setSessionStarting(false);   // aborted before any session exists
                         return undefined;
                     }
+                    // A session is now on its way (the build may run first, so this can take a
+                    // while) — reflect it on the Start button so it can't be pressed again.
+                    setSessionStarting(true);
                     if (config.launchScript) {
                         // Script-launch relies on the OSDK toolchain (osdk_execute.bat,
                         // %OSDK%\Oricutron, libraries); the OSDK version gate above covers it.
@@ -6892,10 +6993,53 @@ function activate(context) {
         if (!currentInstrView) return;
         if (lastGoodInstr) currentInstrView.webview.postMessage(Object.assign({}, lastGoodInstr, { stale: true }));
         else renderCurrentInstr(true);
+        // Deliberately DO NOT clear the locals here. body.stale already dims them, which is the
+        // same "not current" signal the rest of the panel uses — whereas dropping them made the
+        // section blink out and back on every step (markInstrStale now runs on each stop), and
+        // after the session ends you generally want to read the last values, not lose them.
+    }
+
+    // Locals for the current frame, shown at the BOTTOM of this panel. They aren't the current
+    // instruction, but they are what the executing code is working on — and putting them here
+    // means the built-in VARIABLES view is no longer needed just to reach Locals (which sits
+    // below Registers/Flags/Globals/Zero Page there, all of which are covered by Oric Registers,
+    // Watch and Oric Symbols). Always expanded: a struct/array local is flattened one level so
+    // its fields are visible without any clicking.
+    const LOCALS_CHILD_CAP = 24;        // guard against a huge array flooding the panel
+    async function refreshCurrentInstrLocals(session) {
+        if (!currentInstrView) return;
+        if (!session || session.type !== 'oric-debug') { currentInstrView.webview.postMessage({ type: 'locals', locals: null }); return; }
+        try {
+            const st = await session.customRequest('stackTrace', { threadId: 1, startFrame: 0, levels: 1 });
+            const frame = st && st.stackFrames && st.stackFrames[0];
+            if (!frame) { currentInstrView.webview.postMessage({ type: 'locals', locals: null }); return; }
+            const sc = await session.customRequest('scopes', { frameId: frame.id });
+            const locals = (sc && sc.scopes || []).find(s => s.name === 'Locals' || s.presentationHint === 'locals');
+            if (!locals || !locals.variablesReference) { currentInstrView.webview.postMessage({ type: 'locals', locals: [] }); return; }
+            const v = await session.customRequest('variables', { variablesReference: locals.variablesReference });
+            const rows = [];
+            for (const item of (v && v.variables) || []) {
+                rows.push({ name: item.name, value: item.value, depth: 0 });
+                // Flatten one level so aggregates read without expanding anything.
+                if (item.variablesReference && rows.length < LOCALS_CHILD_CAP) {
+                    try {
+                        const kids = await session.customRequest('variables', { variablesReference: item.variablesReference });
+                        for (const k of (kids && kids.variables) || []) {
+                            if (rows.length >= LOCALS_CHILD_CAP) { rows.push({ name: '…', value: '(more)', depth: 1 }); break; }
+                            rows.push({ name: k.name, value: k.value, depth: 1 });
+                        }
+                    } catch (_) { /* leaf after all */ }
+                }
+            }
+            currentInstrView.webview.postMessage({ type: 'locals', locals: rows });
+        } catch (_) {
+            // Session dying or a query raced a resume — leave whatever is shown rather than flicker.
+        }
     }
 
     function refreshInstructionAnnotation(session) {
         if (!session || session.type !== 'oric-debug') { markInstrStale(); return; }
+        refreshCurrentInstrLocals(session);
         session.customRequest('resolveInstruction').then(resp => {
             const hasVars = resp && resp.lineVars && resp.lineVars.length > 0;
             if (resp && (resp.annotation || hasVars) && resp.file && resp.line > 0) {
@@ -6915,7 +7059,10 @@ function activate(context) {
                     lastPcAddr = resp.pc;
                     highlightHeatmapAddr(resp.pc);
                 }
-                clearInstrDecoration();
+                // No annotation for this PC (source-less code, or the adapter hasn't caught up).
+                // Keep the last good render dimmed instead of flashing "— no instruction —";
+                // only genuinely clear when there has never been anything to show.
+                if (lastGoodInstr) markInstrStale(); else clearInstrDecoration();
             }
         }).catch(() => { markInstrStale(); });   // session dying (query threw) → keep last-good dimmed, don't clear
     }
@@ -6939,6 +7086,12 @@ function activate(context) {
             #asm { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--vscode-panel-border, #80808040);
                    white-space: pre-wrap; word-break: break-word; }
             #asm .lbl { color: var(--vscode-descriptionForeground, #808080); font-size: 0.85em; }
+            /* Locals: always-visible value rows at the bottom (see refreshCurrentInstrLocals).
+               Separated by a rule so it reads as its own section, not more instruction detail. */
+            #locals { margin-top: 6px; border-top: 1px solid var(--vscode-widget-border, #333); padding-top: 4px; }
+            #locals .lbl { color: var(--vscode-descriptionForeground, #808080); font-size: 0.85em; }
+            #locals .vrow.child { padding-left: 1.2em; }
+            #locals .vrow.child .sym { color: var(--vscode-descriptionForeground, #999); }
             #asmann { color: var(--vscode-descriptionForeground, #808080); }
             /* Comment green has no workbench color var (it is a TextMate token colour),
                so it stays literal with an explicit light-theme override. */
@@ -6960,6 +7113,7 @@ function activate(context) {
             <div id="src"></div>
             <div id="ann"><span class="empty">— no instruction —</span></div>
             <div id="asm" style="display:none"></div>
+            <div id="locals" style="display:none"></div>
             <script>
                 const vs = acquireVsCodeApi();
                 const hdr = document.getElementById('hdr');
@@ -7010,8 +7164,24 @@ function activate(context) {
                     return esc(mm[1]) + '<span class="mne">' + esc(mm[2]) + '</span>'
                          + tokenize(text.slice(mm[0].length), function(){ return 'sym'; });
                 }
+                // Locals section (bottom): name = value rows, aggregates flattened one level.
+                // Rendered here rather than in the built-in VARIABLES view so they need no
+                // expanding and sit next to the line that is using them.
+                const loc = document.getElementById('locals');
+                function renderLocals(list){
+                    if (!list || !list.length){ loc.style.display = 'none'; loc.innerHTML = ''; return; }
+                    let w = 0; for (const r of list) { const n = (r.depth ? '  ' : '') + r.name; if (n.length > w) w = n.length; }
+                    let html = '<div class="lbl">locals</div>';
+                    for (const r of list){
+                        const nm = r.name + ' '.repeat(Math.max(0, w - r.name.length - (r.depth ? 2 : 0)));
+                        html += '<div class="vrow' + (r.depth ? ' child' : '') + '"><span class="sym">' + esc(nm) + '</span>'
+                              + '<span class="op">=</span>' + colorize(String(r.value == null ? '' : r.value)) + '</div>';
+                    }
+                    loc.innerHTML = html; loc.style.display = '';
+                }
                 window.addEventListener('message', function(e){
                     const d = e.data;
+                    if (d && d.type === 'locals'){ renderLocals(d.locals); return; }
                     if (!d || d.type !== 'instr') return;
                     document.body.classList.toggle('stale', !!d.stale);
                     const hasVars = d.lineVars && d.lineVars.length;
@@ -8079,7 +8249,7 @@ function activate(context) {
         { label: 'XA assembler reference', icon: 'symbol-keyword', color: 'charts.purple', desc: 'Internal quick reference', cmd: 'osdk.xaReference' },
         { label: '6502 opcode reference', icon: 'symbol-numeric', color: 'charts.green', desc: 'Internal quick reference', cmd: 'osdk.6502Reference' },
         { sep: true, label: '— useful links —' },
-        { label: 'OSDK website', icon: 'globe', color: 'charts.orange', desc: 'osdk.org (external)', cmd: 'vscode.open', args: [vscode.Uri.parse('http://www.osdk.org')] },
+        { label: 'OSDK website', icon: 'globe', color: 'charts.orange', desc: 'osdk.org (external)', cmd: 'vscode.open', args: [vscode.Uri.parse('https://osdk.org')] },
         { label: 'Defence Force forum', icon: 'comment-discussion', color: 'charts.yellow', desc: 'forum.defence-force.org (external)', cmd: 'vscode.open', args: [vscode.Uri.parse('https://forum.defence-force.org')] },
         // Quick shortcuts to the UI tabs — avoids CTRL+SHIFT+P to find and run them.
         // iconFile reuses the same panel SVG as the tab itself, for visual consistency.
@@ -8117,7 +8287,10 @@ function activate(context) {
         vscode.commands.registerCommand('oric-debug.openTroubleshooting', openTroubleshooting),
         // Open the extension's page (README rendered inside VS Code); fall back to a README preview.
         vscode.commands.registerCommand('oric-debug.openManual', async () => {
-            try { await vscode.commands.executeCommand('extension.open', 'dbug.osdk-debug'); }
+            // Derive "<publisher>.<name>" from our own manifest rather than hardcoding it: the
+            // publisher id changes (e.g. individual -> group when publishing), and a stale literal
+            // here would silently open nothing and fall back to the raw README.
+            try { await vscode.commands.executeCommand('extension.open', (context.extension && context.extension.id) || (require('./package.json').publisher + '.' + require('./package.json').name)); }
             catch (e) {
                 const readme = vscode.Uri.file(nodePath.join(nodePath.dirname(__filename), 'README.md'));
                 vscode.commands.executeCommand('markdown.showPreview', readme).then(undefined, () => vscode.commands.executeCommand('vscode.open', readme));
@@ -8369,6 +8542,7 @@ function activate(context) {
                     return;
                 }
                 oricSessionActive = true; oricWarpOn = false; oricEndedSessionId = null;
+                setSessionStarting(false);   // it started — no longer "starting"
                 // Tell attached clients a NEW session exists. Without this a long-lived client
                 // keeps the `ended` flag from the previous session and reports a live session as
                 // "ended" (DOGFOODING #22).
@@ -8376,7 +8550,7 @@ function activate(context) {
             }
             debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); bridgeUpdateStatusBar();
         }),
-        vscode.debug.onDidTerminateDebugSession(s => { oricEndedSessionId = s && s.id; oricSessionActive = false; oricWarpOn = false; debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); bridgeUpdateStatusBar(); }),
+        vscode.debug.onDidTerminateDebugSession(s => { oricEndedSessionId = s && s.id; oricSessionActive = false; oricWarpOn = false; setSessionStarting(false); debugControlsProvider.pushState(); snapDecoEmitter.fire(); postScreenRunState(); bridgeUpdateStatusBar(); }),
         vscode.window.registerWebviewViewProvider('oricCpuRegs', regsProvider),
         vscode.window.registerWebviewViewProvider('oricPeripherals', periphProvider),
         vscode.commands.registerCommand('oric-debug.openMemoryView', () => createMemoryPanel(context)),
@@ -8887,10 +9061,13 @@ function activate(context) {
                                 // change (source editor) isn't mistaken for a user click that
                                 // would flip step mode.
                                 lastStopMs = Date.now();
-                                // Drop the previous line's annotation at once so it can't
-                                // flicker there during the post-step navigation churn; the
-                                // fresh one is applied when refreshAll's resolve returns.
-                                clearInstrDecoration();
+                                // Leave the panel exactly as it is until refreshAll's resolve
+                                // returns (~50ms) and replaces it. The two earlier attempts both
+                                // flickered on every step: clearing flashed "— no instruction —",
+                                // and dimming flashed the whole panel grey. Briefly showing the
+                                // previous line undimmed is imperceptible at this delay, and the
+                                // no-annotation case still dims explicitly (see
+                                // refreshInstructionAnnotation).
                                 setTimeout(() => refreshAll(), 50);
                                 // While instruction-stepping (the disassembly panel is visible,
                                 // tracked by the oricInstructionStepMode context key) don't yank
@@ -9026,7 +9203,9 @@ function activate(context) {
             refreshAll();
             vizDisconnect();
             clearCycleAnnotations();
-            clearInstrDecoration();
+            // Keep the last instruction + locals visible (dimmed) after the session ends, like
+            // Oric Registers does — you usually want to read where it stopped in order to fix it.
+            markInstrStale();
             restoreGitLensBlame(); // give the user back their git blame
             lastPcAddr = -1;
             clearHeatmapHighlight();

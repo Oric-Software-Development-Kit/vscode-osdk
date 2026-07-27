@@ -180,7 +180,7 @@ A built-in memory map (like `osdk_showmap`) generated from the current module's 
 
 - **Oric: XA Quick Reference** - searchable XA assembler directive reference
 - **Oric: 6502 Opcode Reference** - searchable 6502 instruction set reference with cycle counts
-- **Oric Documentation** panel (in the Run & Debug sidebar) — one-click links to this manual, the XA/6502 references, the [OSDK website](http://www.osdk.org), and the [Defence Force forum](https://forum.defence-force.org). External links prompt once (VS Code's link protection) — add them via *Configure Trusted Domains* to skip it thereafter.
+- **Oric Documentation** panel (in the Run & Debug sidebar) — one-click links to this manual, the XA/6502 references, the [OSDK website](https://osdk.org), and the [Defence Force forum](https://forum.defence-force.org). External links prompt once (VS Code's link protection) — add them via *Configure Trusted Domains* to skip it thereafter.
 
 ---
 

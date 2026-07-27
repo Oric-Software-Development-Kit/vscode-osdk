@@ -1,3 +1,24 @@
 .git/
 .gitignore
 *.vsix
+
+# --- development-only material: keep it out of the published package ---------
+# The runtime needs: extension.js, debug_adapter.js, resolver.cjs, mcp/**,
+# templates/**, images/**, syntaxes/**, language-configuration.json, package.json,
+# README.md, CHANGELOG.md, LICENSE, and TROUBLESHOOTING.md (opened by the
+# "Troubleshooting & Written Guide" command, so it MUST ship).
+.claude/
+.vscode/
+review/
+test/
+
+# Internal notes and specs — the user-facing docs are README + TROUBLESHOOTING
+DOGFOODING.md
+DESIGN-*.md
+SPEC-*.md
+CORE-CONCEPTS.md
+
+# Editor/OS noise
+**/.DS_Store
+**/Thumbs.db
+*.log

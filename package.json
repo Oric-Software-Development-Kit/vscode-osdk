@@ -2,8 +2,8 @@
     "name": "osdk-debug",
     "displayName": "OSDK",
     "description": "Oric Software Development Kit - 6502/XA assembly highlighting and Oricutron debugging",
-    "version": "0.0.74",
-    "publisher": "dbug",
+    "version": "0.0.78",
+    "publisher": "DefenceForce",
     "license": "MIT",
     "icon": "images/oric-icon.png",
     "homepage": "https://osdk.org",
@@ -161,6 +161,7 @@
                 },
                 {
                     "id": "oricPeripherals",
+                    "visibility": "collapsed",
                     "name": "Oric Peripherals",
                     "type": "webview",
                     "icon": "images/oric.svg",
@@ -174,18 +175,21 @@
                 },
                 {
                     "id": "oricSnapshots",
+                    "visibility": "collapsed",
                     "name": "Oric Snapshots",
                     "icon": "images/oric.svg",
                     "when": "!oric-debug.osdkIncompatible"
                 },
                 {
                     "id": "oricAutomation",
+                    "visibility": "collapsed",
                     "name": "Oric Automation",
                     "icon": "images/oric.svg",
                     "when": "!oric-debug.osdkIncompatible"
                 },
                 {
                     "id": "oricDocs",
+                    "visibility": "collapsed",
                     "name": "Oric Documentation",
                     "icon": "images/oric.svg"
                 }
