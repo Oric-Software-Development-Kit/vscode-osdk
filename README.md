@@ -546,6 +546,7 @@ VS Code settings (User or Workspace) under **Oric Debug**:
 | `oric-debug.showBinary` | boolean | `true` | Show the `%binary` column in decoded values (`$02\|2\|%00000010`). Turn off for a compact `$02\|2`. Applies live to a running session; also toggleable via **Oric: Toggle Binary Column in Values** or the `bin` console command. |
 | `oric-debug.breakpointsFollowActiveModule` | boolean | `true` | In the **Oric Breakpoints** panel, expand the active overlay module's section and collapse the others as the active module changes (multi-module/overlay projects). The active module is always highlighted regardless of this setting. |
 | `oric-debug.colorSourceFilesByType` | boolean | `true` | Tint file-name labels (editor tabs and Explorer) by type: C source `.c` green, headers `.h` teal, assembler `.s`/`.asm` blue, automation scripts `.js` violet. The colors are the `oric.*` theme colors below — override them in `workbench.colorCustomizations`. |
+| `oric-debug.wrapPanelRows` | boolean | `false` | Wrap long rows in the **Oric CPU & Current Instruction** panel instead of clipping them. Wrapping shows the whole value (long paths, wide arrays) at the cost of vertical space; clipping keeps the panel compact while stepping. Toggle it from that panel's title bar (**Oric: Wrap Long Rows In Panel** / **Stop Wrapping…**). |
 
 File-label tint colors (contributed theme colors, overridable in `workbench.colorCustomizations`):
 

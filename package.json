@@ -2,7 +2,7 @@
     "name": "osdk-debug",
     "displayName": "OSDK",
     "description": "Oric Software Development Kit - 6502/XA assembly highlighting and Oricutron debugging",
-    "version": "0.0.96",
+    "version": "0.0.97",
     "publisher": "DefenceForce",
     "license": "MIT",
     "icon": "images/oric-icon.png",
@@ -80,6 +80,11 @@
                     "type": "boolean",
                     "default": true,
                     "description": "Tint file-name labels (editor tabs and Explorer) by type: C source (.c) green, headers (.h) teal, assembler (.s/.asm) blue, automation scripts (.js) violet. Colors are the oric.* theme colors (override them in workbench.colorCustomizations)."
+                },
+                "oric-debug.wrapPanelRows": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Wrap long rows in the Oric CPU & Current Instruction panel instead of clipping them. Wrapping shows the whole value (long paths, wide arrays) at the cost of vertical space; clipping keeps the panel compact while stepping. Toggle it from the panel's title bar."
                 },
                 "oric-debug.focusOnStop": {
                     "type": "string",
@@ -425,6 +430,16 @@
                 "icon": "$(rocket)"
             },
             {
+                "command": "oric-debug.wrapOn",
+                "title": "Oric: Wrap Long Rows In Panel",
+                "icon": "$(word-wrap)"
+            },
+            {
+                "command": "oric-debug.wrapOff",
+                "title": "Oric: Stop Wrapping Long Rows In Panel",
+                "icon": "$(list-flat)"
+            },
+            {
                 "command": "oric-debug.resetCycleCounter",
                 "title": "Oric: Reset Cycle Counter",
                 "icon": "$(history)"
@@ -573,7 +588,9 @@
                 { "command": "oric-debug.snapshotOpenFolder", "when": "view == oricSnapshots", "group": "navigation@3" },
                 { "command": "oric-debug.stopAutomationScript", "when": "view == oricAutomation && oric-debug.automationRunning", "group": "navigation@1" },
                 { "command": "oric-debug.automationRefresh", "when": "view == oricAutomation", "group": "navigation@2" },
-                { "command": "oric-debug.automationOpenFolder", "when": "view == oricAutomation", "group": "navigation@3" }
+                { "command": "oric-debug.automationOpenFolder", "when": "view == oricAutomation", "group": "navigation@3" },
+                { "command": "oric-debug.wrapOn", "when": "view == oricCurrentInstr && !oric-debug.wrapRows", "group": "navigation@1" },
+                { "command": "oric-debug.wrapOff", "when": "view == oricCurrentInstr && oric-debug.wrapRows", "group": "navigation@1" }
             ],
             "view/item/context": [
                 { "command": "oric-debug.snapshotRestoreItem", "when": "view == oricSnapshots && viewItem == oricSnap", "group": "inline@1" },

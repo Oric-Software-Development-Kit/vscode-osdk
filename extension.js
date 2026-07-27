@@ -7467,6 +7467,21 @@ function activate(context) {
             #cpu .stkb { color: var(--vscode-charts-blue, #569cd6); }
             #cpu .stkr { white-space: nowrap; font-size: 0.85em; opacity: 0.8; padding-left: 0.8em; }
             #cpu .stkr .hint { color: var(--vscode-descriptionForeground, #808080); font-size: 0.9em; }
+            /* WRAP MODE (body.wrap), toggled from the view title bar / the wrapPanelRows setting.
+               Off by default: clipping keeps the panel compact and the rows aligned, which is what
+               you want while stepping. On, nothing is hidden -- a long value or a deep path is fully
+               readable at the cost of vertical space. Continuation lines get a hanging indent so a
+               wrapped row still reads as ONE row rather than as a new entry. */
+            body.wrap .vrow, body.wrap .pcline, body.wrap #cpu .cr,
+            body.wrap #cpu .stk, body.wrap #cpu .stkr {
+                white-space: pre-wrap; overflow-wrap: anywhere;
+                padding-left: 1.4em; text-indent: -1.4em;
+            }
+            /* Nested rows keep their own level ON TOP of the hanging indent, else a wrapped child
+               would line up with its parent and the nesting would be lost. */
+            body.wrap #locals .vrow.child { padding-left: 2.6em; }
+            body.wrap #cpu .stkr { padding-left: 2.2em; }
+            body.wrap #cpu .stk { overflow-x: visible; }   /* nothing to scroll once it wraps */
             /* Locals: always-visible value rows at the bottom (see refreshCurrentInstrLocals).
                Separated by a rule so it reads as its own section, not more instruction detail. */
             #vec { margin-top: 6px; border-top: 1px solid var(--vscode-widget-border, #333); padding-top: 4px; }
@@ -7666,6 +7681,9 @@ function activate(context) {
                     const d = e.data;
                     if (d && d.type === 'cpu'){ renderCpu(d); return; }
                     if (d && d.type === 'locals'){ renderLocals(d.locals); return; }
+                    // Wrap long rows or clip them. Purely a class flip: no re-render, so toggling
+                    // it never costs a round-trip to the adapter or disturbs what is displayed.
+                    if (d && d.type === 'wrap'){ document.body.classList.toggle('wrap', !!d.on); return; }
                     if (!d || d.type !== 'instr') return;
                     document.body.classList.toggle('stale', !!d.stale);
                     const hasVars = d.lineVars && d.lineVars.length;
@@ -7708,12 +7726,43 @@ function activate(context) {
         </body></html>`.replace(/\r/g, '');
     }
 
+    // Wrap long rows, or clip them. The SETTING is the single source of truth: the title-bar button
+    // writes it and everything else follows, so the button and the Settings UI can never disagree.
+    // Mirrored into a context key so the title bar can offer the OPPOSITE action (same shape as the
+    // warp toggle), and pushed to the webview as a body class. It is a real setting rather than a
+    // webview-local toggle so it is discoverable and labelled in Settings, and survives a reload.
+    const applyWrapSetting = () => {
+        const on = !!vscode.workspace.getConfiguration('oric-debug').get('wrapPanelRows', false);
+        vscode.commands.executeCommand('setContext', 'oric-debug.wrapRows', on);
+        if (currentInstrView) currentInstrView.webview.postMessage({ type: 'wrap', on });
+    };
+    // Write at whichever scope already defines the value. Always writing Global would make the
+    // button look BROKEN for anyone with a workspace-level override: the global value would change
+    // while the effective one -- and therefore the panel -- did not move at all.
+    const setWrapRows = (on) => {
+        const cfg = vscode.workspace.getConfiguration('oric-debug');
+        const info = cfg.inspect('wrapPanelRows') || {};
+        const target = info.workspaceFolderValue !== undefined ? vscode.ConfigurationTarget.WorkspaceFolder
+                     : info.workspaceValue !== undefined ? vscode.ConfigurationTarget.Workspace
+                     : vscode.ConfigurationTarget.Global;
+        return cfg.update('wrapPanelRows', on, target);
+    };
+    context.subscriptions.push(
+        vscode.commands.registerCommand('oric-debug.wrapOn', () => setWrapRows(true)),
+        vscode.commands.registerCommand('oric-debug.wrapOff', () => setWrapRows(false)),
+        vscode.workspace.onDidChangeConfiguration(e => {
+            if (e.affectsConfiguration('oric-debug.wrapPanelRows')) applyWrapSetting();
+        })
+    );
+    applyWrapSetting();   // context key must be right before the title bar is first drawn
+
     const currentInstrProvider = {
         resolveWebviewView(view) {
             currentInstrView = view;
             view.webview.options = { enableScripts: true };
             view.webview.onDidReceiveMessage(msg => {
                 if (msg && msg.type === 'ready') {
+                    applyWrapSetting();   // before any content, so rows never re-flow visibly
                     if (lastCpuMsg) currentInstrView.webview.postMessage(lastCpuMsg);   // replay cache
                     const s = vscode.debug.activeDebugSession;
                     if (s && s.type === 'oric-debug') {
