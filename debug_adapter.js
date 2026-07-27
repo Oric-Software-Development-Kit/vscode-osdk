@@ -3365,7 +3365,20 @@ async function formatAnnotated(ann, addr, size) {
 // (Registers/Flags are CPU state, not memory-typed values — they legitimately
 // render separately.) See CORE-CONCEPTS.md → "One render path".
 // ============================================================================
+// Every typed row, whichever view asked for it, carries a declaration reference when the name has a
+// real definition. That is what lets the BUILT-IN Variables/Watch rows navigate to source: those
+// views are rendered by VS Code, so a reference resolved through the `locations` request is the only
+// hook available. Stamped in ONE wrapper rather than at each of the seven return sites below, so a
+// new render path cannot forget it. Struct members and other non-symbol names simply get nothing.
 async function buildTypedVar(name, addr, fullType, size, ann, opts) {
+    const v = await buildTypedVarCore(name, addr, fullType, size, ann, opts);
+    if (v && v.declarationLocationReference === undefined) {
+        const ref = locationRefForName(name);
+        if (ref !== undefined) v.declarationLocationReference = ref;
+    }
+    return v;
+}
+async function buildTypedVarCore(name, addr, fullType, size, ann, opts) {
     addr &= 0xFFFF;
     const hAddr = '$' + addr.toString(16).toUpperCase().padStart(4, '0');
     // opts.omitAddr: compact form for the inline instruction annotation, where
@@ -3429,6 +3442,44 @@ async function buildTypedVar(name, addr, fullType, size, ann, opts) {
 function isBuildArtifact(filePath) {
     const base = path.basename(filePath).toLowerCase();
     return base === 'linked.s' || base === 'linked.asm';
+}
+
+// Definition site of a symbol BY NAME: the file:line where it is declared. Tries the name as given
+// and its C<->asm underscore variant. Build artifacts (linked.s, TMP intermediates) are refused —
+// they are ephemeral, so navigating there lands in a file that no longer matches what is running.
+// ONE implementation, shared by the symbolDefinition request and the DAP location references, so
+// a name is navigable in the built-in views exactly when it is navigable in our own panels.
+function definitionOfName(n) {
+    for (const cand of [n, (n[0] === '_' ? n.slice(1) : '_' + n)]) {
+        const src = symSource.get(cand)
+            || (resolverInstance && resolverInstance.declOf ? resolverInstance.declOf(cand) : null);
+        if (src && src.file && !isBuildArtifact(src.file) && !/[\\/]tmp[\\/]/i.test(src.file))
+            return { name: cand, file: src.file, line: src.line || 0 };
+    }
+    return null;
+}
+
+// DAP location references. The client receives an opaque integer on a Variable / evaluate result and
+// asks the `locations` request to turn it into a source position. Deduplicated by file:line so a
+// long-running session with many refreshes does not grow one entry per repaint.
+const locationRefs = new Map();     // id -> {file, line}
+const locationRefIds = new Map();   // "file:line" -> id
+let nextLocationRef = 1;
+function locationRefFor(src) {
+    if (!src || !src.file) return undefined;
+    const key = src.file + ':' + (src.line || 0);
+    let id = locationRefIds.get(key);
+    if (id === undefined) {
+        id = nextLocationRef++;
+        locationRefIds.set(key, id);
+        locationRefs.set(id, { file: src.file, line: src.line || 0 });
+    }
+    return id;
+}
+// Location reference for a symbol name, or undefined when it has no navigable definition.
+function locationRefForName(name) {
+    if (typeof name !== 'string' || !/^[A-Za-z_]\w*$/.test(name)) return undefined;
+    return locationRefFor(definitionOfName(name));
 }
 
 // Record name -> definition site, keeping the best source we have seen for that name.
@@ -6033,7 +6084,12 @@ const handlers = {
             respond(req, {
                 result: v.value,
                 variablesReference: v.variablesReference,
-                memoryReference: '0x' + a.toString(16)
+                memoryReference: '0x' + a.toString(16),
+                // Makes the row navigable in the BUILT-IN Watch view, which we do not render and so
+                // cannot make clickable ourselves — the client resolves this via `locations`.
+                // Undefined when the symbol has no real definition, and an absent field simply
+                // means "not navigable", so older clients that ignore it are unaffected.
+                valueLocationReference: locationRefForName(symName)
             });
             return;
         }
@@ -6468,18 +6524,18 @@ const handlers = {
     // they are ephemeral and jumping into them lands the user in a file that no longer matches.
     symbolDefinition(req) {
         const names = (req.arguments && req.arguments.names) || [];
-        const one = (n) => {
-            for (const cand of [n, (n[0] === '_' ? n.slice(1) : '_' + n)]) {
-                const src = symSource.get(cand)
-                    || (resolverInstance && resolverInstance.declOf ? resolverInstance.declOf(cand) : null);
-                // Reject linked.s AND anything under a TMP folder (compiler intermediates): both
-                // are ephemeral, so navigating there lands in a file that no longer matches.
-                if (src && src.file && !isBuildArtifact(src.file) && !/[\\/]tmp[\\/]/i.test(src.file))
-                    return { name: cand, file: src.file, line: src.line || 0 };
-            }
-            return null;
-        };
-        respond(req, { defs: names.map(n => (typeof n === 'string' ? one(n) : null)) });
+        respond(req, { defs: names.map(n => (typeof n === 'string' ? definitionOfName(n) : null)) });
+    },
+
+    // DAP `locations`: resolve a location reference handed out earlier (on a Variable or an evaluate
+    // result) to a real source position. This is what makes the BUILT-IN Variables and Watch rows
+    // navigable — those views are not ours to render, so a reference plus this request is the only
+    // way to offer "go to declaration" there.
+    locations(req) {
+        const id = req.arguments && req.arguments.locationReference;
+        const loc = locationRefs.get(id);
+        if (!loc) { respond(req, {}, false, 'Unknown location reference'); return; }
+        respond(req, { source: { name: path.basename(loc.file), path: loc.file }, line: loc.line || 1 });
     },
 
     // Resolve addresses to their symbol labels. Used for the CPU block's interrupt vectors: a bare
