@@ -4475,9 +4475,25 @@ async function resolveIdentifierDefinition(name) {
 // Open an identifier's definition, or say plainly that there isn't one to open. Used by the
 // panels' click-to-definition; a status-bar note (not a modal) because a miss is routine — many
 // tokens are types or literals with nothing to jump to.
-async function gotoIdentifierDefinition(name) {
+async function gotoIdentifierDefinition(name, addr) {
     const hit = await resolveIdentifierDefinition(name);
-    if (!hit) { vscode.window.setStatusBarMessage('Oric: no definition found for "' + name + '"', 4000); return; }
+    if (!hit) {
+        // No source for it — but if the caller knows the ADDRESS (interrupt vectors do), show the
+        // disassembly there instead of shrugging. That is the only meaningful destination for
+        // something with a name and an address but no source file: a ROM routine, or a symbol whose
+        // definition only ever existed in a build intermediate.
+        // NB: deliberately NOT gotoAddress() — that MOVES THE PC. This only navigates the view.
+        if (typeof addr === 'number') {
+            disasmCenterAddr = addr & 0xFFFF;
+            createDisasmPanel();
+            const s2 = vscode.debug.activeDebugSession;
+            if (s2 && s2.type === 'oric-debug') refreshDisasmPanel(s2);
+            vscode.window.setStatusBarMessage('Oric: ' + name + ' has no source — showing disassembly at $'
+                + (addr & 0xFFFF).toString(16).toUpperCase().padStart(4, '0'), 4000);
+            return;
+        }
+        vscode.window.setStatusBarMessage('Oric: no definition found for "' + name + '"', 4000); return;
+    }
     try {
         const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(hit.file));
         const ln = Math.max(0, (hit.line || 1) - 1);
@@ -7499,10 +7515,20 @@ function activate(context) {
                     // Vectors go BELOW the instruction, one per line: they are reference state that
                     // rarely changes, so they must not push the live information down the panel.
                     if (d.vectors && d.vectors.length){
-                        vec.innerHTML = '<div class="lbl">interrupt vectors</div>' + d.vectors.map(v =>
-                            '<div class="cr"><span class="n">' + esc(v.label) + '</span>=' + colorize(v.hex)
-                            + (v.name ? ' <span class="vecname">' + esc(v.name) + '</span>' : '') + '</div>'
-                        ).join('');
+                        // The vector NAME is emitted directly rather than through colorize(), so it
+                        // needs its own data-sym to be click-to-definition like every other
+                        // identifier. data-addr rides along as a fallback: if the symbol turns out to
+                        // have no source, the host shows the disassembly at that address instead.
+                        vec.innerHTML = '<div class="lbl">interrupt vectors</div>' + d.vectors.map(function(v){
+                            // The name can carry an offset (Name+2) when the vector does not point at a
+                            // symbol exactly. Keep that in the TEXT (it is informative) but look up the
+                            // bare symbol, which is the only thing that has a definition.
+                            const bare = v.name ? String(v.name).split(/[+-]/)[0] : '';
+                            return '<div class="cr"><span class="n">' + esc(v.label) + '</span>=' + colorize(v.hex)
+                                + (v.name ? ' <span class="vecname idsym" data-sym="' + esc(bare) + '"'
+                                            + (v.addr != null ? ' data-addr="' + (v.addr & 0xFFFF) + '"' : '')
+                                            + '>' + esc(v.name) + '</span>' : '') + '</div>';
+                        }).join('');
                         vec.style.display = '';
                     } else { vec.style.display = 'none'; vec.innerHTML = ''; }
                 }
@@ -7556,7 +7582,8 @@ function activate(context) {
                     // An identifier wins over the row containing it: clicking 'itemId' inside the
                     // current-line row should go to itemId's definition, not to that row's line.
                     const sym = e.target.closest('[data-sym]');
-                    if (sym) { vs.postMessage({ type: 'gotoDef', name: sym.dataset.sym }); return; }
+                    if (sym) { vs.postMessage({ type: 'gotoDef', name: sym.dataset.sym,
+                                               addr: sym.dataset.addr !== undefined ? parseInt(sym.dataset.addr, 10) : undefined }); return; }
                     // Otherwise: a whole location row (.pcline) or a legacy inline .loc-link.
                     const el = e.target.closest('[data-file][data-line]');
                     if (el) vs.postMessage({ type: 'gotoSymbol', file: el.dataset.file, line: parseInt(el.dataset.line, 10) });
@@ -7586,7 +7613,7 @@ function activate(context) {
                     }
                     return;
                 }
-                if (msg && msg.type === 'gotoDef' && msg.name) { gotoIdentifierDefinition(msg.name); return; }
+                if (msg && msg.type === 'gotoDef' && msg.name) { gotoIdentifierDefinition(msg.name, msg.addr); return; }
                 if (msg && msg.type === 'gotoSymbol' && msg.file && msg.line > 0) {
                     const uri = vscode.Uri.file(msg.file);
                     vscode.workspace.openTextDocument(uri).then(doc => {
