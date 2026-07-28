@@ -7502,15 +7502,29 @@ function activate(context) {
                you want while stepping. On, nothing is hidden -- a long value or a deep path is fully
                readable at the cost of vertical space. Continuation lines get a hanging indent so a
                wrapped row still reads as ONE row rather than as a new entry. */
-            body.wrap .vrow, body.wrap .pcline, body.wrap #cpu .cr,
-            body.wrap #cpu .stk, body.wrap #cpu .stkr {
-                white-space: pre-wrap; overflow-wrap: anywhere;
-                padding-left: 1.4em; text-indent: -1.4em;
-            }
+            /* Only .vrow aligns its columns with LITERAL SPACES, so only it may preserve runs of
+               them (pre-wrap). Everything else is aligned by CSS and must COLLAPSE runs: the flags
+               row separates flags from cycles with three spaces that nowrap collapsed, and pre-wrap
+               turned into a visibly wrong gap. */
+            body.wrap .vrow { white-space: pre-wrap; overflow-wrap: anywhere; }
+            body.wrap .pcline, body.wrap #cpu .cr,
+            body.wrap #cpu .stk, body.wrap #cpu .stkr { white-space: normal; overflow-wrap: anywhere; }
+            /* Hanging indent ONLY on the rows long enough to actually wrap. Deliberately not on
+               .pcline/.cr: those are short, and a negative text-indent there is INHERITED by
+               .pcline .lab — which is display:inline-block, so it re-applies the shift to its own
+               first line and pushes the label clean off the left edge of the panel. */
+            /* INVARIANT: the hanging indent must not MOVE the first line, or a row jumps sideways
+               when wrap is toggled. Since the first line sits at (padding-left + text-indent), every
+               wrap rule below must use padding-left = its own non-wrap indent + 1.4em. .vrow has no
+               base indent, so 1.4em; .stkr (0.8em) and .vrow.child (1.2em) get their own values. */
+            body.wrap .vrow { padding-left: 1.4em; text-indent: -1.4em; }
+            body.wrap #cpu .stkr { padding-left: 2.2em; text-indent: -1.4em; }   /* 0.8 + 1.4 */
+            /* Same inheritance trap one level down: any inline-block inside an indented row would
+               shift again. Resetting on descendants is harmless for plain inline spans. */
+            body.wrap .vrow *, body.wrap #cpu .stkr * { text-indent: 0; }
             /* Nested rows keep their own level ON TOP of the hanging indent, else a wrapped child
                would line up with its parent and the nesting would be lost. */
-            body.wrap #locals .vrow.child { padding-left: 2.6em; }
-            body.wrap #cpu .stkr { padding-left: 2.2em; }
+            body.wrap #locals .vrow.child { padding-left: 2.6em; }   /* 1.2 + 1.4 */
             body.wrap #cpu .stk { overflow-x: visible; }   /* nothing to scroll once it wraps */
             /* Locals: always-visible value rows at the bottom (see refreshCurrentInstrLocals).
                Separated by a rule so it reads as its own section, not more instruction detail. */
