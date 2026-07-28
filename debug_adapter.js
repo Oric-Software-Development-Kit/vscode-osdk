@@ -6101,7 +6101,17 @@ const handlers = {
 
         // Binary column toggle:  bin  |  bin on|off   (the |%binary in decoded values)
         if ((m = expr.match(/^bin(?:\s+(on|off))?$/i))) {
-            if (m[1] !== undefined) showBinary = (m[1].toLowerCase() === 'on');
+            if (m[1] !== undefined) {
+                showBinary = (m[1].toLowerCase() === 'on');
+                // Announce it so the HOST can write the oric-debug.showBinary setting, which is the
+                // single source of truth for this flag (title-bar buttons, palette command and
+                // context key all read it). Without this the console would be a second, invisible
+                // source: "bin off" would leave the setting saying on, so the button would show the
+                // wrong state and clicking it would appear to do nothing.
+                // Deliberately NOT emitted from setShowBinary(), which is the host pushing the
+                // setting down — emitting there would loop.
+                evt('oricShowBinaryChanged', { on: showBinary });
+            }
             respond(req, { result: 'Binary in values: ' + (showBinary ? 'on' : 'off'), variablesReference: 0 });
             evt('stopped', { reason: 'pause', threadId: 1, allThreadsStopped: true });
             return;

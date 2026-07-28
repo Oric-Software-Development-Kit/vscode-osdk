@@ -8748,6 +8748,14 @@ function activate(context) {
         vscode.window.registerFileDecorationProvider(snapDecoProvider),
         vscode.debug.onDidReceiveDebugSessionCustomEvent(e => {
             if (e.event === 'oricSnapshotsChanged') refreshSnapshots();
+            // "bin on/off" in the Debug Console changed the flag adapter-side. Fold it back into the
+            // SETTING so there is one source of truth: the title-bar buttons, the palette command
+            // and the context key all read that, and would otherwise show a stale state.
+            else if (e.event === 'oricShowBinaryChanged' && e.body && typeof e.body.on === 'boolean') {
+                const cur = vscode.workspace.getConfiguration('oric-debug').get('showBinary', true);
+                if (cur !== e.body.on) updateSettingInPlace('showBinary', e.body.on);
+                else applyBinarySetting();   // already in sync; just make sure the icon agrees
+            }
             else if (e.event === 'oricSignal') { automationEvents.fire({ type: 'signal', id: e.body && e.body.id, pc: e.body && e.body.pc }); if (bridgeServer) bridgeServer.broadcast('signal', { id: e.body && e.body.id, pc: e.body && e.body.pc }); }
         }),
         vscode.debug.onDidStartDebugSession(() => setTimeout(refreshSnapshots, 300)),
