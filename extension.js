@@ -7785,25 +7785,38 @@ function activate(context) {
         vscode.commands.executeCommand('setContext', 'oric-debug.wrapRows', on);
         if (currentInstrView) currentInstrView.webview.postMessage({ type: 'wrap', on });
     };
-    // Write at whichever scope already defines the value. Always writing Global would make the
-    // button look BROKEN for anyone with a workspace-level override: the global value would change
-    // while the effective one — and therefore the panel — did not move at all.
-    const setWrapRows = (on) => {
+    // Write a setting at whichever scope already DEFINES it. Always writing Global would make a
+    // toggle look BROKEN for anyone with a workspace-level override: the global value would change
+    // while the effective one — and therefore the UI — did not move at all. Shared by every
+    // title-bar toggle so they cannot drift apart on this.
+    const updateSettingInPlace = (key, value) => {
         const cfg = vscode.workspace.getConfiguration('oric-debug');
-        const info = cfg.inspect('wrapPanelRows') || {};
+        const info = cfg.inspect(key) || {};
         const target = info.workspaceFolderValue !== undefined ? vscode.ConfigurationTarget.WorkspaceFolder
                      : info.workspaceValue !== undefined ? vscode.ConfigurationTarget.Workspace
                      : vscode.ConfigurationTarget.Global;
-        return cfg.update('wrapPanelRows', on, target);
+        return cfg.update(key, value, target);
+    };
+    // The %binary column is a Dashboard-wide display choice like wrap, but until now the only ways
+    // to change it were the command palette and typing "bin on/off" in the Debug Console — neither
+    // discoverable. Same two-command shape as wrap and warp: the setting stays the source of truth,
+    // a context key mirrors it, and the title bar offers the OPPOSITE action.
+    const applyBinarySetting = () => {
+        const on = !!vscode.workspace.getConfiguration('oric-debug').get('showBinary', true);
+        vscode.commands.executeCommand('setContext', 'oric-debug.showBinaryOn', on);
     };
     context.subscriptions.push(
-        vscode.commands.registerCommand('oric-debug.wrapOn', () => setWrapRows(true)),
-        vscode.commands.registerCommand('oric-debug.wrapOff', () => setWrapRows(false)),
+        vscode.commands.registerCommand('oric-debug.wrapOn', () => updateSettingInPlace('wrapPanelRows', true)),
+        vscode.commands.registerCommand('oric-debug.wrapOff', () => updateSettingInPlace('wrapPanelRows', false)),
+        vscode.commands.registerCommand('oric-debug.binOn', () => updateSettingInPlace('showBinary', true)),
+        vscode.commands.registerCommand('oric-debug.binOff', () => updateSettingInPlace('showBinary', false)),
         vscode.workspace.onDidChangeConfiguration(e => {
             if (e.affectsConfiguration('oric-debug.wrapPanelRows')) applyWrapSetting();
+            if (e.affectsConfiguration('oric-debug.showBinary')) applyBinarySetting();
         })
     );
-    applyWrapSetting();   // context key must be right before the title bar is first drawn
+    applyWrapSetting();     // context keys must be right before the title bar is first drawn
+    applyBinarySetting();
 
     const currentInstrProvider = {
         resolveWebviewView(view) {
@@ -9242,9 +9255,11 @@ function activate(context) {
         vscode.commands.registerCommand('oric-debug.reparseAnnotations', () => reparseAnnotations(true)),
         vscode.commands.registerCommand('oric-debug.reloadSymbols', () => reloadSymbols()),
         vscode.commands.registerCommand('oric-debug.toggleBinary', async () => {
-            const cfg = vscode.workspace.getConfiguration('oric-debug');
-            const next = !cfg.get('showBinary', true);
-            await cfg.update('showBinary', next, vscode.ConfigurationTarget.Global);
+            // Same writer as the title-bar buttons (updateSettingInPlace) rather than its own
+            // ConfigurationTarget.Global update — two paths writing one setting is how they end up
+            // disagreeing, e.g. the palette silently no-oping under a workspace override.
+            const next = !vscode.workspace.getConfiguration('oric-debug').get('showBinary', true);
+            await updateSettingInPlace('showBinary', next);
             vscode.window.setStatusBarMessage('Oric: %binary in values ' + (next ? 'on' : 'off'), 3000);
         }),
         vscode.commands.registerCommand('oric-debug.openDisassembly', () => createDisasmPanel()),

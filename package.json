@@ -428,6 +428,16 @@
                 "icon": "$(refresh)"
             },
             {
+                "command": "oric-debug.binOn",
+                "title": "Oric: Show %binary Column In Values",
+                "icon": "$(circle-slash)"
+            },
+            {
+                "command": "oric-debug.binOff",
+                "title": "Oric: Hide %binary Column In Values",
+                "icon": "$(symbol-numeric)"
+            },
+            {
                 "command": "oric-debug.wrapOn",
                 "title": "Oric: Wrap Long Rows In Panel",
                 "icon": "$(word-wrap)"
@@ -583,7 +593,9 @@
                 { "command": "oric-debug.bpRemoveAll", "when": "view == oricBreakpoints", "group": "navigation@3" },
                 { "command": "oric-debug.dataRefresh", "when": "view == oricData", "group": "navigation@1" },
                 { "command": "oric-debug.wrapOn", "when": "view == oricCurrentInstr && !oric-debug.wrapRows", "group": "navigation@1" },
-                { "command": "oric-debug.wrapOff", "when": "view == oricCurrentInstr && oric-debug.wrapRows", "group": "navigation@1" }
+                { "command": "oric-debug.wrapOff", "when": "view == oricCurrentInstr && oric-debug.wrapRows", "group": "navigation@1" },
+                { "command": "oric-debug.binOn", "when": "view == oricCurrentInstr && !oric-debug.showBinaryOn", "group": "navigation@2" },
+                { "command": "oric-debug.binOff", "when": "view == oricCurrentInstr && oric-debug.showBinaryOn", "group": "navigation@2" }
             ],
             "view/item/context": [
                 { "command": "oric-debug.snapshotRestoreItem", "when": "view == oricData && viewItem == oricSnap", "group": "inline@1" },
