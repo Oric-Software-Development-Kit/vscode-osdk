@@ -12,11 +12,25 @@
 review/
 test/
 
-# Internal notes and specs — the user-facing docs are README + TROUBLESHOOTING
+# Internal notes and specs.
+#
+# SELF-SUFFICIENCY RULE: the package must contain everything the shipped docs link to. An installed
+# extension may be a different version from the repo, and may be offline, so a link that resolves to
+# a file outside the package is either dead or silently showing DIFFERENT content. Consequences:
+#   - docs/** ships (the "Manual" command opens docs/README.md)
+#   - TROUBLESHOOTING.md ships (opened by "Troubleshooting & Written Guide")
+#   - CORE-CONCEPTS.md ships (8 KB, linked from the docs index)
+#   - images/** ships, screenshots included, and README images use RELATIVE paths
+# Before excluding anything here, check nothing in README.md or docs/** links to it.
 DOGFOODING.md
 DESIGN-*.md
 SPEC-*.md
-CORE-CONCEPTS.md
+
+# NOTE: images/screenshots/ MUST ship. The README links them with RELATIVE paths, and VS Code
+# renders the extension's details page from the INSTALLED FOLDER — an absolute raw.githubusercontent
+# URL showed a broken icon there (and 404s until the file is pushed). vsce rewrites the relative
+# links to https for the Marketplace page, so relative works in all three places at the cost of
+# carrying the PNGs in the package.
 
 # Editor/OS noise
 **/.DS_Store
