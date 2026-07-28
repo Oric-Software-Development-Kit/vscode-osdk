@@ -6803,13 +6803,22 @@ async function setupOricProject() {
                    : 'note your OSDK is still incompatible (see the red status-bar item).'));
 }
 
-// Open the bundled written guide (rendered markdown) — the full reference behind the
-// interactive Getting Started checklist.
-function openTroubleshooting() {
-    const uri = vscode.Uri.file(nodePath.join(nodePath.dirname(__filename), 'TROUBLESHOOTING.md'));
+// Show one of the extension's own markdown files rendered, falling back to the raw file if the
+// markdown preview is unavailable. Shared so every in-editor doc entry behaves identically —
+// paths are relative to the extension root, and these files must stay out of .vscodeignore.
+function previewBundledMarkdown(relPath) {
+    const uri = vscode.Uri.file(nodePath.join(nodePath.dirname(__filename), relPath));
     vscode.commands.executeCommand('markdown.showPreview', uri).then(undefined,
         () => vscode.commands.executeCommand('vscode.open', uri));
 }
+
+// Open the bundled written guide (rendered markdown) — the full reference behind the
+// interactive Getting Started checklist.
+function openTroubleshooting() { previewBundledMarkdown('TROUBLESHOOTING.md'); }
+
+// The documentation index (docs/README.md), which links every topic page. The README is now a
+// one-screen landing page, so the manual proper lives here.
+function openDocsIndex() { previewBundledMarkdown('docs/README.md'); }
 
 // --- Getting Started: a LIVE, self-checking setup checklist (webview) --------
 // A static page can't tell you whether %OSDK% is set, the version is new enough, the
@@ -8911,7 +8920,8 @@ function activate(context) {
         { label: 'Set up this project for debugging', icon: 'gear', color: 'charts.blue', desc: 'Create .vscode launch/tasks/settings', cmd: 'oric-debug.setupProject' },
         { label: 'Troubleshooting & written guide', icon: 'question', color: 'charts.orange', desc: 'Install/configure steps & common fixes', cmd: 'oric-debug.openTroubleshooting' },
         { sep: true, label: '— documentation —' },
-        { label: 'Extension manual', icon: 'book', color: 'charts.blue', desc: 'This extension’s page & README', cmd: 'oric-debug.openManual' },
+        { label: 'Manual — all documentation', icon: 'book', color: 'charts.blue', desc: 'Getting started, panels, annotations, reference', cmd: 'oric-debug.openDocs' },
+        { label: 'Extension page (overview)', icon: 'extensions', color: 'charts.blue', desc: 'The Marketplace page / README summary', cmd: 'oric-debug.openManual' },
         { label: 'XA assembler reference', icon: 'symbol-keyword', color: 'charts.purple', desc: 'Internal quick reference', cmd: 'osdk.xaReference' },
         { label: '6502 opcode reference', icon: 'symbol-numeric', color: 'charts.green', desc: 'Internal quick reference', cmd: 'osdk.6502Reference' },
         { sep: true, label: '— useful links —' },
@@ -8952,6 +8962,7 @@ function activate(context) {
         vscode.commands.registerCommand('oric-debug.openGettingStarted', openGettingStarted),
         vscode.commands.registerCommand('oric-debug.openTroubleshooting', openTroubleshooting),
         // Open the extension's page (README rendered inside VS Code); fall back to a README preview.
+        vscode.commands.registerCommand('oric-debug.openDocs', () => openDocsIndex()),
         vscode.commands.registerCommand('oric-debug.openManual', async () => {
             // Derive "<publisher>.<name>" from our own manifest rather than hardcoding it: the
             // publisher id changes (e.g. individual -> group when publishing), and a stale literal

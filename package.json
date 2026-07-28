@@ -2,7 +2,7 @@
     "name": "osdk-debug",
     "displayName": "OSDK",
     "description": "Oric Software Development Kit - 6502/XA assembly highlighting and Oricutron debugging",
-    "version": "0.0.102",
+    "version": "0.0.103",
     "publisher": "DefenceForce",
     "license": "MIT",
     "icon": "images/oric-icon.png",
@@ -201,6 +201,11 @@
                 "command": "oric-debug.setupProject",
                 "title": "Oric: Set Up Project for Debugging",
                 "icon": "$(gear)"
+            },
+            {
+                "command": "oric-debug.openDocs",
+                "title": "Oric: Documentation (Manual)",
+                "icon": "$(book)"
             },
             {
                 "command": "oric-debug.openTroubleshooting",
