@@ -132,3 +132,39 @@ current code — but if you edit the file mid-session, the running process is st
 `warnIfStale()` (called on each stop) compares the file's mtime now vs. at process start
 and prints a loud ⚠️ telling you to restart the session. The session banner shows file
 mtimes but can't prove which code is *running* — trust the stale check, not the banner.
+
+## 10. Documentation ships with the extension, and its images are version-pinned
+
+Two rules, both about a user reading the docs of *the version they installed*, possibly offline.
+
+**Everything the docs link to must be inside the package.** An installed extension can be a
+different version from the repo and can be offline, so a link resolving outside the package is
+either dead or silently showing *different* content. That means `docs/**`, `TROUBLESHOOTING.md`,
+`CORE-CONCEPTS.md` and `images/**` all ship, and the `docs/` pages reference screenshots with
+**relative** paths so markdown preview reads them from disk with no network. Before adding anything
+to `.vscodeignore`, check nothing in `README.md` or `docs/**` links to it.
+
+**`README.md` is the exception, and needs care.** It is rendered by the Marketplace and by the
+Extensions details page, neither of which can read a file out of the package, so relative image
+links there are rewritten to absolute URLs by `vsce` at package time. Consequences:
+
+- Write them **relative** in the repo anyway; `vsce` does the rewriting. (Verified: every installed
+  extension's shipped README contains `…/raw/HEAD/…` URLs its author did not write.)
+- A relative README image therefore does **not** render when running from source — no packaging step
+  has happened. That is expected, not a bug to chase.
+- The same applies to **relative links**, not just images: `docs/getting-started.md` in the README is
+  rewritten to a `github.com/…/blob/<ref>/…` URL. So on those two surfaces the README's doc links go
+  to GitHub in a browser — they cannot open a bundled file. In-editor and offline, the route is the
+  **Oric Documentation → Manual** entry, which previews `docs/README.md`; relative links *between*
+  docs pages work there, because markdown preview resolves them from disk.
+- `vsce`'s default ref for both is **`HEAD`**, which is *not* version-pinned: an old release's page
+  would show today's screenshots and link to today's docs. Pin **both** to the release tag:
+
+  ```
+  vsce publish \
+    --baseImagesUrl  https://raw.githubusercontent.com/Oric-Software-Development-Kit/vscode-osdk/<tag>/ \
+    --baseContentUrl https://github.com/Oric-Software-Development-Kit/vscode-osdk/blob/<tag>/
+  ```
+
+  and tag the release before publishing. Skipping this is silent — the page looks fine today and
+  misrepresents the UI after the next redesign.
