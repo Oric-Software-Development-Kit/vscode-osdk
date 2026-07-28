@@ -697,6 +697,21 @@ function resolveEnum(name, value) {
 // underscore the C compiler / assembler add. One place so every view resolves the
 // same way.
 function annForSymbol(name) { return name ? annBySymbol.get(name.replace(/^_+/, '')) : undefined; }
+// The annotation that applies to an ACCESS EXPRESSION, or undefined.
+//
+// @-annotations are attached to a SYMBOL, so they describe that symbol AND its elements: they carry
+// to `sym` and to `sym[i]` (an element of an annotated array is still that annotated kind), but NOT
+// through a field selection — in `a[i].f` the annotation describes the element, not f, so applying
+// it there would decode the wrong thing. Pointer dereferences are excluded for the same reason.
+//
+// ONE helper because every evalAccess() caller needs the identical rule. They each used to pass
+// `undefined`, which is why `gWordBuffer[1]` rendered as `$3E|62 '>' char` in the Dashboard and the
+// Watch while the Symbols panel — which renders through renderSpec().ann — showed
+// `e_ITEM_RoughPlan`. Same symbol, same annotation, three call sites disagreeing.
+function annForAccess(expr) {
+    const m = /^\s*([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*$/.exec(String(expr == null ? '' : expr));
+    return m ? annForSymbol(m[1]) : undefined;
+}
 // The byte width an annotation pins down, or 0 if it implies none (bool/enum default
 // to a single byte at the caller). One place so symbol sizing and value rendering agree.
 function annWidth(ann) {
@@ -2089,7 +2104,7 @@ async function evalLogExpr(expr) {
             if (typeof fpA === 'number') { const mm = await readMem(fpA, 2); fpVal = (mm[0] || 0) | ((mm[1] || 0) << 8); }
             if (typeof apA === 'number') { const mm = await readMem(apA, 2); apVal = (mm[0] || 0) | ((mm[1] || 0) << 8); }
             const lv = await evalAccess(expr, locals, fpVal, apVal);
-            if (lv) { const v = await buildTypedVar(expr, lv.addr, lv.type, lv.size, undefined, { omitAddr: true }); return v.value; }
+            if (lv) { const v = await buildTypedVar(expr, lv.addr, lv.type, lv.size, annForAccess(expr), { omitAddr: true }); return v.value; }
         } catch (e) { return '[' + (e && e.message ? e.message : 'err') + ']'; }
     }
     const hm = expr.match(/^\$([0-9a-fA-F]{1,4})$/);
@@ -6010,7 +6025,7 @@ const handlers = {
                 lv = await evalAccess(expr, wlocals, fpVal, apVal);
             } catch (e) { respond(req, {}, false, e.message); return; }
             if (lv) {
-                const v = await buildTypedVar(expr, lv.addr, lv.type, lv.size, undefined);
+                const v = await buildTypedVar(expr, lv.addr, lv.type, lv.size, annForAccess(expr));
                 respond(req, { result: v.value, variablesReference: v.variablesReference, memoryReference: '0x' + lv.addr.toString(16) });
                 return;
             }
@@ -7139,7 +7154,7 @@ const handlers = {
                     try {
                         const lv = await evalAccess(e, locals, fpVal, apVal);
                         if (!lv) continue;
-                        const v = await buildTypedVar(e, lv.addr, lv.type, lv.size, undefined, { omitAddr: true });
+                        const v = await buildTypedVar(e, lv.addr, lv.type, lv.size, annForAccess(e), { omitAddr: true });
                         rows.push({ expr: e, value: (v.value || '').trim() });
                     } catch (_) { /* skip an expression that can't be evaluated */ }
                 }
