@@ -1,6 +1,6 @@
 {
     "name": "osdk-debug",
-    "displayName": "OSDK",
+    "displayName": "Oric OSDK",
     "description": "Oric Software Development Kit - 6502/XA assembly highlighting and Oricutron debugging",
     "version": "1.0.0",
     "publisher": "DefenceForce",
