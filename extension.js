@@ -7448,8 +7448,9 @@ function activate(context) {
             /* NO font-size here. #hdr now holds nothing but a .pcline, which sets its own 0.85em —
                keeping it here made the sizes COMPOUND (0.85 x 0.85 = 0.72em) so the 'current' row
                rendered smaller than the 'prev' row it is meant to match. */
-            #hdr { color: var(--vscode-descriptionForeground, #808080); padding-bottom: 5px; margin-bottom: 6px;
-                   border-bottom: 1px solid var(--vscode-panel-border, #80808040); }
+            /* NO border-bottom: #asm already draws a rule above "current instruction", and the two
+               together rendered as a double line with a gap between them. One rule, on #asm. */
+            #hdr { color: var(--vscode-descriptionForeground, #808080); padding-bottom: 5px; margin-bottom: 6px; }
             #hdr .loc-link { color: var(--vscode-textLink-foreground); cursor: pointer; }
             #hdr .loc-link:hover { text-decoration: underline; }
             #src { white-space: pre-wrap; word-break: break-word; padding-bottom: 6px; margin-bottom: 6px;
@@ -7485,7 +7486,11 @@ function activate(context) {
             .pcline .loc-link { color: var(--vscode-textLink-foreground); }
             .pcline[data-file]:hover .loc-link { text-decoration: underline; }
             #cpu .cr { white-space: nowrap; }
-            #cpu .gap { height: 0.55em; }
+            /* Rule above SP, so the stack block (SP + bytes + probable returns) reads as its own
+               section rather than as three more register rows. Replaces the blank gap that was
+               there: a gap alone did not say "different kind of thing". */
+            #cpu .sep { border-top: 1px solid var(--vscode-panel-border, #80808040);
+                        margin: 5px 0 4px; }
             #cpu .n { color: var(--vscode-descriptionForeground, #888); }
             #cpu .fon { color: var(--vscode-charts-green, #89d185); font-weight: bold; }
             #cpu .foff { color: var(--vscode-descriptionForeground, #666); }
@@ -7662,7 +7667,7 @@ function activate(context) {
                     // Rows 2..n: one register each (SP kept — it is where the stack preview lands).
                     // SP separated from A/X/Y: it is the stack pointer rather than a data register
                     // (and it is where the stack preview will attach).
-                    h += ['A','X','Y'].map(reg).join('') + '<div class="gap"></div>' + reg('SP');
+                    h += ['A','X','Y'].map(reg).join('') + '<div class="sep"></div>' + reg('SP');
                     // The stack itself, directly under SP. One row of raw bytes (top of stack first,
                     // i.e. most recently pushed) plus any probable return addresses, whose names are
                     // click-to-definition like every other symbol. Marked "probable" on purpose: a
